@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  ts:
+    name: TypeScript lint + tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nox-sdk
+
+    steps:
+      - name: Checkout nox-sdk
+        uses: actions/checkout@v4
+        with:
+          path: nox-sdk
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "pnpm"
+          cache-dependency-path: nox-sdk/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Lint (tsc --noEmit)
+        run: pnpm --filter @hisoka/nox-client lint
+
+      - name: Test (vitest)
+        run: pnpm --filter @hisoka/nox-client test
+
+  # --------------------------------------------------------------------------
+  # Rust WASM build — wasm-pack build --target bundler
+  # --------------------------------------------------------------------------
+  wasm:
+    name: WASM build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout nox-sdk
+        uses: actions/checkout@v4
+        with:
+          path: nox-sdk
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: nox-sdk
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Build WASM (bundler target)
+        working-directory: nox-sdk/packages/nox-wasm
+        run: wasm-pack build --target bundler --out-dir pkg-bundler --release
+
+      - name: Build WASM (web target)
+        working-directory: nox-sdk/packages/nox-wasm
+        run: wasm-pack build --target web --out-dir pkg-web --release
+
+      - name: Run WASM tests (Node)
+        working-directory: nox-sdk/packages/nox-wasm
+        run: wasm-pack test --node -- --release

@@ -1,0 +1,43 @@
+---
+slug: /
+sidebar_position: 1
+title: Nox
+hide_title: true
+---
+
+import NoxHero from '@site/src/components/NoxHero';
+
+<NoxHero />
+
+## What is NOX?
+
+NOX is a privacy layer for Ethereum. It sits between your application and the blockchain, routing transactions and RPC calls through a **mixnet**  - a network of independent nodes that shuffle and relay encrypted packets so no single party can trace a message from sender to destination.
+
+When you interact with DeFi today, your RPC provider sees your IP address, wallet addresses, and every request you make. MEV bots watch your pending transactions. Chain analysis firms link your wallets to your identity. NOX breaks these links.
+
+## How the mixnet works
+
+Every request travels through three independent nodes:
+
+```
+You  →  [ Entry Node ]  →  [ Mix Node ]  →  [ Exit Node ]  →  Ethereum
+              ←  ←  ←  ←  response path (SURBs)  ←  ←  ←  ←
+```
+
+1. **Your SDK encrypts the message** into a Sphinx packet  - a fixed-size encrypted blob with one encryption layer per node
+2. **The entry node** strips its layer, learns the next hop, and forwards. It knows your IP but not what you sent.
+3. **The mix node** strips its layer and forwards. It sees neither sender nor content.
+4. **The exit node** decrypts the payload and submits your transaction (or makes the RPC call). It sees the request but not who sent it.
+5. **The response** returns via a SURB (Single-Use Reply Block)  - a pre-built encrypted return path included with your request
+
+No single node sees both your identity and your request.
+
+## What's protected
+
+| Without NOX | With NOX |
+|------------|----------|
+| RPC provider sees your IP | Provider sees the exit node's IP |
+| Provider links all your calls to you | Each request can take a different route |
+| Transaction timing reveals activity | Cover traffic masks real requests |
+| MEV bots can target your transactions | Transactions are submitted by the exit node |
+

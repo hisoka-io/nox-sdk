@@ -1,0 +1,52 @@
+---
+sidebar_position: 10
+title: FAQ
+hide_title: true
+---
+
+import NoxFaq from '@site/src/components/NoxFaq';
+
+# FAQ
+
+<NoxFaq items={[
+  {
+    q: "Is NOX a blockchain?",
+    a: "No. NOX is a network layer that sits in front of Ethereum. It doesn't have its own chain, token, or consensus mechanism. It's infrastructure for private communication with existing blockchains."
+  },
+  {
+    q: "Can the exit node steal my transaction?",
+    a: "No. Your transaction is signed by your wallet. The exit node submits it but can't modify it. It sees the transaction content but not who sent it."
+  },
+  {
+    q: "What happens if a node goes down?",
+    a: "The SDK picks a new route for each request. If a node is unreachable, the next request uses a different path. Topology refresh keeps the list current."
+  },
+  {
+    q: "Does cover traffic cost gas?",
+    a: "No. Dummy packets travel through the mixnet but never touch Ethereum. They use bandwidth, not gas."
+  },
+  {
+    q: "How is this different from a VPN?",
+    a: "A VPN hides your IP from the destination, but the VPN provider sees everything  - your IP, your requests, your timing. It's a single point of trust and failure. NOX splits trust across three independent nodes. No single node sees both your identity and your request. Even if one node is compromised, your privacy is preserved."
+  },
+  {
+    q: "How is this different from Tor?",
+    a: "Tor uses circuit-based routing with no mixing  - packets flow in order, making timing attacks practical. NOX adds random delays at each hop and cover traffic, providing stronger anonymity against a global observer."
+  },
+  {
+    q: "How is this different from Tornado Cash?",
+    a: "Tornado Cash anonymizes token transfers  - you deposit and withdraw from a different address. It doesn't help with general DeFi interactions like swaps, lending, or governance votes. NOX works at the network level. Any Ethereum interaction  - transactions, RPC calls, HTTP requests  - can be routed privately."
+  },
+  {
+    q: "What are the system requirements?",
+    a: "Anywhere JavaScript runs  - browsers, Node.js (>= 18), bundlers (webpack, vite). The WASM module is ~175 KB gzipped and loads automatically."
+  },
+  {
+    q: "How many SURBs do I need?",
+    a: "Each SURB carries ~30 KB of response data. The default of 10 SURBs supports responses up to ~300 KB. The SDK also uses adaptive budgeting  - it tracks past response sizes and adjusts automatically. For specific large responses, pass expectedResponseBytes in the options."
+  },
+  {
+    q: "Is this production-ready?",
+    a: "NOX is in active development. The SDK is functional and tested. The network and protocol are still evolving."
+  }
+]} />

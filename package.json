@@ -1,0 +1,19 @@
+{
+  "name": "nox-sdk",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Nox mixnet TypeScript + WASM client SDK",
+  "scripts": {
+    "build": "pnpm -r build",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "wasm:build": "pnpm --filter @hisoka-io/nox-wasm build",
+    "wasm:build:bundler": "pnpm --filter @hisoka-io/nox-wasm build:bundler",
+    "docs:dev": "pnpm --filter docs start",
+    "docs:build": "pnpm --filter docs build"
+  },
+  "packageManager": "pnpm@10.0.0",
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}

@@ -1,0 +1,49 @@
+---
+sidebar_position: 8
+title: Deployments
+hide_title: true
+---
+
+import NoxDeployments from '@site/src/components/NoxDeployments';
+
+# Deployments
+
+Live contract addresses and network info for the NOX protocol.
+
+## Testnet
+
+<NoxDeployments networks={[
+  {
+    name: "Arbitrum Sepolia",
+    chainId: 421614,
+    explorer: "https://sepolia.arbiscan.io",
+    contracts: [
+      { name: "NoxRegistry", address: "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc" },
+    ],
+  }
+]} />
+
+## Seed nodes
+
+The SDK resolves seed nodes automatically via the seed API (`api.hisoka.io/seed`). You can also pass explicit seeds:
+
+```ts
+const client = await NoxClient.connect({
+  seeds: ["https://api.hisoka.io/seed"],
+});
+```
+
+## On-chain verification
+
+To verify the topology against the NoxRegistry contract:
+
+```ts
+const client = await NoxClient.connect({
+  ethRpcUrl: "https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY",
+  registryAddress: "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc",
+});
+```
+
+## Network map
+
+See live node status at [map.hisoka.io](https://map.hisoka.io).
