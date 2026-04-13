@@ -17,21 +17,13 @@ import { NoxClient } from "@hisoka-io/nox-client";
 
 const client = await NoxClient.connect();
 
-// submit a tx through the mixnet
-const txResult = await client.submitTransaction("0xContractAddress", new Uint8Array([...]));
-
-// or broadcast something you already signed
+await client.submitTransaction("0xContractAddress", calldata);
 await client.broadcastSignedTransaction(signedTxBytes);
 
-// rpc works too
+const balance = await client.rpcCall("eth_getBalance", ["0x...", "latest"]);
 const block = await client.blockNumber();
-const receipt = await client.getTransactionReceipt("0x...");
-const raw = await client.rpcCall("eth_getBalance", ["0x...", "latest"]);
 
-// route arbitrary http through the exit node
-const body = await client.httpRequest(
-  "GET", "https://api.example.com/price", [], new Uint8Array(0),
-);
+const resp = await client.httpRequest("GET", "https://api.example.com/price", [], new Uint8Array(0));
 
 client.disconnect();
 ```
@@ -52,7 +44,7 @@ const client = await NoxClient.connect({
 });
 ```
 
-See the full API and architecture docs at [docs/](./docs/README.md).
+See the full API and architecture docs at [docs.hisoka.io](https://docs.hisoka.io).
 
 ## License
 
