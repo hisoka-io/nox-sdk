@@ -26,16 +26,30 @@ const __dirname = path.dirname(__filename);
 // Import NOX SDK
 import { NoxClient } from "../../src/client.js";
 
-// Import darkpool-v2 wallet SDK and prover via absolute paths
-const DARKPOOL_ROOT = path.resolve(__dirname, "../../../../darkpool-v2");
-const CONTRACTS_ROOT = path.join(DARKPOOL_ROOT, "packages/evm-contracts");
+// External EVM contracts project providing wallet SDK + prover. Required via CONTRACTS_DIR
+// env var; the sibling default is a convenience for maintainers working in the standard
+// multi-repo layout. See tests/internal/README.md.
+const CONTRACTS_ROOT_ENV = process.env["CONTRACTS_DIR"];
+const CONTRACTS_ROOT = CONTRACTS_ROOT_ENV
+  ? path.resolve(CONTRACTS_ROOT_ENV)
+  : path.resolve(__dirname, "../../../../../contracts");
 
-// Dynamic imports — tsx handles ESM/CJS interop
+if (!fs.existsSync(path.join(CONTRACTS_ROOT, "packages/evm-contracts"))) {
+  throw new Error(
+    `Contracts project not found at ${CONTRACTS_ROOT}. ` +
+      `Set CONTRACTS_DIR to the root of an EVM contracts project with ` +
+      `packages/evm-contracts, packages/wallets, and packages/prover subpackages. ` +
+      `See tests/internal/README.md.`,
+  );
+}
+const CONTRACTS_EVM = path.join(CONTRACTS_ROOT, "packages/evm-contracts");
+
+// Dynamic imports - tsx handles ESM/CJS interop
 const walletsMod = await import(
-  pathToFileURL(path.join(DARKPOOL_ROOT, "packages/wallets/dist/index.cjs")).href
+  pathToFileURL(path.join(CONTRACTS_ROOT, "packages/wallets/dist/index.cjs")).href
 );
 const proverMod = await import(
-  pathToFileURL(path.join(DARKPOOL_ROOT, "packages/prover/dist/index.cjs")).href
+  pathToFileURL(path.join(CONTRACTS_ROOT, "packages/prover/dist/index.cjs")).href
 );
 
 const {
@@ -62,10 +76,10 @@ const {
   ensureBBInitialized,
 } = proverMod;
 
-// BJJ curve imports
+// BJJ curve imports (resolved from the contracts project's hoisted node_modules)
 const bjjMod = await import(
   pathToFileURL(
-    path.join(DARKPOOL_ROOT, "node_modules/.pnpm/@zk-kit+baby-jubjub@1.0.3/node_modules/@zk-kit/baby-jubjub/dist/index.js"),
+    path.join(CONTRACTS_ROOT, "node_modules/.pnpm/@zk-kit+baby-jubjub@1.0.3/node_modules/@zk-kit/baby-jubjub/dist/index.js"),
   ).href
 );
 const { Base8, mulPointEscalar } = bjjMod;
@@ -95,7 +109,7 @@ function log(msg: string) {
 
 function loadArtifact(contractPath: string): { abi: any[]; bytecode: string } {
   const jsonPath = path.join(
-    CONTRACTS_ROOT,
+    CONTRACTS_EVM,
     "artifacts/contracts",
     contractPath,
   );
@@ -567,10 +581,12 @@ async function main() {
   // 3. Load pre-deployed contracts (deployed via `npx hardhat run scripts/deploy.ts --network localhost`)
   log("");
   log("--- Phase 1: Load Deployed Contracts ---");
-  const DEPLOY_FILE = path.join(CONTRACTS_ROOT, "deployments/localhost-latest.json");
+  const DEPLOY_FILE = path.join(CONTRACTS_EVM, "deployments/localhost-latest.json");
   if (!fs.existsSync(DEPLOY_FILE)) {
     throw new Error(
-      `No deployment found at ${DEPLOY_FILE}. Run: cd darkpool-v2/packages/evm-contracts && NODE_OPTIONS="--import tsx" npx hardhat run scripts/deploy.ts --network localhost`,
+      `No deployment found at ${DEPLOY_FILE}. Deploy the contracts first: ` +
+        `cd "$CONTRACTS_DIR/packages/evm-contracts" && ` +
+        `NODE_OPTIONS="--import tsx" npx hardhat run scripts/deploy.ts --network localhost`,
     );
   }
   const deployment = JSON.parse(fs.readFileSync(DEPLOY_FILE, "utf-8"));
@@ -578,13 +594,13 @@ async function main() {
   const tokenAddr = deployment.contracts.stakingToken;
 
   // Load compliance key from deployment secrets
-  const secretsFiles = fs.readdirSync(path.join(CONTRACTS_ROOT, "deployments"))
+  const secretsFiles = fs.readdirSync(path.join(CONTRACTS_EVM, "deployments"))
     .filter((f: string) => f.includes("localhost") && f.endsWith(".secrets.json"))
     .sort()
     .reverse();
   if (secretsFiles.length > 0) {
     const secrets = JSON.parse(
-      fs.readFileSync(path.join(CONTRACTS_ROOT, "deployments", secretsFiles[0]), "utf-8"),
+      fs.readFileSync(path.join(CONTRACTS_EVM, "deployments", secretsFiles[0]), "utf-8"),
     );
     COMPLIANCE_SK = BigInt(secrets.complianceSecretKey);
     COMPLIANCE_PK = mulPointEscalar(Base8, COMPLIANCE_SK);

@@ -2,7 +2,7 @@
  * Live Testnet E2E — tests against the real Hisoka testnet on Arbitrum Sepolia.
  *
  * NOT run in CI. Run manually:
- *   npx tsx tests/live_testnet.ts
+ *   npx tsx tests/internal/live_testnet.ts
  *
  * Tests: connectivity, echo, HTTP downloads (1KB to 100MB), web3 RPC calls.
  */

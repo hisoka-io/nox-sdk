@@ -583,7 +583,7 @@ export class NoxClient {
     count: number,
   ): Uint8Array[] {
     const wasm = this._requireWasm();
-    return this.surbPool.generate(wasm, returnPath, requestId, count, this.config.powDifficulty);
+    return this.surbPool.generate(wasm, returnPath, requestId, count);
   }
 
   private _buildSphinxPacket(

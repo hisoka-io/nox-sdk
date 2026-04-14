@@ -1,6 +1,6 @@
 {
   "name": "@hisoka-io/nox-client",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "TypeScript client SDK for the NOX mixnet - anonymous DeFi transactions and HTTP proxying",
   "license": "Apache-2.0",
   "repository": {
@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts --clean",
     "dev": "tsup src/index.ts --format esm,cjs --dts --watch",
-    "test": "vitest run",
+    "test": "tsc --noEmit && vitest run",
     "e2e": "bash tests/internal/run_e2e.sh",
     "lint": "tsc --noEmit"
   },

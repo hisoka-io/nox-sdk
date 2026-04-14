@@ -4,7 +4,7 @@
  * Tests against the real Hisoka 10-node mixnet on Arbitrum Sepolia.
  * Covers: echo, HTTP proxy (1KB to 100MB), public websites, Web3 RPC, signed TX broadcast.
  *
- * Run: npx tsx tests/live_comprehensive.ts
+ * Run: npx tsx tests/internal/live_comprehensive.ts
  */
 
 import { webcrypto } from "node:crypto";

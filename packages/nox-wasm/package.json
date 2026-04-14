@@ -1,6 +1,6 @@
 {
   "name": "@hisoka-io/nox-wasm",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "WASM bindings for NOX mixnet Sphinx cryptography",
   "license": "Apache-2.0",
   "repository": {
