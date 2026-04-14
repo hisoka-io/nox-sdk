@@ -21,7 +21,7 @@
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts --clean",
     "dev": "tsup src/index.ts --format esm,cjs --dts --watch",
-    "test": "vitest run",
+    "test": "tsc --noEmit && vitest run",
     "e2e": "bash tests/internal/run_e2e.sh",
     "lint": "tsc --noEmit"
   },
