@@ -4,7 +4,7 @@
  * Prerequisites:
  *   1. Build the nox binary:  cargo build --release -p nox
  *   2. Start the mesh server: cargo run -p nox-sim --bin nox_mesh_server --features dev-node -- --nodes 10
- *   3. Run this test:         npx tsx tests/stress_mesh.ts
+ *   3. Run this test:         npx tsx tests/internal/stress_mesh.ts
  *
  * The test reads mesh_info.json from the mesh server's data directory,
  * connects via NoxClient.connect(), and sends HTTP requests through the mixnet.
