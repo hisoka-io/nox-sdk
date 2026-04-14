@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
-# NOX SDK E2E Test Orchestrator
+# Nox SDK E2E test orchestrator.
 #
-# Builds nox + wasm, starts Anvil + mesh server, runs E2E tests, cleans up.
-# All service logs go to /tmp/nox_e2e_logs/ for post-mortem debugging.
+# Builds the SDK, starts Anvil + a local Nox mesh, runs the E2E tests, cleans up.
+# Service logs go to /tmp/nox_e2e_logs/ for post-mortem debugging.
+#
+# Requires:
+#   NOX_REPO    Path to a checkout of the Nox server repo (https://github.com/hisoka-io/nox).
+#               Defaults to a sibling directory at ../../../../../nox if not set.
+#   anvil       Installed and on PATH (https://book.getfoundry.sh/).
+#   node, pnpm  For the SDK build.
 #
 # Usage:
-#   bash tests/run_e2e.sh                      # small tests only (~2 min)
-#   RUN_LARGE_DOWNLOADS=1 bash tests/run_e2e.sh  # include 10MB + 100MB (~15 min)
-#   DEBUG_POLL=1 bash tests/run_e2e.sh           # verbose SURB polling
+#   NOX_REPO=/path/to/nox bash tests/internal/run_e2e.sh
+#   RUN_LARGE_DOWNLOADS=1 bash tests/internal/run_e2e.sh  # include 10MB + 100MB (~15 min)
+#   DEBUG_POLL=1 bash tests/internal/run_e2e.sh           # verbose SURB polling
 
 set -euo pipefail
 
@@ -15,7 +21,21 @@ set -euo pipefail
 # Config
 # ============================================================================
 
-NOX_REPO="${NOX_REPO:-$(cd "$(dirname "$0")/../../../../.." && pwd)/nox}"
+NOX_REPO="${NOX_REPO:-$(cd "$(dirname "$0")/../../../../.." 2>/dev/null && pwd)/nox}"
+if [ ! -d "$NOX_REPO/crates" ]; then
+    cat >&2 <<EOF
+error: NOX_REPO does not point to a valid Nox checkout: $NOX_REPO
+
+Set NOX_REPO to a clone of https://github.com/hisoka-io/nox, or place the repo
+as a sibling directory to nox-sdk.
+
+Example:
+    git clone https://github.com/hisoka-io/nox.git
+    NOX_REPO=\$(pwd)/nox bash tests/internal/run_e2e.sh
+EOF
+    exit 2
+fi
+
 SDK_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 MESH_NODES="${MESH_NODES:-10}"
 LOG_DIR="/tmp/nox_e2e_logs"

@@ -13,9 +13,9 @@
  *   cargo run --bin micro_mainnet_sim -p nox-sim --features dev-node
  *
  * Usage:
- *   SEED="https://api.hisoka.io/seed" npx tsx tests/traffic_generator.ts
- *   SEED="https://api.hisoka.io/seed" ROUNDS=3 npx tsx tests/traffic_generator.ts
- *   SEED="https://api.hisoka.io/seed" SKIP_WEB3_WRITES=1 npx tsx tests/traffic_generator.ts
+ *   SEED="https://api.hisoka.io/seed" npx tsx tests/internal/traffic_generator.ts
+ *   SEED="https://api.hisoka.io/seed" ROUNDS=3 npx tsx tests/internal/traffic_generator.ts
+ *   SEED="https://api.hisoka.io/seed" SKIP_WEB3_WRITES=1 npx tsx tests/internal/traffic_generator.ts
  */
 
 import { webcrypto } from "node:crypto";

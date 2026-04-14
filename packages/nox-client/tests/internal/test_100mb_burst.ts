@@ -1,7 +1,7 @@
 /**
  * 100MB burst replenishment test.
  *
- * Usage: npx tsx tests/test_100mb_burst.ts
+ * Usage: npx tsx tests/internal/test_100mb_burst.ts
  * Set DEBUG_POLL=1 for verbose SURB replenishment logs.
  */
 
