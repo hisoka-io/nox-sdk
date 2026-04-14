@@ -12,6 +12,7 @@
     "build:web": "wasm-pack build --target web --out-dir pkg-web --release",
     "build:bundler": "wasm-pack build --target bundler --out-dir pkg-bundler --release",
     "build:node": "wasm-pack build --target nodejs --out-dir pkg-node --release",
+    "prepack": "rm -f pkg-web/.gitignore pkg-bundler/.gitignore pkg-node/.gitignore",
     "test": "wasm-pack test --node"
   },
   "files": [
