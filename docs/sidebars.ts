@@ -6,6 +6,23 @@ const sidebars: SidebarsConfig = {
     'quickstart',
     {
       type: 'category',
+      label: 'Raven',
+      items: [
+        'raven-overview',
+        'raven-architecture',
+        'pir-trilemma',
+      ],
+    },
+    {
+      type: 'category',
+      label: 'Nox Protocol',
+      items: [
+        'nox-protocol',
+        'security',
+      ],
+    },
+    {
+      type: 'category',
       label: 'SDK',
       items: [
         'transactions',
@@ -16,8 +33,13 @@ const sidebars: SidebarsConfig = {
     },
     'configuration',
     'error-handling',
-    'architecture',
+    {
+      type: 'doc',
+      id: 'architecture',
+      label: 'SDK Architecture',
+    },
     'deployments',
+    'glossary',
     'faq',
   ],
 };
