@@ -18,9 +18,9 @@ const sidebars: SidebarsConfig = {
       label: 'Nox Protocol',
       items: [
         'nox-protocol',
-        'security',
       ],
     },
+    'security',
     {
       type: 'category',
       label: 'SDK',

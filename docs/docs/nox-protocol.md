@@ -28,16 +28,26 @@ Full-path compromise probability: **f³** where f is the fraction of adversary-c
 
 Every packet is exactly **32,768 bytes**. Fixed size means an observer cannot distinguish a small RPC call from a large transaction.
 
-```
-[ ChaCha20-Poly1305 AEAD envelope ]
-    [ Sphinx header (472 bytes) ]
-        [ Ephemeral X25519 pubkey     32 B ]
-        [ Routing info                400 B ] (three 128-byte per-hop blocks)
-        [ MAC (HMAC-SHA256)           32 B ]
-        [ PoW nonce                    8 B ] (u64, big-endian on wire)
-    [ Sphinx body (32,296 bytes)           ]
-        [ Three nested Lioness layers      ]
-        [ ISO 7816-4 padded payload        ] (max 31,716 B)
+```mermaid
+block-beta
+  columns 1
+  A["ChaCha20-Poly1305 AEAD envelope — 32,768 bytes"]:1
+  block:header["Sphinx header — 472 bytes"]:1
+    columns 2
+    B["Ephemeral X25519 pubkey"]:1
+    Bs["32 B"]:1
+    C["Routing info (3 × 128-byte per-hop blocks)"]:1
+    Cs["400 B"]:1
+    D["MAC — HMAC-SHA256"]:1
+    Ds["32 B"]:1
+    E["PoW nonce — u64 big-endian"]:1
+    Es["8 B"]:1
+  end
+  block:body["Sphinx body — 32,296 bytes"]:1
+    columns 2
+    F["Three nested Lioness layers (one per hop)"]:1
+    G["ISO 7816-4 padded payload — max 31,716 B"]:1
+  end
 ```
 
 The outer ChaCha20-Poly1305 envelope protects the packet in transit to the entry node. Inside, the Sphinx header is the onion routing layer; the body carries the actual payload encrypted under three nested Lioness wide-block ciphers (one per hop).

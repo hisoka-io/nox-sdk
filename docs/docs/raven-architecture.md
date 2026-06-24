@@ -19,24 +19,27 @@ The Raven codebase is split into two physically separate Cargo workspaces:
 
 A client interaction follows these steps:
 
-```
-Client                              Raven Server
-  │                                      │
-  ├─ GET /v1/instance/:id/params ───────►│
-  │◄─ InspireParams + CRS ───────────────┤
-  │                                      │
-  ├─ Build ClientSession (WASM) ─────────┤  (local, ~3.8s first time)
-  │                                      │
-  ├─ POST /session (packing keys) ──────►│  (saves ~48 KB/query bandwidth)
-  │                                      │
-  ├─ query_seeded (local, WASM) ─────────┤  (produces encrypted PIR query)
-  │                                      │
-  ├─ POST /query ───────────────────────►│
-  │                                      ├─ respond_seeded_inspiring_cached
-  │                                      │    (uses InspiRING + packing cache)
-  │◄─ encrypted PIR response ────────────┤
-  │                                      │
-  ├─ extract_response (local, WASM) ─────┤  (decrypts; learns the record)
+```mermaid
+sequenceDiagram
+    participant C as Client (WASM)
+    participant S as Raven Server
+
+    C->>S: GET /v1/instance/:id/params
+    S-->>C: InspireParams + CRS
+
+    Note over C: Build ClientSession (~3.8s first time)
+
+    C->>S: POST /session (packing keys)
+    Note over S: cache packing keys<br/>saves ~48 KB/query
+
+    Note over C: query_seeded() → encrypted PIR query
+
+    C->>S: POST /query
+    Note over S: respond_seeded_inspiring_cached()<br/>InspiRING + packing cache
+
+    S-->>C: encrypted PIR response
+
+    Note over C: extract_response() → decrypts record
 ```
 
 The server never sees the plaintext query index. It processes a Ring-LWE ciphertext and returns an encrypted response. The client decrypts locally.
