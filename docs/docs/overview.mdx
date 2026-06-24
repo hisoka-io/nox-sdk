@@ -1,7 +1,7 @@
 ---
 slug: /
 sidebar_position: 1
-title: Nox
+title: Hisoka
 hide_title: true
 ---
 
@@ -9,35 +9,73 @@ import NoxHero from '@site/src/components/NoxHero';
 
 <NoxHero />
 
-## What is NOX?
+## What is Hisoka?
 
-NOX is a privacy layer for Ethereum. It sits between your application and the blockchain, routing transactions and RPC calls through a **mixnet**  - a network of independent nodes that shuffle and relay encrypted packets so no single party can trace a message from sender to destination.
+Hisoka is full-stack privacy infrastructure for Ethereum. Most privacy protocols close one leak and leave others open. A shielded pool hides your transaction contents, but your RPC provider still logs your IP and every query you make. A mixnet hides your IP, but the server still learns exactly which records you fetched. Hisoka closes all three leaks as composable, independently deployable layers.
 
-When you interact with DeFi today, your RPC provider sees your IP address, wallet addresses, and every request you make. MEV bots watch your pending transactions. Chain analysis firms link your wallets to your identity. NOX breaks these links.
+## The Four Silences
 
-## How the mixnet works
+四つの沈黙: four independently shippable layers, each closing a distinct privacy leak.
 
-Every request travels through three independent nodes:
+| Silence | Threat closed | Layer | Codename | Status |
+|---|---|---|---|---|
+| Silence the **trades** | What you transact: value, asset, counterparty | Write privacy | **Howl** (Dark Pool) | Testnet (gated on audit) |
+| Silence the **queries** | What you read: UTXOs, balances, Merkle paths | Read privacy | **Raven** (PIR) | Live on Ethereum mainnet |
+| Silence the **traffic** | Who you are: IP, timing, metadata | Network privacy | **Nox** (Mixnet) | Live on testnet |
+| Silence the **exposure** | Cross-settlement linkage | Settlement | **Kage** (Solver Network) | Design |
+
+No single component learns both who you are and what you want.
+
+## How the layers compose
 
 ```
-You  →  [ Entry Node ]  →  [ Mix Node ]  →  [ Exit Node ]  →  Ethereum
-              ←  ←  ←  ←  response path (SURBs)  ←  ←  ←  ←
+Browser wallet / dApp
+       │
+       ├── fetch UTXOs, incoming transfers, Merkle paths ──► RAVEN  (read privacy)
+       ├── route all RPC / HTTP reads, hide IP ────────────► NOX    (network privacy)
+       │
+       ▼
+   HOWL: Dark Pool (write privacy)
+       │   gas paid anonymously via ── NOX as paymaster
+       │   private intent settlement via ── KAGE (roadmap)
+       ▼
+   Ethereum (Arbitrum Sepolia testnet · Ethereum mainnet for Raven)
 ```
 
-1. **Your SDK encrypts the message** into a Sphinx packet  - a fixed-size encrypted blob with one encryption layer per node
-2. **The entry node** strips its layer, learns the next hop, and forwards. It knows your IP but not what you sent.
-3. **The mix node** strips its layer and forwards. It sees neither sender nor content.
-4. **The exit node** decrypts the payload and submits your transaction (or makes the RPC call). It sees the request but not who sent it.
-5. **The response** returns via a SURB (Single-Use Reply Block)  - a pre-built encrypted return path included with your request
+**Nox** plays two roles. It is the wallet's query transport: every RPC call routes through the mixnet so no provider links your IP to your request. It is also the Dark Pool's anonymous paymaster: gas is paid from shielded funds via a ZK proof with no payer linkage.
 
-No single node sees both your identity and your request.
+**Raven** is how a wallet privately discovers its UTXOs, syncs incoming transfers, and fetches Merkle paths without telling a server which leaves it wants. Technically it is a single-server PIR (Private Information Retrieval) framework. It also generalizes to private reads of arbitrary Ethereum account state.
 
-## What's protected
+**Howl** is the shielded write layer. Balances live as encrypted notes committed to an on-chain Merkle tree; ownership is proven in zero knowledge using Noir circuits and UltraHonk proofs. No asset-to-user mapping is ever published on-chain.
 
-| Without NOX | With NOX |
-|------------|----------|
-| RPC provider sees your IP | Provider sees the exit node's IP |
-| Provider links all your calls to you | Each request can take a different route |
-| Transaction timing reveals activity | Cover traffic masks real requests |
-| MEV bots can target your transactions | Transactions are submitted by the exit node |
+**Kage** is the private solver network. Users emit intent ZK proofs; solvers verify them recursively inside their own circuits and settle swaps on-chain. Roadmap only.
 
+## Layer descriptions
+
+### Nox: network privacy
+
+A three-hop stratified Sphinx mixnet following the Loopix design. Fixed 32 KB packets with per-hop onion encryption, Poisson mixing delays, cover traffic, and SURB-based reply paths make timing correlation attacks impractical. Exit nodes double as blockchain relayers and execute transactions on behalf of users without learning who sent them.
+
+Live on Arbitrum Sepolia. The Nox SDK is what you use to route your application's Ethereum calls through the mixnet.
+
+### Raven: read privacy
+
+A PIR framework that lets a client fetch a record from a server's database without the server learning which record was requested. Communication cost is independent of database size. Raven's production scheme is InsPIRe (eprint 2025/1352), a lattice-based hintless PIR. Currently serving Railgun's PPOI compliance data on Ethereum mainnet via six InsPIRe instances.
+
+### Howl: write privacy
+
+A multi-asset ZK-UTXO shielded pool on Ethereum. Seven Noir circuits cover deposit, withdraw, transfer, join, split, public claim, and anonymous gas payment. The on-chain contract is deliberately thin: all authorization is proven in zero knowledge. There are no `msg.sender` ownership checks. Circuit soundness is contract security.
+
+Deployed to Arbitrum Sepolia testnet. Not on mainnet (gated on a field-overflow audit finding; see the [security page](/security)).
+
+### Kage: settlement privacy (roadmap)
+
+A private solver network where users generate intent ZK proofs and solvers recursively verify them inside their own circuits before settling on-chain. Design stage only.
+
+## Where to start
+
+- **Route your app's Ethereum calls through Nox** → [Quickstart](/quickstart)
+- **Understand Raven's PIR approach** → [Raven Overview](/raven-overview)
+- **Protocol-level Nox specification** → [Nox Protocol](/nox-protocol)
+- **Threat model and non-goals** → [Security](/security)
+- **Term definitions** → [Glossary](/glossary)
