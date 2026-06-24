@@ -3,6 +3,10 @@ import type { Config } from "@docusaurus/types";
 import type * as Preset from "@docusaurus/preset-classic";
 
 const config: Config = {
+  themes: ["@docusaurus/theme-mermaid"],
+  markdown: {
+    mermaid: true,
+  },
   title: "Hisoka",
   tagline: "Privacy layer for DeFi on Ethereum",
   favicon: "img/logo-white.svg",

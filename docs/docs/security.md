@@ -5,7 +5,7 @@ title: Security
 
 # Security
 
-This page describes the adversary model, what each Hisoka layer protects against, and explicit non-goals. Read this before deploying any Hisoka component in a security-sensitive context.
+This page describes the adversary model, what Nox and Raven protect against, and explicit non-goals. Read this before deploying any Hisoka component in a security-sensitive context.
 
 ## Adversary model
 
@@ -77,33 +77,12 @@ Hisoka designs against a computationally bounded adversary that is simultaneousl
 
 **Open crypto gate.** There is a pending cryptographer review of a possibly-missing `(q̃/q)²` factor in InsPIRe's noise-variance derivation (`raven/SECURITY.md`, item G6). Until this is resolved, Raven should not be used to serve high-value data where a wrong noise bound would affect correctness or privacy assertions. The current Railgun PPOI deployment uses the conservative wider single-prime modulus `q ≈ 2⁶⁰` which provides larger noise margins.
 
-## What Howl protects against
-
-**Transaction content revelation.** Asset type, value, sender, and receiver are all hidden inside encrypted notes. The on-chain commitment tree contains only ciphertexts. A chain analysis firm observing the contract sees that a valid ZK proof was submitted and a nullifier was consumed, but learns nothing about the note's contents or the parties involved.
-
-**Double-spend.** The nullifier set tracks spent notes. A valid proof consumes the nullifier; subsequent attempts with the same nullifier are rejected by the contract.
-
-**Linkability of nullifier to note.** The nullifier computation (either `Poseidon2(nullifier)` for self-owned notes or `Poseidon2(shared_secret, commitment, leaf_index)` for received notes) has no algebraic relationship to the note's on-chain commitment. A chain analyst cannot link a nullifier publication to the corresponding tree leaf.
-
-**Gas payment attribution.** The `gas_payment` circuit pays relayers from shielded funds. The relayer learns the action being paid for but not the payer's identity or note.
-
-### Howl non-goals and open issues
-
-**Mainnet deployment.** Howl has a CRITICAL open audit finding: field-overflow in value conservation. All value-balance checks use BN254 `Field` (modular) arithmetic; a prover can satisfy conservation while individual output values exceed the input via modular wraparound, enabling pool drain with no special access. A working exploit exists. This is the mainnet blocker. Do not use Howl with real funds until this is fixed and an audit is completed.
-
-**Threshold compliance.** The deployed compliance mechanism is a single immutable BabyJubJub public key set at contract deployment. All notes are ECDH-encrypted to this key. The "15-entity threshold quorum" described on the marketing site is a design goal, not a deployed feature.
-
-**Post-quantum adversaries.** BabyJubJub, BN254, and UltraHonk are not post-quantum secure.
-
-## Open security issues across layers
+## Open security issues
 
 | Severity | Issue | Layer | Status |
 |---|---|---|---|
-| Critical | Field-overflow value conservation (pool drain) | Howl | Open: mainnet blocker |
 | High | SURB AEAD authentication (ISSUE-012) | Nox | Open: mainnet blocker |
-| Medium | `public_claim` does not enforce timelock | Howl | Open |
-| Medium | Fee-on-transfer tokens break `deposit()` accounting | Howl | Open |
 | Open question | Noise-variance factor in InsPIRe `get_variance` | Raven | Cryptographer review needed |
 | Open research | Formal sender-anonymity bound | Nox | Not yet proven |
 
-For the full list of known issues, see the respective repositories: `darkpool-v2/no-commit/ISSUES.md` (Howl), `raven/SECURITY.md` (Raven), and `yellow-paper/TODO.md` (Nox).
+For the full list of known issues, see `raven/SECURITY.md` (Raven) and `yellow-paper/TODO.md` (Nox).
