@@ -100,7 +100,7 @@ fi
 # ============================================================================
 
 echo "[e2e] Building nox binary (release)..."
-(cd "$NOX_REPO" && cargo build --release -p nox 2>"$LOG_DIR/nox_build.log") || {
+(cd "$NOX_REPO" && cargo build --release --bin nox 2>"$LOG_DIR/nox_build.log") || {
     echo "ERROR: nox build failed. See $LOG_DIR/nox_build.log"
     exit 1
 }

@@ -15,7 +15,10 @@ The WASM dependency (`@hisoka-io/nox-wasm`) is installed automatically.
 ```ts
 import { NoxClient } from "@hisoka-io/nox-client";
 
-const client = await NoxClient.init();
+const client = await NoxClient.init({
+  ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
+  registryAddress: "0xCURRENT_NOX_REGISTRY",
+});
 
 const balance = await client.rpcCall("eth_getBalance", ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "latest"]);
 console.log(balance);
@@ -23,7 +26,10 @@ console.log(balance);
 client.disconnect();
 ```
 
-`init()` connects to the Hisoka testnet with production defaults (seed discovery, PoW, timeouts). No configuration needed.
+`init()` connects to the Hisoka testnet and verifies the discovered topology against the configured registry.
+Both verification inputs are required outside a loopback test mesh.
+Replace `0xCURRENT_NOX_REGISTRY` with the current signed deployment address. Historical testnet addresses are
+not compatible with the complete profile verifier.
 
 ## Usage
 
@@ -31,7 +37,12 @@ client.disconnect();
 
 ```ts
 // Override specific settings while keeping the rest as defaults
-const client = await NoxClient.init({ timeoutMs: 60_000, surbsPerRequest: 20 });
+const client = await NoxClient.init({
+  ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
+  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  timeoutMs: 60_000,
+  surbsPerRequest: 20,
+});
 ```
 
 ### Full custom configuration
@@ -54,9 +65,28 @@ const response = await client.submitTransaction(
   "0xContractAddress",
   calldata, // Uint8Array
 );
+const outcome = await client.submitTransactionTyped(
+  "0xContractAddress",
+  calldata,
+);
 ```
 
 The transaction is wrapped in a Sphinx packet, routed through 3 relay nodes, and executed by the exit node. The response comes back through Single-Use Reply Blocks (SURBs) so the exit node never learns who sent the request.
+
+### Protocol-neutral paid execution
+
+```ts
+const selectedExit = client.selectPaidExit();
+const quote = await client.requestPaidQuote(request, selectedExit);
+if (quote.status === "rejected") {
+  throw new Error(`${quote.code}: ${quote.detail}`);
+}
+const outcome = await client.submitPaidTransaction(quote, entryPointCalldata);
+```
+
+The quote request and paid submission use the same selected exit. The client re-resolves that exit from a
+recently chain-verified topology, verifies the EIP-712 quote and execution ID, and returns a typed submission or
+rejection outcome. Applications provide opaque EntryPoint calldata; Nox does not parse Howl proofs.
 
 ### Broadcast a signed transaction
 
@@ -80,7 +110,7 @@ All RPC calls are routed through the mixnet. The exit node forwards them to its 
 const body = await client.httpRequest(
   "GET",
   "https://api.example.com/data",
-  { "Accept": "application/json" },
+  [["Accept", "application/json"]],
   new Uint8Array(0),
 );
 ```
@@ -112,12 +142,14 @@ client.disconnect();
 | `timeoutMs` | `number` | `30000` | Per-request timeout in milliseconds |
 | `surbsPerRequest` | `number` | `10` | SURBs sent with each request (~30KB each) |
 | `topologyRefreshMs` | `number` | `60000` | Background topology refresh interval |
+| `livenessMaxAgeMs` | `number` | `180000` | Maximum age of an online indexer observation |
 | `fecRatio` | `number` | `0.3` | Reed-Solomon FEC redundancy ratio (0.0--1.0) |
 | `ethRpcUrl` | `string` | `""` | Ethereum RPC for on-chain topology verification |
 | `registryAddress` | `string` | `""` | NoxRegistry contract address |
-| `dangerouslySkipFingerprintCheck` | `boolean` | `true` | Skip topology fingerprint verification |
+| `dangerouslySkipFingerprintCheck` | `boolean` | `false` | Skip verification on a loopback test mesh only |
 
-All fields are optional. `NoxClient.init()` uses these defaults. `NoxClient.connect()` also falls back to these defaults for any unset field.
+`ethRpcUrl` and `registryAddress` are required together. Connection fails before fetching a seed if either is
+missing. `dangerouslySkipFingerprintCheck: true` is accepted only when every seed URL is loopback.
 
 To inspect or spread the defaults programmatically:
 
@@ -127,15 +159,14 @@ import { DEFAULTS } from "@hisoka-io/nox-client";
 const client = await NoxClient.connect({
   ...DEFAULTS,
   timeoutMs: 60_000,
-  ethRpcUrl: "https://eth.llamarpc.com",
-  registryAddress: "0x...",
-  dangerouslySkipFingerprintCheck: false,
+  ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
+  registryAddress: "0xCURRENT_NOX_REGISTRY",
 });
 ```
 
 ## How it works
 
-1. Client fetches the network topology from a seed node (list of relay nodes with their Sphinx public keys)
+1. Client fetches the complete registered member set and separate liveness observations from a seed node
 2. Selects a 3-hop route: entry node, mix node, exit node
 3. For each request, builds a Sphinx packet with layered encryption -- each relay can only decrypt its own layer and learn the next hop
 4. Packet is sent to the entry node via HTTPS
@@ -148,7 +179,7 @@ Large responses are automatically fragmented and reassembled with Reed-Solomon f
 
 ## Requirements
 
-Node.js 18+. Works in browsers with WASM support.
+Node.js 20+ or a browser runtime with Web Crypto and WASM support.
 
 ## License
 

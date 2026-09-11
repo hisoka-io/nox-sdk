@@ -12,7 +12,7 @@ This page covers the protocol-level specification for Nox: packet format, crypto
 Nox is a three-hop stratified Sphinx mixnet following the Loopix design (USENIX Security 2017). Ten nodes are live on Arbitrum Sepolia. The mixnet has two roles in the Hisoka system:
 
 1. **Query transport.** Every RPC and HTTP read from the browser wallet routes through Nox so no provider links the requesting IP to the query.
-2. **Anonymous paymaster.** The `gas_payment` Noir circuit proves a user holds shielded funds to cover a relayer's gas cost. The exit node submits the transaction via `RelayerMulticall`. No `msg.sender` check exists; the ZK proof is the authorization.
+2. **Protocol-neutral paid execution.** An application supplies opaque action calldata and an independent payment authorization. The selected exit prices, signs, and submits one bounded transaction without parsing the application's proof or account model.
 
 ## Network topology
 
@@ -155,13 +155,15 @@ Client reassembly: if a response stalls for 8 seconds, the client enters a reple
 
 ## On-chain contracts
 
-Three Solidity contracts support Nox at the network layer:
+The current paid architecture uses these Solidity contracts:
 
 **NoxRegistry.** Stores node profiles: Sphinx public key (unique across all nodes), service/ingress/metadata URLs, staked amount, unstake request time, and role (RELAY=1, EXIT=2, FULL=3). Registration requires staking a minimum amount of ERC-20 tokens. Unstaking is two-step: `requestUnstake` followed by `executeUnstake` after an unstake delay (≥1 day). A `SLASHER_ROLE` can slash misbehaving nodes. Computes an XOR topology fingerprint over `keccak256(address)` of all active nodes: clients call `topologyFingerprint()` to detect stale views without downloading the full node list.
 
-**NoxRewardPool.** Receives fees deposited by `DarkPool.payRelayer`. Holds per-relayer balances pending distribution. Whitelists payment assets. Emits `RewardsDeposited(address, address, uint256)`: the exit node's profitability check reads these events.
+**NoxRewardPool.** Holds execution-scoped exit credit and pooled network rewards. It accounts for the selected exit separately from the network share and protects both liabilities from rescue or unrelated distribution.
 
-**RelayerMulticall.** A batch executor: `(target, calldata, value, requireSuccess)[]`. Each operation is authorized by its own ZK proof. No `msg.sender` checks. This is how the exit node submits `gas_payment`-authorized transactions: the proof authorizes the action, not the sender's identity.
+**NoxEntryPoint.** Verifies the selected exit's signed quote, consumes execution and payment identifiers, acquires the exact ERC-20 fee through a protocol adapter, records reward attribution, and runs the opaque action through a one-shot sandbox. V1 sends zero native value to the action.
+
+**HowlPaymentAdapter.** Acquires a Howl fee with the existing standard withdraw proof. The fee note is independent from the action notes, and its withdraw intent binds the complete Nox execution identifier.
 
 ## Handshake and peer authentication
 
@@ -177,13 +179,11 @@ A node with fake credentials cannot complete the handshake, preventing Sybil inf
 
 Sessions last 24 hours. Reconnection resumes the session rather than rebuilding the Sphinx key state.
 
-## ZK gas payment
+## Shielded fee payment
 
-To pay for a transaction from shielded funds, the wallet generates a `gas_payment` Noir circuit proof. The proof's public outputs include the nullifier hash, payment value and asset, the relayer's address, and an **execution hash** `= keccak256(target ‖ calldata ‖ fee) mod p_BN254`.
+Howl pays Nox with a separate standard note. The wallet proves a normal withdraw whose recipient is `HowlPaymentAdapter` and whose intent is a domain-separated reduction of the full execution ID. The adapter checks the nullifier, asset, amount, and intent before forwarding the exact fee to `NoxEntryPoint`.
 
-The execution hash binds the proof to one specific on-chain action. The `DarkPool` contract recomputes the execution hash from the actual submitted parameters and reverts if they don't match. This prevents front-running (the bound operation cannot be changed), parameter substitution (fee and target are fixed), and proof reuse (the nullifier is consumed).
-
-Variable-length parameters such as multi-hop swap paths use a two-stage hash: `keccak256(path) mod p_BN254`, then Poseidon2 compression.
+The selected exit signs a short-lived quote over the EntryPoint, action target and calldata hash, gas limits, fee split, payment identifier, and execution identifier. A different exit, action, chain, fee, or expired quote fails closed. The immediate response reports submitted or rejected; final application state comes from an independent chain source.
 
 ## Relay pipeline
 

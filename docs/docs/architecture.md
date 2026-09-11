@@ -104,11 +104,16 @@ The SDK verifies the node list it receives from seed nodes:
 
 ### Self-consistency check
 
-The topology includes a `fingerprint`  - the XOR of `keccak256(address)` for every node. The SDK recomputes this and rejects the topology if they don't match.
+The topology includes a `fingerprint`  - the XOR of `keccak256(address)` for every registered member. Schema
+version 2 keeps that complete chain-authenticated member set separate from indexer liveness observations. The
+SDK recomputes the fingerprint and rejects omissions, duplicate members, or mismatches.
 
-### On-chain verification (optional)
+### On-chain verification
 
-When `ethRpcUrl` and `registryAddress` are configured, the SDK reads the fingerprint from the NoxRegistry smart contract and compares it to the seed node's fingerprint. This catches:
+Outside an explicit loopback test mesh, `ethRpcUrl` and `registryAddress` are required. The SDK pins Registry
+reads to one block and verifies the fingerprint, count, every profile field, registration status, frozen status,
+node role, and deterministic primary layer before using the topology. Frozen registered members remain in the
+verified member set but are excluded from routing. This catches:
 
 - Compromised seed nodes serving a fake topology
 - Stale seed nodes serving an outdated node list
@@ -117,7 +122,7 @@ When `ethRpcUrl` and `registryAddress` are configured, the SDK reads the fingerp
 ```ts
 const client = await NoxClient.connect({
   ethRpcUrl: "https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY",
-  registryAddress: "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc",
+  registryAddress: "0xCURRENT_NOX_REGISTRY",
 });
 ```
 

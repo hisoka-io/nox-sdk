@@ -33,9 +33,9 @@ Hisoka designs against a computationally bounded adversary that is simultaneousl
 
 **Packet tagging.** Lioness (wide-block cipher) over the Sphinx body means a single-bit flip diffuses over the entire 32 KB body. An adversary cannot flip a recognizable bit in the body at one hop and identify the same bit at a downstream hop.
 
-**Gas payment deanonymization.** The `gas_payment` circuit proves fund ownership in zero knowledge. The execution hash binds the proof to one specific action. The relayer learns the action but not the payer. The on-chain contract verifies the proof and execution hash; it has no `msg.sender` check.
+**Shielded fee unlinkability.** Howl pays through an independent standard withdraw proof to `HowlPaymentAdapter`. The selected exit sees the action and quoted fee but does not receive the user's note witness or spend key.
 
-**Front-running and parameter substitution.** The execution hash `keccak256(target ‖ calldata ‖ fee) mod p_BN254` is a public circuit output. The contract recomputes it from the actual submitted parameters and reverts on mismatch. The proof can only authorize the specific action it was generated for.
+**Front-running and parameter substitution.** The exit's signed quote binds the chain, EntryPoint, exit, execution ID, payment ID, fee terms, action target, calldata hash, gas bounds, and expiry. The Howl withdraw intent binds the same execution ID through a domain-separated BN254 reduction.
 
 ### Nox non-goals
 

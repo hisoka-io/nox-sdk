@@ -6,7 +6,7 @@
  * BroadcastSignedTransaction, and error/edge cases.
  *
  * Prerequisites:
- *   1. Build nox:  cargo build --release -p nox
+ *   1. Build nox:  cargo build --release --bin nox
  *   2. Start mesh: cargo run -p nox-sim --bin nox_mesh_server --features dev-node -- --nodes 10
  *   3. Start anvil: anvil --port 8545 --silent
  *   4. Run tests:  MESH_INFO_PATH=/tmp/nox_mesh/mesh_info.json npx tsx tests/e2e_mesh.ts

@@ -21,7 +21,9 @@ Key terms used across the Hisoka protocol documentation. Alphabetical order.
 
 ---
 
-**Barretenberg (bb.js).** The Rust/C++ backend for the UltraHonk proof system, developed by Aztec. Howl uses `bb.js` specifically (the JavaScript/WASM version) for both proving and verifier generation. The `bb` CLI binary and `bb.js` produce different verifier contract bytecodes for the same circuit: the project standardizes on `bb.js` end-to-end. Pinned to nightly `4.0.0-nightly.20260218`.
+**Barretenberg (bb.js).** The UltraHonk backend developed by Aztec. Howl uses pinned bb.js 5.0.0 for client
+proving and base verifier generation. Native bb 5.0.0 remains required for optimized verifier generation and
+Kage's recursive outer proof; verification-key parity between the two is locked on the 5.x line.
 
 ---
 
@@ -57,7 +59,7 @@ Key terms used across the Hisoka protocol documentation. Alphabetical order.
 
 ---
 
-**DarkPool.sol.** Howl's core Ethereum contract. Holds the LeanIMT commitment tree, nullifier set, public-memo registry, and references to seven HonkVerifier contracts. Enforces compliance-key pinning, proof-timestamp validation (proof timestamp must be within block.timestamp + 1 hour), Merkle root history, nullifier double-spend prevention, and a pausable emergency stop. Has no `msg.sender` ownership checks: all authorization is proven in zero knowledge.
+**DarkPool.sol.** Howl's core Ethereum contract. Holds the level-bound LeanIMT commitment tree, nullifier set, public-memo registry, and eleven-verifier registry. It enforces compliance-key pinning, proof timestamps, root history, nullifier uniqueness, and a pausable emergency stop. Ownership authorization is proven in zero knowledge.
 
 ---
 
@@ -69,7 +71,7 @@ Key terms used across the Hisoka protocol documentation. Alphabetical order.
 
 ---
 
-**Execution hash.** `keccak256(target || calldata || fee) mod p_BN254`. A public output of the `gas_payment` circuit that binds the proof to one specific on-chain action. The `DarkPool` contract recomputes this from the actual submitted transaction parameters and reverts on mismatch, preventing front-running, parameter substitution, and proof reuse.
+**Execution ID.** The full 32-byte identifier of one paid Nox execution. The selected exit quote, EntryPoint replay state, protocol payment authorization, and application intent bind this identifier.
 
 ---
 
@@ -129,19 +131,21 @@ Key terms used across the Hisoka protocol documentation. Alphabetical order.
 
 ---
 
-**Noir.** A ZK circuit language developed by Aztec. Howl's seven circuits are written in Noir and compiled to UltraHonk proofs via Barretenberg.
+**Noir.** A ZK circuit language developed by Aztec. Howl's standard, multisig, and Kage circuits compile to UltraHonk proofs through Barretenberg.
 
 ---
 
-**Note.** Howl's unified UTXO. A 6-field struct: `(asset_id, value, secret, nullifier, timelock, hashlock)`, serialized to 192 bytes. `timelock` enables time-locked spending; `hashlock` enables hash-locked spending (HTLCs, atomic swaps). A "memo note" (a received transfer) is a Note with `nullifier = 0` using the received-note nullifier path.
+**Note.** Howl's unified eight-field UTXO: `note_version`, `asset_id`, `note_type`, `conditions_hash`, `value`, `owner`, `psi`, and `parents`. The leaf commits to those plaintext fields. Spending publishes `Poseidon2(psi, leaf_index)` as the note's single nullifier.
 
 ---
 
-**Nox.** Hisoka's network-privacy layer. A three-hop stratified Sphinx mixnet following Loopix. Routes wallet queries and transactions through a network of independent relay and exit nodes, hiding IP, timing, and metadata. Also serves as the Dark Pool's anonymous paymaster via the `gas_payment` circuit. Live on Arbitrum Sepolia testnet.
+**Nox.** Hisoka's network-privacy layer. A three-hop stratified Sphinx mixnet following Loopix. It routes wallet queries and application-opaque transactions through independent relay and exit nodes. Paid actions use a selected-exit quote, a protocol payment adapter, and `NoxEntryPoint`.
 
 ---
 
-**NoxRegistry.** The on-chain Solidity contract that stores Nox node registrations: Sphinx public key, staking, role, and service URLs. Computes an XOR topology fingerprint for cheap stale-topology detection. Clients optionally verify the topology fingerprint against the on-chain value to detect compromised seed nodes.
+**NoxRegistry.** The on-chain Solidity contract that stores Nox node registrations: Sphinx public key, staking,
+role, and service URLs. Clients outside explicit loopback tests verify the complete discovered address set,
+profiles, status, and roles against one pinned Registry block before routing.
 
 ---
 
@@ -181,7 +185,7 @@ Key terms used across the Hisoka protocol documentation. Alphabetical order.
 
 ---
 
-**RelayerMulticall.** An on-chain Solidity contract that batch-executes operations: `(target, calldata, value, requireSuccess)[]`. Each operation is authorized by its own ZK proof; there are no `msg.sender` checks. Used by exit nodes to submit `gas_payment`-authorized transactions and other pool operations.
+**NoxEntryPoint.** The versioned paid-execution contract that binds a selected exit and signed quote, acquires an exact protocol-specific fee, records exit and network rewards, and executes an opaque zero-native-value action through a one-shot sandbox.
 
 ---
 

@@ -36,13 +36,13 @@ Browser wallet / dApp
        │
        ▼
    HOWL: Dark Pool (write privacy)
-       │   gas paid anonymously via ── NOX as paymaster
+       │   independent shielded fee via ── NOX paid execution
        │   private intent settlement via ── KAGE (roadmap)
        ▼
    Ethereum (Arbitrum Sepolia testnet · Ethereum mainnet for Raven)
 ```
 
-**Nox** plays two roles. It is the wallet's query transport: every RPC call routes through the mixnet so no provider links your IP to your request. It is also the Dark Pool's anonymous paymaster: gas is paid from shielded funds via a ZK proof with no payer linkage.
+**Nox** plays two roles. It routes wallet RPC calls through the mixnet so no provider links your IP to your request. It also sponsors bounded application-opaque actions after an independent protocol adapter acquires the quoted fee.
 
 **Raven** is how a wallet privately discovers its UTXOs, syncs incoming transfers, and fetches Merkle paths without telling a server which leaves it wants. Technically it is a single-server PIR (Private Information Retrieval) framework. It also generalizes to private reads of arbitrary Ethereum account state.
 
@@ -64,7 +64,7 @@ A PIR framework that lets a client fetch a record from a server's database witho
 
 ### Howl: write privacy
 
-A multi-asset ZK-UTXO shielded pool on Ethereum. Seven Noir circuits cover deposit, withdraw, transfer, join, split, public claim, and anonymous gas payment. The on-chain contract is deliberately thin: all authorization is proven in zero knowledge. There are no `msg.sender` ownership checks. Circuit soundness is contract security.
+A multi-asset ZK-UTXO shielded pool on Ethereum. Six standard circuits, four multisig circuits, and two Kage circuits cover private state transitions. Nox fees reuse the standard withdraw circuit. The on-chain contract is deliberately thin: all ownership authorization is proven in zero knowledge.
 
 Deployed to Arbitrum Sepolia testnet. Not on mainnet (gated on a field-overflow audit finding; see the [security page](/security)).
 

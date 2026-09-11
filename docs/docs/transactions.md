@@ -96,6 +96,7 @@ Let the exit node handle gas and submission:
 
 ```ts
 const response = await client.submitTransaction(to, data);
+const typed = await client.submitTransactionTyped(to, data);
 ```
 
 | Parameter | Type | Description |
@@ -103,7 +104,9 @@ const response = await client.submitTransaction(to, data);
 | `to` | `string` | Contract address (hex, 0x-prefixed) |
 | `data` | `Uint8Array` | Encoded calldata |
 
-**Returns:** `Uint8Array`  - raw response bytes from the exit node.
+`submitTransaction` preserves the legacy raw response. `submitTransactionTyped` returns either
+`{ status: "submitted", transactionHash }` or `{ status: "rejected", code, detail }` and cannot mistake
+a bounded `tx_error:` response for a transaction hash.
 
 :::warning
 With relay transactions, the exit node pays gas and constructs the on-chain transaction. Use this only when you trust the relay node's behavior, or when the target contract validates the original sender separately.
@@ -115,4 +118,5 @@ With relay transactions, the exit node pays gas and constructs the on-chain tran
 |--------|------------|---------|----------|
 | `broadcastSignedTransaction` | You pay gas | Your wallet | You need full control |
 | `broadcastSignedTransactionWithOptions` | You pay gas | Your wallet | You need custom RPC or response sizing |
-| `submitTransaction` | Handled by relay | Exit node | You want simplicity and trust the relay |
+| `submitTransactionTyped` | Quoted fee | Exit node | You need a decoded legacy paid result |
+| `submitTransaction` | Quoted fee | Exit node | You need byte-compatible raw behavior |

@@ -2,7 +2,7 @@
  * Stress test: connect TS SDK to a real NOX mesh and download data through the mixnet.
  *
  * Prerequisites:
- *   1. Build the nox binary:  cargo build --release -p nox
+ *   1. Build the nox binary:  cargo build --release --bin nox
  *   2. Start the mesh server: cargo run -p nox-sim --bin nox_mesh_server --features dev-node -- --nodes 10
  *   3. Run this test:         npx tsx tests/internal/stress_mesh.ts
  *
