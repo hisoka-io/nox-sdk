@@ -9,8 +9,7 @@
  * - Web3 signed TX broadcasts (2 self-transfer + registry call)
  * - On-chain broadcasts via mixnet (3 token transfer + approve + ETH transfer)
  *
- * For exit node REVENUE (ZK gas payment proofs), use micro_mainnet_sim:
- *   cargo run --bin micro_mainnet_sim -p nox-sim --features dev-node
+ * For exit node paid-execution revenue, use the funded paid-mesh runner.
  *
  * Usage:
  *   SEED="https://api.hisoka.io/seed" npx tsx tests/internal/traffic_generator.ts
@@ -35,13 +34,30 @@ const SKIP_WEB3_WRITES = process.env["SKIP_WEB3_WRITES"] === "1";
 const TIMEOUT = 60_000;
 const SURBS = 10;
 
-// Contracts (Arbitrum Sepolia)
-const STAKING_TOKEN = "0x208be235AAB9b8b5d86285b2684c8e6743e662b5";
-const REWARD_POOL = "0x1D336Fd873178a41333Ec7B50Be0fF52A5F69E1d";
-const REGISTRY = "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc";
-const ARB_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc";
-const FUNDED_KEY =
-  "3e8a4387dce9ecce4d3dabf84e8d3883074a4756ae369906175e8ca40f52af68";
+const ETH_RPC_URL = requiredEnv("ETH_RPC_URL");
+const REGISTRY = requiredAddressEnv("REGISTRY_ADDRESS");
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value.length === 0) throw new Error(`${name} is required`);
+  return value;
+}
+
+function requiredAddressEnv(name: string): string {
+  const value = requiredEnv(name);
+  if (!/^0x[0-9a-fA-F]{40}$/u.test(value)) {
+    throw new Error(`${name} must be a 20-byte Ethereum address`);
+  }
+  return value;
+}
+
+function requiredPrivateKey(): string {
+  const value = requiredEnv("FUNDED_KEY");
+  if (!/^[0-9a-f]{64}$/u.test(value) || /^0+$/u.test(value)) {
+    throw new Error("FUNDED_KEY must be a nonzero lowercase 32-byte hex private key");
+  }
+  return value;
+}
 
 // ============================================================================
 // Helpers
@@ -104,13 +120,16 @@ async function main() {
     powDifficulty: POW,
     timeoutMs: TIMEOUT,
     surbsPerRequest: SURBS,
-    dangerouslySkipFingerprintCheck: true,
+    ethRpcUrl: ETH_RPC_URL,
+    registryAddress: REGISTRY,
   });
   log("Connected to mixnet.\n");
 
   const ethers = await import("ethers");
-  const provider = new ethers.JsonRpcProvider(ARB_SEPOLIA_RPC);
-  const signer = new ethers.Wallet(FUNDED_KEY, provider);
+  const provider = new ethers.JsonRpcProvider(ETH_RPC_URL);
+  const signer = SKIP_WEB3_WRITES
+    ? null
+    : new ethers.Wallet(requiredPrivateKey(), provider);
 
   for (let round = 1; round <= ROUNDS; round++) {
     if (ROUNDS > 1) log(`\n========== ROUND ${round}/${ROUNDS} ==========`);
@@ -262,7 +281,7 @@ async function main() {
 
     await test("rpc_getBalance", async () => {
       const r = await client.rpcCall("eth_getBalance", [
-        signer.address,
+        REGISTRY,
         "latest",
       ]);
       if (typeof r !== "string") throw new Error(`Bad: ${typeof r}`);
@@ -282,6 +301,7 @@ async function main() {
     // Web3 Signed TX Broadcasts (populates exitBroadcast)
     // ======================================================================
     if (!SKIP_WEB3_WRITES) {
+      if (signer === null) throw new Error("FUNDED_KEY is required for write traffic");
       log("\n=== Signed TX Broadcasts ===");
 
       await test("signed_self_transfer", async () => {
@@ -343,105 +363,6 @@ async function main() {
         return resp.length;
       });
 
-      // ====================================================================
-      // On-Chain Broadcasts via Mixnet (populates exitBroadcast)
-      //
-      // These are user-signed TXs broadcast through the mixnet for IP privacy.
-      // The user pays gas directly. Exit nodes broadcast but don't earn revenue.
-      //
-      // For exit node REVENUE, use the full ZK gas_payment flow via
-      // micro_mainnet_sim (Rust) which builds real ZK proofs:
-      //   cargo run --bin micro_mainnet_sim -p nox-sim --features dev-node
-      // ====================================================================
-      log("\n=== On-Chain Broadcasts via Mixnet ===");
-
-      const erc20Iface = new ethers.Interface([
-        "function transfer(address,uint256) returns (bool)",
-        "function approve(address,uint256) returns (bool)",
-        "function balanceOf(address) view returns (uint256)",
-      ]);
-
-      // Token transfer via mixnet (user pays gas, exit node broadcasts)
-      await test("broadcast_token_transfer", async () => {
-        const nonce = await provider.getTransactionCount(signer.address);
-        const feeData2 = await provider.getFeeData();
-        const calldata = erc20Iface.encodeFunctionData("transfer", [
-          REGISTRY, // send to registry address (harmless, it's a contract)
-          ethers.parseUnits("1", 18),
-        ]);
-        const tx = await signer.signTransaction({
-          to: STAKING_TOKEN,
-          data: calldata,
-          value: 0n,
-          nonce,
-          chainId: 421614n,
-          gasLimit: 100000n,
-          maxFeePerGas: feeData2.maxFeePerGas ?? 1000000000n,
-          maxPriorityFeePerGas: feeData2.maxPriorityFeePerGas ?? 100000000n,
-          type: 2,
-        });
-        const resp = await client.broadcastSignedTransaction(ethers.getBytes(tx));
-        if (resp.length < 32) throw new Error(`Response too short: ${resp.length}`);
-        const txHash = "0x" + Array.from(resp.slice(0, 32)).map((b) => b.toString(16).padStart(2, "0")).join("");
-        log(`    tx: ${txHash}`);
-        const receipt = await provider.waitForTransaction(txHash, 1, 30_000);
-        if (!receipt || receipt.status !== 1) throw new Error("TX failed");
-        log(`    gas: ${receipt.gasUsed}, block: ${receipt.blockNumber}`);
-        return resp.length;
-      });
-
-      // Token approval via mixnet
-      await test("broadcast_token_approve", async () => {
-        const nonce = await provider.getTransactionCount(signer.address);
-        const feeData2 = await provider.getFeeData();
-        const calldata = erc20Iface.encodeFunctionData("approve", [
-          REWARD_POOL,
-          ethers.MaxUint256,
-        ]);
-        const tx = await signer.signTransaction({
-          to: STAKING_TOKEN,
-          data: calldata,
-          value: 0n,
-          nonce,
-          chainId: 421614n,
-          gasLimit: 100000n,
-          maxFeePerGas: feeData2.maxFeePerGas ?? 1000000000n,
-          maxPriorityFeePerGas: feeData2.maxPriorityFeePerGas ?? 100000000n,
-          type: 2,
-        });
-        const resp = await client.broadcastSignedTransaction(ethers.getBytes(tx));
-        if (resp.length < 32) throw new Error(`Response too short: ${resp.length}`);
-        const txHash = "0x" + Array.from(resp.slice(0, 32)).map((b) => b.toString(16).padStart(2, "0")).join("");
-        log(`    tx: ${txHash}`);
-        const receipt = await provider.waitForTransaction(txHash, 1, 30_000);
-        if (!receipt || receipt.status !== 1) throw new Error("TX failed");
-        log(`    gas: ${receipt.gasUsed}, block: ${receipt.blockNumber}`);
-        return resp.length;
-      });
-
-      // ETH transfer via mixnet
-      await test("broadcast_eth_transfer", async () => {
-        const nonce = await provider.getTransactionCount(signer.address);
-        const feeData2 = await provider.getFeeData();
-        const tx = await signer.signTransaction({
-          to: ethers.Wallet.createRandom().address,
-          value: ethers.parseEther("0.0001"),
-          nonce,
-          chainId: 421614n,
-          gasLimit: 21000n,
-          maxFeePerGas: feeData2.maxFeePerGas ?? 1000000000n,
-          maxPriorityFeePerGas: feeData2.maxPriorityFeePerGas ?? 100000000n,
-          type: 2,
-        });
-        const resp = await client.broadcastSignedTransaction(ethers.getBytes(tx));
-        if (resp.length < 32) throw new Error(`Response too short: ${resp.length}`);
-        const txHash = "0x" + Array.from(resp.slice(0, 32)).map((b) => b.toString(16).padStart(2, "0")).join("");
-        log(`    tx: ${txHash}`);
-        const receipt = await provider.waitForTransaction(txHash, 1, 30_000);
-        if (!receipt || receipt.status !== 1) throw new Error("TX failed");
-        log(`    gas: ${receipt.gasUsed}, block: ${receipt.blockNumber}`);
-        return resp.length;
-      });
     }
   }
 
@@ -465,44 +386,6 @@ async function main() {
   }
 
   log(`\n  TOTAL: ${passed} passed, ${failed} failed, ${results.length} tests`);
-
-  // ======================================================================
-  // Dashboard Metrics Check
-  // ======================================================================
-  if (!SKIP_WEB3_WRITES) {
-    log("\n=== EXIT NODE DASHBOARD METRICS ===");
-    for (const [name, ip] of [
-      ["nox-6", "98.92.70.228"],
-      ["nox-7", "3.226.251.110"],
-      ["nox-10", "13.223.188.90"],
-    ] as const) {
-      try {
-        const m = await (
-          await fetch(`http://${ip}:15001/metrics/json`)
-        ).json();
-        if (
-          m.exitEthereum > 0 ||
-          m.exitHttp > 0 ||
-          m.exitRpc > 0 ||
-          m.exitEcho > 0
-        ) {
-          log(`${name}:`);
-          log(
-            `  exit: echo=${m.exitEcho} http=${m.exitHttp} rpc=${m.exitRpc} broadcast=${m.exitBroadcast} ethereum=${m.exitEthereum}`,
-          );
-          log(
-            `  econ: revenue=$${m.cumulativeRevenueUsd?.toFixed(2)} cost=$${m.cumulativeCostUsd?.toFixed(4)} P&L=$${(m.cumulativeRevenueUsd - m.cumulativeCostUsd)?.toFixed(2)}`,
-          );
-          log(
-            `  prof: profitable=${m.profitableCount} unprofitable=${m.unprofitableCount} submitted=${m.ethTransactionsSubmitted}`,
-          );
-        }
-      } catch {
-        /* skip unreachable */
-      }
-    }
-  }
-
   log("========================================");
   client.disconnect();
   process.exit(failed > 0 ? 1 : 0);

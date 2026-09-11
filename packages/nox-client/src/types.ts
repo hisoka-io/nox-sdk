@@ -8,11 +8,24 @@ export interface RelayerNode {
   layer: number;
   role: number;
   ingress_url?: string;
+  metadata_url?: string;
+}
+
+export type TopologyLivenessStatus = "online" | "offline";
+
+/** Untrusted availability observation for a chain-authenticated member. */
+export interface TopologyLiveness {
+  address: string;
+  status: TopologyLivenessStatus;
+  observed_at_unix: number;
 }
 
 export interface TopologySnapshot {
   nodes: RelayerNode[];
   fingerprint: string;
+  /** Seed topology wire schema. Version 2 separates chain membership from liveness. */
+  schema_version?: number;
+  liveness?: TopologyLiveness[];
   timestamp?: number;
   block_number?: number;
   pow_difficulty?: number;
@@ -51,18 +64,20 @@ export interface NoxClientConfig {
   ethRpcUrl?: string;
   registryAddress?: string;
   topologyRefreshMs?: number;
+  /** Maximum age accepted for an indexer's online liveness observation. */
+  livenessMaxAgeMs?: number;
   timeoutMs?: number;
   /** SURBs per request (~30KB each). Default: 10. */
   surbsPerRequest?: number;
   powDifficulty?: number;
-  /** Skip fingerprint check -- only for local test meshes. */
+  /** Skip fingerprint checks. Accepted only when every seed is a loopback URL. */
   dangerouslySkipFingerprintCheck?: boolean;
   /** FEC (Forward Error Correction) ratio for redundancy shards. Range: 0.0-1.0. Default: 0.3. */
   fecRatio?: number;
 }
 
 /**
- * Production-ready defaults for the Hisoka testnet.
+ * Transport defaults. Production callers must supply ethRpcUrl and registryAddress.
  * Pass directly to `NoxClient.connect()` or spread with overrides:
  *
  *   await NoxClient.connect(DEFAULTS)
@@ -73,10 +88,11 @@ export const DEFAULTS: Required<NoxClientConfig> = {
   ethRpcUrl: "",
   registryAddress: "",
   topologyRefreshMs: 60_000,
+  livenessMaxAgeMs: 180_000,
   timeoutMs: 30_000,
   surbsPerRequest: 10,
   powDifficulty: 3,
-  dangerouslySkipFingerprintCheck: true,
+  dangerouslySkipFingerprintCheck: false,
   fecRatio: 0.3,
 };
 

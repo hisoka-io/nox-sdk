@@ -11,9 +11,10 @@ Pass options to `NoxClient.connect()` to control how the SDK discovers nodes, ve
 const client = await NoxClient.connect({
   seeds: ["https://seed.example.com"],
   ethRpcUrl: "https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY",
-  registryAddress: "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc",
+  registryAddress: "0xCURRENT_NOX_REGISTRY",
   timeoutMs: 30_000,
   topologyRefreshMs: 60_000,
+  livenessMaxAgeMs: 180_000,
   surbsPerRequest: 10,
   fecRatio: 0.3,
   powDifficulty: 0,
@@ -24,7 +25,7 @@ const client = await NoxClient.connect({
 
 ### `seeds`
 
-**Type:** `string[]`  - **Default:** `[]`
+**Type:** `string[]`  - **Default:** `["https://api.hisoka.io/seed"]`
 
 Seed node URLs for topology discovery. The SDK tries these first, then falls back to the default seed API (`api.hisoka.io/seed`).
 
@@ -34,7 +35,8 @@ Set this if you're running your own seed node or need deterministic bootstrappin
 
 **Type:** `string`  - **Default:** `""`
 
-Ethereum RPC endpoint for on-chain topology verification. When set alongside `registryAddress`, the SDK fetches the topology fingerprint from the NoxRegistry contract and compares it to the seed node's topology.
+Ethereum RPC endpoint for on-chain topology verification. Required alongside `registryAddress` unless every
+seed is loopback and the local-test bypass is explicit.
 
 This catches compromised or stale seed nodes. If the fingerprints don't match, `connect()` throws a `TopologyVerificationFailed` error.
 
@@ -42,7 +44,10 @@ This catches compromised or stale seed nodes. If the fingerprints don't match, `
 
 **Type:** `string`  - **Default:** `""`
 
-Address of the NoxRegistry contract. Only used when `ethRpcUrl` is also set. See [Deployments](./deployments) for the current address.
+Address of the NoxRegistry contract. Required alongside `ethRpcUrl`.
+
+Use the address from the current signed deployment record. `0xCURRENT_NOX_REGISTRY` in examples is an
+intentional fail-closed placeholder, not a deployed address.
 
 ### `timeoutMs`
 
@@ -58,7 +63,15 @@ Mixnet requests have inherent latency from three hops plus any mixing delays. If
 
 How often the SDK re-fetches the node list from the seed node. The network topology can change as nodes join, leave, or get slashed.
 
-Lower values mean faster reaction to node changes but more background traffic. In most cases, 60 seconds is fine. For long-running processes that need high availability, consider 30 seconds.
+### `livenessMaxAgeMs`
+
+**Type:** `number`  - **Default:** `180000`
+
+Maximum age for an indexer's `online` observation. The SDK verifies the full registered member set and every
+profile at the seed's pinned chain block, then routes only through members that are both chain-eligible and
+recently observed online. A stale, future-dated, missing, duplicate, or incomplete liveness set fails closed.
+
+Lower values react more quickly to node loss. The default permits three one-minute indexer probe intervals.
 
 ### `surbsPerRequest`
 
@@ -80,7 +93,7 @@ FEC allows the client to reconstruct a response even if some fragments are lost 
 
 ### `powDifficulty`
 
-**Type:** `number`  - **Default:** `0`
+**Type:** `number`  - **Default:** `3`
 
 Proof-of-work difficulty for Sphinx packets. The network can require PoW to prevent spam. `0` means no PoW (typical for testnet). In production, the SDK reads the required difficulty from the topology and uses it automatically  - you rarely need to set this manually.
 
@@ -88,7 +101,8 @@ Proof-of-work difficulty for Sphinx packets. The network can require PoW to prev
 
 **Type:** `boolean`  - **Default:** `false`
 
-Skip topology fingerprint self-consistency verification. The SDK normally verifies that the topology data is internally consistent (the fingerprint matches the node list).
+Skip topology fingerprint verification. The SDK accepts this option only when every configured seed is a
+loopback URL.
 
 :::warning
 Only use this for local development with a test mesh where you control all nodes. In any other context, this disables a critical safety check.
@@ -96,27 +110,30 @@ Only use this for local development with a test mesh where you control all nodes
 
 ## Defaults
 
-With no options, the SDK:
-
-1. Resolves seed nodes via DNS
-2. Fetches the topology from the first reachable seed
-3. Verifies topology self-consistency (no on-chain check)
-4. Refreshes the node list every 60 seconds
-5. Uses PoW difficulty from the network (or 0 if not set)
+Production connections require both verification inputs and fail before seed discovery if either is absent:
 
 ```ts
-const client = await NoxClient.connect();
+const client = await NoxClient.connect({
+  ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
+  registryAddress: "0xCURRENT_NOX_REGISTRY",
+});
 ```
 
 ## On-chain verification
 
-For stronger security, verify the topology against the on-chain registry:
+Outside a loopback test mesh, the SDK accepts only schema version 2 snapshots. It verifies the full registered
+member set, fingerprint, count, deterministic layer assignment, and every profile against one pinned registry
+block. The indexer contributes availability only: a member must also be recently observed online before routing.
+
+The SDK verifies both the snapshot's self-consistency and its fingerprint against the on-chain registry:
 
 ```ts
 const client = await NoxClient.connect({
   ethRpcUrl: "https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY",
-  registryAddress: "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc",
+  registryAddress: "0xCURRENT_NOX_REGISTRY",
 });
 ```
 
-The SDK compares the topology fingerprint against the smart contract. If they don't match, connection fails with `TopologyVerificationFailed`.
+The SDK pins every Registry read to the snapshot block when supplied, or to one fetched block for a legacy
+snapshot. It checks the complete address set and every routing profile. Any mismatch fails with
+`TopologyVerificationFailed` and a bounded field-specific diagnostic.

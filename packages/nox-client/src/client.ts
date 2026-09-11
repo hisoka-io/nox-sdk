@@ -10,10 +10,13 @@ import { resolveSeedUrl } from "./seeder.js";
 import {
   fetchTopology,
   verifySelfConsistency,
-  verifyOnChain,
+  verifyOnChainWithEligibility,
   computeTopologyFingerprint,
   parseNodes,
+  selectLiveNodes,
   selectRoute,
+  hasUsableIngress,
+  layersForRole,
 } from "./topology.js";
 import { postPacket, claimResponses, ResponseWebSocket, hasWebSocket } from "./transport.js";
 import {
@@ -22,12 +25,30 @@ import {
   decodeRelayerPayload,
   decodeRpcResponse,
   type RelayerPayload,
+  decodePaidQuoteOutcomeV2,
+  decodePaidTransactionOutcomeV2,
+  decodeSubmitTransactionResponse,
+  type PaidQuoteRequestV2,
+  type PaidTransactionOutcomeV2,
+  type SubmitTransactionResponse,
 } from "./bincode.js";
 import type { FragmentWire } from "./bincode.js";
 import { Reassembler } from "./fragmentation.js";
 import { SurbPool } from "./surb_pool.js";
 import { ReplenishmentManager, buildReturnPath } from "./replenishment.js";
-import { bytesToHex, hexToBytes, initNodeCrypto, buildSphinxPacket } from "./utils.js";
+import {
+  bytesToHex,
+  hexToBytes,
+  buildSphinxPacket,
+  secureRandomIndex,
+} from "./utils.js";
+import {
+  validateIssuedPaidQuote,
+  validatePaidQuoteRequest,
+  fetchPaidChainTimestamp,
+  type IssuedPaidQuoteV2,
+  type PaidQuoteResultV2,
+} from "./paid.js";
 
 export const EMA_ALPHA = 0.2;
 export const EMA_HEADROOM = 1.5;
@@ -98,11 +119,13 @@ export class NoxClient {
   private nextRequestId = BigInt(0);
   private _nodes: TopologyNode[];
   private _entryUrl: string;
+  private _seedUrl: string;
+  private _topologyVerifiedAtMs: number;
+  private _topologyRefreshError: NoxClientError | null = null;
 
   private readonly _config: Required<NoxClientConfig>;
 
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private _wasm: Record<string, any> | null = null;
+  private _wasm: Record<string, unknown> | null = null;
 
   get nodes(): TopologyNode[] {
     return this._nodes;
@@ -120,6 +143,10 @@ export class NoxClient {
     return this._config;
   }
 
+  get topologyRefreshError(): NoxClientError | null {
+    return this._topologyRefreshError;
+  }
+
   private topologyTimer: ReturnType<typeof setInterval> | null = null;
   private pollTimer: ReturnType<typeof setInterval> | null = null;
   private stallTimer: ReturnType<typeof setInterval> | null = null;
@@ -131,18 +158,22 @@ export class NoxClient {
   private constructor(
     nodes: TopologyNode[],
     entryUrl: string,
+    seedUrl: string,
     config: Required<NoxClientConfig>,
+    topologyVerifiedAtMs: number,
   ) {
     this._nodes = nodes;
     this._entryUrl = entryUrl;
+    this._seedUrl = seedUrl;
     this._config = config;
+    this._topologyVerifiedAtMs = topologyVerifiedAtMs;
     this.surbPool = new SurbPool();
     this.replenishment = new ReplenishmentManager();
     this.adaptive = new AdaptiveSurbBudget();
   }
 
   /**
-   * One-liner to connect with production defaults.
+   * Connect with transport defaults and caller-supplied verification inputs.
    * Equivalent to `NoxClient.connect(DEFAULTS)` with optional overrides.
    *
    *   const client = await NoxClient.init();
@@ -154,13 +185,12 @@ export class NoxClient {
 
   /** Resolve seeds, fetch topology, init WASM, start background loops. */
   static async connect(config: NoxClientConfig = {}): Promise<NoxClient> {
-    await initNodeCrypto();
-
     const full: Required<NoxClientConfig> = {
       seeds: config.seeds ?? DEFAULTS.seeds,
       ethRpcUrl: config.ethRpcUrl ?? DEFAULTS.ethRpcUrl,
       registryAddress: config.registryAddress ?? DEFAULTS.registryAddress,
       topologyRefreshMs: config.topologyRefreshMs ?? DEFAULTS.topologyRefreshMs,
+      livenessMaxAgeMs: config.livenessMaxAgeMs ?? DEFAULTS.livenessMaxAgeMs,
       timeoutMs: config.timeoutMs ?? DEFAULTS.timeoutMs,
       surbsPerRequest: config.surbsPerRequest ?? DEFAULTS.surbsPerRequest,
       powDifficulty: config.powDifficulty ?? DEFAULTS.powDifficulty,
@@ -168,6 +198,8 @@ export class NoxClient {
         config.dangerouslySkipFingerprintCheck ?? DEFAULTS.dangerouslySkipFingerprintCheck,
       fecRatio: config.fecRatio ?? DEFAULTS.fecRatio,
     };
+
+    validateTopologyVerificationConfig(full);
 
     const seedUrl = await resolveSeedUrl(full.seeds, full.timeoutMs);
     if (seedUrl === null) {
@@ -178,14 +210,16 @@ export class NoxClient {
     }
 
     const snapshot = await fetchTopology(seedUrl, full.timeoutMs);
-    if (!full.dangerouslySkipFingerprintCheck) {
-      verifySelfConsistency(snapshot);
-    }
-    if (full.ethRpcUrl && full.registryAddress) {
-      const fp = computeTopologyFingerprint(snapshot.nodes);
-      await verifyOnChain(full.ethRpcUrl, full.registryAddress, fp);
-    }
-    const nodes = parseNodes(snapshot);
+    verifySelfConsistency(snapshot, !full.dangerouslySkipFingerprintCheck);
+    const chainEligibleAddresses = full.dangerouslySkipFingerprintCheck
+      ? undefined
+      : await verifyOnChainWithEligibility(
+        full.ethRpcUrl,
+        full.registryAddress,
+        snapshot.nodes,
+        snapshot.block_number,
+      );
+    const nodes = nodesForRouting(snapshot, full, chainEligibleAddresses);
     if (nodes.length === 0) {
       throw new NoxClientError(
         "Topology returned 0 nodes",
@@ -199,7 +233,13 @@ export class NoxClient {
 
     const entryUrl = pickEntryUrl(nodes);
 
-    const client = new NoxClient(nodes, entryUrl, full);
+    const client = new NoxClient(
+      nodes,
+      entryUrl,
+      seedUrl,
+      full,
+      full.dangerouslySkipFingerprintCheck ? 0 : Date.now(),
+    );
 
     await client._initWasm();
     client._startTopologyRefresh(seedUrl);
@@ -227,6 +267,113 @@ export class NoxClient {
     const response = await this._sendAnonymous(inner, "submitTransaction", undefined, undefined, 2);
     this.adaptive.record("submitTransaction", response.length);
     return response;
+  }
+
+  /** Submit through the legacy wire and decode its bounded response. */
+  async submitTransactionTyped(
+    to: string,
+    data: Uint8Array,
+  ): Promise<SubmitTransactionResponse> {
+    return decodeSubmitTransactionResponse(await this.submitTransaction(to, data));
+  }
+
+  selectPaidExit(): TopologyNode {
+    const pinnedEntry = this._nodes.find((node) => node.address === this._entryUrl);
+    const selected = selectRoute(this._nodes, pinnedEntry).exit;
+    return cloneTopologyNode(selected);
+  }
+
+  async requestPaidQuote(
+    request: PaidQuoteRequestV2,
+    selectedExit: TopologyNode,
+  ): Promise<PaidQuoteResultV2> {
+    await this._ensureFreshPaidTopology();
+    const chainTimestamp = await fetchPaidChainTimestamp(
+      this._config.ethRpcUrl,
+      this._config.timeoutMs,
+    );
+    validatePaidQuoteRequest(request, chainTimestamp);
+    const canonicalExit = this._resolvePaidExit(selectedExit);
+    const inner = encodeServiceRequest({ tag: "PaidQuoteRequestV2", ...request });
+    const response = await this._sendAnonymous(
+      inner,
+      "paidQuoteV2",
+      undefined,
+      undefined,
+      2,
+      canonicalExit,
+    );
+    this.adaptive.record("paidQuoteV2", response.length);
+    const outcome = decodePaidQuoteOutcomeV2(response);
+    if (outcome.status === "rejected") return outcome;
+    return validateIssuedPaidQuote(
+      outcome,
+      request,
+      canonicalExit,
+      undefined,
+    );
+  }
+
+  async submitPaidTransaction(
+    issued: IssuedPaidQuoteV2,
+    calldata: Uint8Array,
+  ): Promise<PaidTransactionOutcomeV2> {
+    if (!(calldata instanceof Uint8Array) || calldata.length === 0) {
+      throw new NoxClientError(
+        "submitPaidTransaction calldata must be a non-empty Uint8Array",
+        NoxClientErrorCode.InvalidConfig,
+      );
+    }
+    await this._ensureFreshPaidTopology();
+    const chainTimestamp = await fetchPaidChainTimestamp(
+      this._config.ethRpcUrl,
+      this._config.timeoutMs,
+    );
+    const selectedExit = this._resolvePaidExit(issued.selectedExit);
+    const verified = validateIssuedPaidQuote(
+      issued,
+      undefined,
+      selectedExit,
+      chainTimestamp,
+    );
+    const inner = encodeServiceRequest({
+      tag: "PaidTransactionV2",
+      chainId: wordToU64(verified.quote.chainId, "quote.chainId"),
+      entryPoint: verified.quote.entryPoint,
+      calldata,
+      executionId: verified.executionId,
+      validUntilUnix: verified.quote.validUntilUnix,
+    });
+    const response = await this._sendAnonymous(
+      inner,
+      "paidTransactionV2",
+      undefined,
+      undefined,
+      2,
+      selectedExit,
+    );
+    this.adaptive.record("paidTransactionV2", response.length);
+    const outcome = decodePaidTransactionOutcomeV2(response);
+    if (
+      outcome.status === "submitted" &&
+      !bytesEqual(outcome.executionId, verified.executionId)
+    ) {
+      throw new NoxClientError(
+        "Paid transaction response executionId does not match the submitted quote",
+        NoxClientErrorCode.DecryptionFailed,
+      );
+    }
+    if (
+      outcome.status === "rejected" &&
+      outcome.executionId !== null &&
+      !bytesEqual(outcome.executionId, verified.executionId)
+    ) {
+      throw new NoxClientError(
+        "Paid transaction rejection executionId does not match the submitted quote",
+        NoxClientErrorCode.DecryptionFailed,
+      );
+    }
+    return outcome;
   }
 
   /** Broadcast a pre-signed transaction through the mixnet. */
@@ -440,6 +587,7 @@ export class NoxClient {
     timeoutMs?: number,
     expectedResponseBytes?: number,
     surbCountOverride?: number,
+    selectedExit?: TopologyNode,
   ): Promise<Uint8Array> {
     let surbCount: number;
     if (expectedResponseBytes !== undefined && expectedResponseBytes > 0) {
@@ -456,6 +604,7 @@ export class NoxClient {
       { tag: "AnonymousRequest", inner, replySurbs: [] },
       surbCount,
       timeoutMs,
+      selectedExit,
     );
   }
 
@@ -463,11 +612,12 @@ export class NoxClient {
     payload: RelayerPayload,
     surbCount: number,
     timeoutMs?: number,
+    selectedExit?: TopologyNode,
   ): Promise<Uint8Array> {
     this._requireWasm();
 
     const pinnedEntry = this._nodes.find((n) => n.address === this._entryUrl);
-    const route = selectRoute(this._nodes, pinnedEntry);
+    const route = selectRoute(this._nodes, pinnedEntry, selectedExit);
     const forwardPath: PathHop[] = [
       { pubKeyHex: bytesToHex(route.entry.publicKey), address: route.entry.routingAddress },
       { pubKeyHex: bytesToHex(route.mix.publicKey), address: route.mix.routingAddress },
@@ -672,14 +822,14 @@ export class NoxClient {
       items = await claimResponses(this._entryUrl, surbIds);
     } catch (pollErr) {
       if (this._debugPoll) {
-        process.stderr.write(`[poll] fetch error: ${String(pollErr).slice(0, 120)}\n`);
+        this._debug(`[poll] fetch error: ${String(pollErr).slice(0, 120)}`);
       }
       return;
     }
 
     if (this._debugPoll && items.length > 0) {
-      process.stderr.write(
-        `[poll] got ${items.length} items from ${this._entryUrl}, pending=${this.pending.size}\n`,
+      this._debug(
+        `[poll] got ${items.length} items from ${this._entryUrl}, pending=${this.pending.size}`,
       );
     }
 
@@ -698,8 +848,8 @@ export class NoxClient {
 
       if (match === null) {
         if (this._debugPoll) {
-          process.stderr.write(
-            `[poll] matchAndDecrypt returned null for item id=${item.id} data_len=${encryptedBody.length}\n`,
+          this._debug(
+            `[poll] matchAndDecrypt returned null for item id=${item.id} data_len=${encryptedBody.length}`,
           );
         }
         continue;
@@ -707,8 +857,8 @@ export class NoxClient {
       const { requestId, plaintext } = match;
 
       if (this._debugPoll) {
-        process.stderr.write(
-          `[poll] decrypted item id=${item.id} -> requestId=${requestId} plaintext_len=${plaintext.length}\n`,
+        this._debug(
+          `[poll] decrypted item id=${item.id} -> requestId=${requestId} plaintext_len=${plaintext.length}`,
         );
       }
 
@@ -717,15 +867,15 @@ export class NoxClient {
         decoded = decodeRelayerPayload(plaintext);
       } catch (decodeErr) {
         if (this._debugPoll) {
-          process.stderr.write(
-            `[poll] decodeRelayerPayload failed: ${String(decodeErr).slice(0, 120)}\n`,
+          this._debug(
+            `[poll] decodeRelayerPayload failed: ${String(decodeErr).slice(0, 120)}`,
           );
         }
         continue;
       }
 
       if (this._debugPoll) {
-        process.stderr.write(`[poll] decoded tag=${decoded.tag}\n`);
+        this._debug(`[poll] decoded tag=${decoded.tag}`);
       }
 
       if (decoded.tag === "ServiceResponse") {
@@ -763,10 +913,10 @@ export class NoxClient {
         if (remaining <= 0) continue;
 
         if (this._debugPoll) {
-          process.stderr.write(
+          this._debug(
             `[stall] detected stall for request ${clientRequestId}: ` +
               `${received}/${total} fragments, ${remaining} missing, ` +
-              `${(sinceLastFragment / 1000).toFixed(1)}s since last fragment\n`,
+              `${(sinceLastFragment / 1000).toFixed(1)}s since last fragment`,
           );
         }
 
@@ -795,8 +945,8 @@ export class NoxClient {
       const progress = req.reassembler.messageProgress(fragment.messageId);
       const received = progress ? progress[0] : 0;
       if (received === 0 || received % 500 === 0) {
-        process.stderr.write(
-          `[frag] msgId=${fragment.messageId} seq=${fragment.sequence} total=${fragment.totalFragments} received=${received} data=${fragment.data.length} surbPool=${this.surbPool.size}\n`,
+        this._debug(
+          `[frag] msgId=${fragment.messageId} seq=${fragment.sequence} total=${fragment.totalFragments} received=${received} data=${fragment.data.length} surbPool=${this.surbPool.size}`,
         );
       }
     }
@@ -829,18 +979,18 @@ export class NoxClient {
       const sinceBurst = now - state.sentAt;
       if (sinceBurst < NoxClient.STALL_TIMEOUT_MS) {
         if (this._debugPoll) {
-          process.stderr.write(
+          this._debug(
             `[replenish] ignoring NeedMoreSurbs for request ${clientRequestId} ` +
-              `(round ${state.round}, ${((NoxClient.STALL_TIMEOUT_MS - sinceBurst) / 1000).toFixed(1)}s until stall check)\n`,
+              `(round ${state.round}, ${((NoxClient.STALL_TIMEOUT_MS - sinceBurst) / 1000).toFixed(1)}s until stall check)`,
           );
         }
         return;
       }
       if (state.round >= NoxClient.MAX_BURST_ROUNDS) {
         if (this._debugPoll) {
-          process.stderr.write(
+          this._debug(
             `[replenish] max burst rounds (${NoxClient.MAX_BURST_ROUNDS}) reached for request ${clientRequestId}, ` +
-              `${fragmentsRemaining} fragments still missing\n`,
+              `${fragmentsRemaining} fragments still missing`,
           );
         }
         return;
@@ -862,9 +1012,9 @@ export class NoxClient {
     const packetsNeeded = Math.min(totalPacketsNeeded, MAX_PACKETS_PER_BURST);
 
     if (this._debugPoll) {
-      process.stderr.write(
+      this._debug(
         `[replenish] burst round ${round}: sending ${packetsNeeded}/${totalPacketsNeeded} ReplenishSurbs ` +
-          `for request ${clientRequestId} (${fragmentsRemaining} fragments remaining)\n`,
+          `for request ${clientRequestId} (${fragmentsRemaining} fragments remaining)`,
       );
     }
 
@@ -883,11 +1033,15 @@ export class NoxClient {
     } catch (err) {
       this.burstState.delete(clientRequestId);
       if (this._debugPoll) {
-        process.stderr.write(
-          `[replenish] burst round ${round} failed for request ${clientRequestId}: ${String(err).slice(0, 120)}\n`,
+        this._debug(
+          `[replenish] burst round ${round} failed for request ${clientRequestId}: ${String(err).slice(0, 120)}`,
         );
       }
     }
+  }
+
+  private _debug(message: string): void {
+    globalThis.console?.debug(message);
   }
 
   private _startTopologyRefresh(initialSeed: string): void {
@@ -897,25 +1051,42 @@ export class NoxClient {
   }
 
   private async _refreshTopology(seedUrl: string): Promise<void> {
-    const candidates = [seedUrl];
+    const candidates = Array.from(
+      new Set([
+        seedUrl,
+        ...this._config.seeds.map((seed) =>
+          seed.endsWith("/topology")
+            ? seed.slice(0, -"/topology".length)
+            : seed,
+        ),
+      ]),
+    );
+    let lastError: NoxClientError | null = null;
 
     for (const seed of candidates) {
       try {
         const snapshot = await fetchTopology(seed, this._config.timeoutMs);
-        if (!this._config.dangerouslySkipFingerprintCheck) {
-          verifySelfConsistency(snapshot);
-        }
-        if (this._config.ethRpcUrl && this._config.registryAddress) {
-          const fp = computeTopologyFingerprint(snapshot.nodes);
-          await verifyOnChain(
+        verifySelfConsistency(snapshot, !this._config.dangerouslySkipFingerprintCheck);
+        const chainEligibleAddresses = this._config.dangerouslySkipFingerprintCheck
+          ? undefined
+          : await verifyOnChainWithEligibility(
             this._config.ethRpcUrl,
             this._config.registryAddress,
-            fp,
+            snapshot.nodes,
+            snapshot.block_number,
           );
-        }
-        const nodes = parseNodes(snapshot);
+        const nodes = nodesForRouting(
+          snapshot,
+          this._config,
+          chainEligibleAddresses,
+        );
         if (nodes.length > 0) {
           this._nodes = nodes;
+          this._seedUrl = seed;
+          this._topologyVerifiedAtMs = this._config.dangerouslySkipFingerprintCheck
+            ? 0
+            : Date.now();
+          this._topologyRefreshError = null;
           const currentStillPresent = nodes.some(
             (n) => n.address === this._entryUrl,
           );
@@ -933,15 +1104,68 @@ export class NoxClient {
           }
           return;
         }
-      } catch {
-        // Try next seed
+        lastError = new NoxClientError(
+          `Topology refresh from ${seed} returned zero nodes`,
+          NoxClientErrorCode.NoNodesAvailable,
+        );
+      } catch (error) {
+        lastError = asTopologyRefreshError(seed, error);
       }
     }
+    this._topologyRefreshError =
+      lastError ??
+      new NoxClientError(
+        "Topology refresh found no reachable seed",
+        NoxClientErrorCode.TopologyFetchFailed,
+      );
+  }
 
-    const newSeed = await resolveSeedUrl(this._config.seeds, this._config.timeoutMs);
-    if (newSeed !== null) {
-      await this._refreshTopology(newSeed);
+  private async _ensureFreshPaidTopology(): Promise<void> {
+    if (this._isPaidTopologyFresh()) return;
+    await this._refreshTopology(this._seedUrl);
+    this._requireFreshPaidTopology();
+  }
+
+  private _requireFreshPaidTopology(): void {
+    if (this._config.dangerouslySkipFingerprintCheck) {
+      throw new NoxClientError(
+        "Paid execution requires chain-backed topology verification",
+        NoxClientErrorCode.TopologyVerificationFailed,
+      );
     }
+    if (!this._isPaidTopologyFresh()) {
+      const detail = this._topologyRefreshError?.message ??
+        "no recent successful verification";
+      throw new NoxClientError(
+        `Paid route topology is stale: ${detail}`,
+        NoxClientErrorCode.TopologyVerificationFailed,
+        this._topologyRefreshError ?? undefined,
+      );
+    }
+  }
+
+  private _isPaidTopologyFresh(): boolean {
+    return (
+      !this._config.dangerouslySkipFingerprintCheck &&
+      this._topologyVerifiedAtMs > 0 &&
+      Date.now() - this._topologyVerifiedAtMs <= this._config.topologyRefreshMs
+    );
+  }
+
+  private _resolvePaidExit(selectedExit: TopologyNode): TopologyNode {
+    const normalizedId = normalizeEthereumAddress(selectedExit.id);
+    const node = this._nodes.find(
+      (candidate) =>
+        normalizeEthereumAddress(candidate.id) === normalizedId &&
+        (candidate.role === 2 || candidate.role === 3),
+    );
+    if (node === undefined) {
+      throw new NoxClientError(
+        `Selected paid exit ${selectedExit.id} is absent from the verified topology`,
+        NoxClientErrorCode.NoNodesAvailable,
+      );
+    }
+    return node;
   }
 
   private async _initWasm(): Promise<void> {
@@ -973,17 +1197,150 @@ export class NoxClient {
   }
 }
 
-function pickEntryUrl(nodes: TopologyNode[]): string {
-  const httpsEntries = nodes.filter((n) => n.address.startsWith("https://"));
-  const layerEntries = nodes.filter((n) => n.layer === 0 || n.layer === 1);
-  const pool = httpsEntries.length > 0 ? httpsEntries : layerEntries.length > 0 ? layerEntries : nodes;
-  const node = pool[Math.floor(Math.random() * pool.length)];
-  if (node === undefined) {
+function validateTopologyVerificationConfig(
+  config: Required<NoxClientConfig>,
+): void {
+  if (
+    !Number.isSafeInteger(config.livenessMaxAgeMs) ||
+    config.livenessMaxAgeMs <= 0
+  ) {
     throw new NoxClientError(
-      "Cannot pick entry URL: topology is empty",
+      "livenessMaxAgeMs must be a positive safe integer",
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+  if (config.dangerouslySkipFingerprintCheck) {
+    if (!config.seeds.every(isLoopbackUrl)) {
+      throw new NoxClientError(
+        "dangerouslySkipFingerprintCheck is restricted to loopback test meshes",
+        NoxClientErrorCode.InvalidConfig,
+      );
+    }
+    return;
+  }
+
+  if (config.ethRpcUrl.length === 0 || config.registryAddress.length === 0) {
+    throw new NoxClientError(
+      "Topology verification requires both ethRpcUrl and registryAddress; set dangerouslySkipFingerprintCheck only for a local test mesh",
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+  if (!/^0x[0-9a-fA-F]{40}$/u.test(config.registryAddress)) {
+    throw new NoxClientError(
+      "Topology verification registryAddress must be a 20-byte 0x-prefixed Ethereum address",
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+  try {
+    const rpcUrl = new URL(config.ethRpcUrl);
+    if (rpcUrl.protocol !== "http:" && rpcUrl.protocol !== "https:") {
+      throw new Error("unsupported protocol");
+    }
+  } catch {
+    throw new NoxClientError(
+      "Topology verification ethRpcUrl must be an absolute HTTP(S) URL",
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+}
+
+function nodesForRouting(
+  snapshot: import("./types.js").TopologySnapshot,
+  config: Required<NoxClientConfig>,
+  chainEligibleAddresses?: ReadonlySet<string>,
+): TopologyNode[] {
+  if (snapshot.schema_version !== 2) {
+    return parseNodes(snapshot);
+  }
+  const liveNodes = selectLiveNodes(
+    snapshot,
+    Math.floor(Date.now() / 1000),
+    Math.ceil(config.livenessMaxAgeMs / 1000),
+  );
+  const eligibleNodes = chainEligibleAddresses === undefined
+    ? liveNodes
+    : liveNodes.filter((node) =>
+      chainEligibleAddresses.has(normalizeEthereumAddress(node.address))
+    );
+  return parseNodes({ ...snapshot, nodes: eligibleNodes });
+}
+
+function isLoopbackUrl(value: string): boolean {
+  try {
+    const hostname = new URL(value).hostname.toLowerCase();
+    return (
+      hostname === "localhost" ||
+      hostname === "[::1]" ||
+      /^127(?:\.[0-9]{1,3}){3}$/u.test(hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function cloneTopologyNode(node: TopologyNode): TopologyNode {
+  return { ...node, publicKey: node.publicKey.slice() };
+}
+
+function normalizeEthereumAddress(value: string): string {
+  if (!/^0x[0-9a-fA-F]{40}$/u.test(value)) {
+    throw new NoxClientError(
+      `Paid exit ID must be a 20-byte Ethereum address: ${value}`,
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+  return value.toLowerCase();
+}
+
+function wordToU64(value: Uint8Array, field: string): bigint {
+  if (!(value instanceof Uint8Array) || value.length !== 32) {
+    throw new NoxClientError(
+      `${field} must be a 32-byte uint256 word`,
+      NoxClientErrorCode.DecryptionFailed,
+    );
+  }
+  const decoded = BigInt(`0x${bytesToHex(value)}`);
+  if (decoded > (1n << 64n) - 1n) {
+    throw new NoxClientError(
+      `${field} exceeds the paid-v2 uint64 wire range`,
+      NoxClientErrorCode.DecryptionFailed,
+    );
+  }
+  return decoded;
+}
+
+function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+  return (
+    left.length === right.length &&
+    left.every((byte, index) => byte === right[index])
+  );
+}
+
+function asTopologyRefreshError(
+  seed: string,
+  error: unknown,
+): NoxClientError {
+  if (error instanceof NoxClientError) return error;
+  return new NoxClientError(
+    `Topology refresh from ${seed} failed: ${String(error)}`,
+    NoxClientErrorCode.TopologyFetchFailed,
+    error,
+  );
+}
+
+function pickEntryUrl(nodes: TopologyNode[]): string {
+  const pool = nodes.filter(
+    (node) =>
+      layersForRole(node.role).includes(0) &&
+      hasUsableIngress(node.address),
+  );
+  if (pool.length === 0) {
+    throw new NoxClientError(
+      "No layer-0 node has a usable HTTP(S) ingress URL",
       NoxClientErrorCode.NoNodesAvailable,
     );
   }
+  const node = pool[secureRandomIndex(pool.length)]!;
   return node.address;
 }
 
@@ -997,4 +1354,3 @@ function parseSurbIdFromPacketId(packetId: string): string | null {
   if (suffix.length === 32 && HEX32_RE.test(suffix)) return suffix;
   return null;
 }
-

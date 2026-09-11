@@ -11,9 +11,19 @@ import {
   decodeServiceRequest,
   encodeRelayerPayload,
   decodeRelayerPayload,
+  decodeSubmitTransactionResponse,
+  decodePaidTransactionOutcomeV2,
+  decodePaidQuoteOutcomeV2,
+  encodePaidTransactionOutcomeV2,
+  encodePaidQuoteOutcomeV2,
   PAYLOAD_VERSION,
 } from "../src/bincode.js";
-import type { ServiceRequest, RelayerPayload } from "../src/bincode.js";
+import type {
+  PaidTransactionOutcomeV2,
+  PaidQuoteOutcomeV2,
+  ServiceRequest,
+  RelayerPayload,
+} from "../src/bincode.js";
 import { NoxClientError, NoxClientErrorCode } from "../src/types.js";
 
 // ---------------------------------------------------------------------------
@@ -26,6 +36,12 @@ function rt(req: ServiceRequest): ServiceRequest {
 
 function rtPayload(p: RelayerPayload): RelayerPayload {
   return decodeRelayerPayload(encodeRelayerPayload(p));
+}
+
+function hex(bytes: Uint8Array): string {
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +132,22 @@ describe("bincode ServiceRequest", () => {
     expect(Array.from(got.data)).toEqual([0x01, 0x02, 0x03]);
   });
 
+  it("SubmitTransaction keeps the legacy wire bytes", () => {
+    const to = new Uint8Array(20).fill(0xab);
+    const data = new Uint8Array([0x01, 0x02, 0x03]);
+    expect(
+      Array.from(
+        encodeServiceRequest({ tag: "SubmitTransaction", to, data }),
+      ),
+    ).toEqual([
+      1,
+      3, 0, 0, 0,
+      ...new Array<number>(20).fill(0xab),
+      3, 0, 0, 0, 0, 0, 0, 0,
+      1, 2, 3,
+    ]);
+  });
+
   it("BroadcastSignedTransaction round-trips (all null)", () => {
     const req: ServiceRequest = {
       tag: "BroadcastSignedTransaction",
@@ -177,6 +209,216 @@ describe("bincode ServiceRequest", () => {
     expect(encoded[21]).toBe(0x11);
     // surb2 starts at offset 31, first byte should be 0x22
     expect(encoded[31]).toBe(0x22);
+  });
+
+  it("PaidTransactionV2 matches the Rust ordinal-6 golden", () => {
+    const request: ServiceRequest = {
+      tag: "PaidTransactionV2",
+      chainId: 421_614n,
+      entryPoint: new Uint8Array(20).fill(1),
+      calldata: new Uint8Array([2, 3]),
+      executionId: new Uint8Array(32).fill(4),
+      validUntilUnix: 1_800_000_000n,
+    };
+    const encoded = encodeServiceRequest(request);
+    expect(hex(encoded)).toBe(
+      "0106000000ee6e060000000000010101010101010101010101010101010101010102000000000000000203040404040404040404040404040404040404040404040404040404040404040400d2496b00000000",
+    );
+    expect(decodeServiceRequest(encoded)).toEqual(request);
+    expect(() =>
+      decodeServiceRequest(new Uint8Array([...encoded, 0])),
+    ).toThrow("trailing bytes");
+  });
+
+  it("PaidQuoteRequestV2 matches the Rust ordinal-7 golden", () => {
+    const request: ServiceRequest = {
+      tag: "PaidQuoteRequestV2",
+      chainId: 421_614n,
+      entryPoint: new Uint8Array(20).fill(1),
+      clientIntentId: new Uint8Array(32).fill(2),
+      paymentAdapter: new Uint8Array(20).fill(3),
+      paymentId: new Uint8Array(32).fill(4),
+      feeAsset: new Uint8Array(20).fill(5),
+      paymentGasLimit: 500_000n,
+      actionTarget: new Uint8Array(20).fill(6),
+      actionCalldataHash: new Uint8Array(32).fill(7),
+      actionGasLimit: 700_000n,
+      trackedAssetsHash: new Uint8Array(32).fill(8),
+      maximumTransactionGas: 1_500_000n,
+      returnDataLimit: 256,
+      validUntilUnix: 1_800_000_000n,
+    };
+    const encoded = encodeServiceRequest(request);
+    expect(hex(encoded)).toBe(
+      "0107000000ee6e0600000000000101010101010101010101010101010101010101020202020202020202020202020202020202020202020202020202020202020203030303030303030303030303030303030303030404040404040404040404040404040404040404040404040404040404040404050505050505050505050505050505050505050520a10700000000000606060606060606060606060606060606060606070707070707070707070707070707070707070707070707070707070707070760ae0a0000000000080808080808080808080808080808080808080808080808080808080808080860e31600000000000001000000d2496b00000000",
+    );
+    expect(decodeServiceRequest(encoded)).toEqual(request);
+  });
+});
+
+describe("PaidQuoteOutcomeV2", () => {
+  it("pins rejected bytes and round-trips", () => {
+    const outcome: PaidQuoteOutcomeV2 = {
+      status: "rejected",
+      code: "WrongChain",
+      retryable: false,
+      detail: "wrong chain",
+    };
+    const encoded = encodePaidQuoteOutcomeV2(outcome);
+    expect(hex(encoded)).toBe(
+      "010100000001000000000b0000000000000077726f6e6720636861696e",
+    );
+    expect(decodePaidQuoteOutcomeV2(encoded)).toEqual(outcome);
+  });
+
+  it("round-trips an issued quote in Solidity field order", () => {
+    const word = (value: number): Uint8Array => {
+      const bytes = new Uint8Array(32);
+      new DataView(bytes.buffer).setBigUint64(24, BigInt(value), false);
+      return bytes;
+    };
+    const outcome: PaidQuoteOutcomeV2 = {
+      status: "issued",
+      quote: {
+        quoteVersion: 1,
+        chainId: word(421_614),
+        entryPoint: new Uint8Array(20).fill(0x11),
+        exitAddress: new Uint8Array(20).fill(0x22),
+        clientIntentId: new Uint8Array(32).fill(0x33),
+        paymentAdapter: new Uint8Array(20).fill(0x44),
+        paymentId: new Uint8Array(32).fill(0x55),
+        feeAsset: new Uint8Array(20).fill(0x66),
+        exitFee: word(77),
+        networkFee: word(8),
+        paymentGasLimit: word(500_000),
+        actionTarget: new Uint8Array(20).fill(0x77),
+        actionCalldataHash: new Uint8Array(32).fill(0x88),
+        actionGasLimit: word(700_000),
+        trackedAssetsHash: new Uint8Array(32).fill(0x99),
+        maximumTransactionGas: word(1_450_000),
+        maximumFeePerGas: word(123),
+        returnDataLimit: word(256),
+        validAfterUnix: 1_799_999_900n,
+        validUntilUnix: 1_800_000_000n,
+        quoteNonce: word(1),
+      },
+      executionId: new Uint8Array(32).fill(0xab),
+      exitSignature: new Uint8Array(65).fill(0xcd),
+    };
+    const encoded = encodePaidQuoteOutcomeV2(outcome);
+    expect(hex(encoded)).toBe(
+      "0100000000010000000000000000000000000000000000000000000000000000000000066eee111111111111111111111111111111111111111122222222222222222222222222222222222222223333333333333333333333333333333333333333333333333333333333333333444444444444444444444444444444444444444455555555555555555555555555555555555555555555555555555555555555556666666666666666666666666666666666666666000000000000000000000000000000000000000000000000000000000000004d0000000000000000000000000000000000000000000000000000000000000008000000000000000000000000000000000000000000000000000000000007a1207777777777777777777777777777777777777777888888888888888888888888888888888888888888888888888888888888888800000000000000000000000000000000000000000000000000000000000aae6099999999999999999999999999999999999999999999999999999999999999990000000000000000000000000000000000000000000000000000000000162010000000000000000000000000000000000000000000000000000000000000007b00000000000000000000000000000000000000000000000000000000000001009cd1496b0000000000d2496b000000000000000000000000000000000000000000000000000000000000000000000001abababababababababababababababababababababababababababababababab4100000000000000cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    );
+    expect(decodePaidQuoteOutcomeV2(encoded)).toEqual(outcome);
+  });
+
+  it("rejects a non-canonical exit signature length", () => {
+    const bytes = new Uint8Array([
+      1,
+      0, 0, 0, 0,
+      1,
+      ...new Uint8Array(532),
+      ...new Uint8Array(32),
+      64, 0, 0, 0, 0, 0, 0, 0,
+      ...new Uint8Array(64),
+    ]);
+    expect(() => decodePaidQuoteOutcomeV2(bytes)).toThrow(
+      "exit signature must be 65 bytes",
+    );
+  });
+});
+
+describe("PaidTransactionOutcomeV2", () => {
+  it("pins submitted bytes and round-trips", () => {
+    const outcome: PaidTransactionOutcomeV2 = {
+      status: "submitted",
+      executionId: new Uint8Array(32).fill(7),
+      transactionHash: new Uint8Array(32).fill(8),
+    };
+    const encoded = encodePaidTransactionOutcomeV2(outcome);
+    expect(hex(encoded)).toBe(
+      `0100000000${"07".repeat(32)}${"08".repeat(32)}`,
+    );
+    expect(decodePaidTransactionOutcomeV2(encoded)).toEqual(outcome);
+  });
+
+  it("pins rejected bytes and round-trips", () => {
+    const outcome: PaidTransactionOutcomeV2 = {
+      status: "rejected",
+      executionId: new Uint8Array(32).fill(7),
+      code: "WrongChain",
+      retryable: false,
+      detail: "request chain does not match exit chain",
+    };
+    const encoded = encodePaidTransactionOutcomeV2(outcome);
+    expect(hex(encoded)).toBe(
+      "0101000000010707070707070707070707070707070707070707070707070707070707070707010000000027000000000000007265717565737420636861696e20646f6573206e6f74206d61746368206578697420636861696e",
+    );
+    expect(decodePaidTransactionOutcomeV2(encoded)).toEqual(outcome);
+  });
+});
+
+describe("submit transaction response", () => {
+  const encode = (value: string): Uint8Array => new TextEncoder().encode(value);
+
+  it("decodes a 32-byte submitted transaction hash", () => {
+    expect(decodeSubmitTransactionResponse(new Uint8Array(32).fill(0xab))).toEqual({
+      status: "submitted",
+      transactionHash: `0x${"ab".repeat(32)}`,
+    });
+  });
+
+  it("decodes a bounded typed legacy rejection", () => {
+    expect(
+      decodeSubmitTransactionResponse(
+        encode("tx_error:UNPROFITABLE:payment is below the required margin"),
+      ),
+    ).toEqual({
+      status: "rejected",
+      code: "UNPROFITABLE",
+      detail: "payment is below the required margin",
+    });
+  });
+
+  it("does not mistake a 32-byte rejection for a transaction hash", () => {
+    expect(
+      decodeSubmitTransactionResponse(
+        encode("tx_error:SUBMISSION:twelve-bytes"),
+      ),
+    ).toEqual({
+      status: "rejected",
+      code: "SUBMISSION",
+      detail: "twelve-bytes",
+    });
+  });
+
+  it("accepts 256 detail bytes and rejects 257", () => {
+    expect(
+      decodeSubmitTransactionResponse(
+        encode(`tx_error:SUBMISSION:${"x".repeat(256)}`),
+      ),
+    ).toEqual({
+      status: "rejected",
+      code: "SUBMISSION",
+      detail: "x".repeat(256),
+    });
+    expect(() =>
+      decodeSubmitTransactionResponse(
+        encode(`tx_error:SUBMISSION:${"x".repeat(257)}`),
+      ),
+    ).toThrowError(NoxClientError);
+  });
+
+  it.each([
+    new Uint8Array(31),
+    encode("tx_error:UNKNOWN:detail"),
+    encode("tx_error:SUBMISSION:"),
+    encode("tx_error:SUBMISSION:bad\u007fdetail"),
+    new Uint8Array([0xff]),
+  ])("rejects malformed response %#", (response) => {
+    expect(() => decodeSubmitTransactionResponse(response)).toThrowError(
+      expect.objectContaining({ code: NoxClientErrorCode.DecryptionFailed }),
+    );
   });
 });
 

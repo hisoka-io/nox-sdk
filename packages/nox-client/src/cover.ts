@@ -1,7 +1,13 @@
 import type { TopologyNode, PathHop } from "./types.js";
 import { encodeRelayerPayload } from "./bincode.js";
 import { postPacket } from "./transport.js";
-import { bytesToHex, getCrypto, buildSphinxPacket } from "./utils.js";
+import {
+  bytesToHex,
+  getCrypto,
+  buildSphinxPacket,
+  secureRandomIndex,
+  secureRandomUnit,
+} from "./utils.js";
 import { layersForRole } from "./topology.js";
 
 export interface CoverTrafficConfig {
@@ -94,7 +100,7 @@ export class CoverTrafficController {
     const path = selectCoverPath(nodes);
     if (path === null) return;
 
-    const paddingLen = Math.floor(Math.random() * (this.maxPaddingBytes + 1));
+    const paddingLen = secureRandomIndex(this.maxPaddingBytes + 1);
     const padding = new Uint8Array(paddingLen);
     getCrypto().getRandomValues(padding);
 
@@ -135,7 +141,7 @@ export function createCoverController(
 }
 
 function sampleExp(lambda: number): number {
-  const u = Math.max(Number.EPSILON, Math.random());
+  const u = secureRandomUnit();
   return -Math.log(u) / lambda;
 }
 
@@ -146,17 +152,17 @@ function selectCoverPath(nodes: TopologyNode[]): PathHop[] | null {
 
   if (entries.length === 0 || exits.length === 0) return null;
 
-  const entry = entries[Math.floor(Math.random() * entries.length)]!;
+  const entry = entries[secureRandomIndex(entries.length)]!;
 
   const eligibleMixes = mixes.filter((n) => n.id !== entry.id);
   const mix = eligibleMixes.length > 0
-    ? eligibleMixes[Math.floor(Math.random() * eligibleMixes.length)]!
+    ? eligibleMixes[secureRandomIndex(eligibleMixes.length)]!
     : null;
 
   const usedIds = new Set([entry.id, mix?.id].filter(Boolean) as string[]);
   const eligibleExits = exits.filter((n) => !usedIds.has(n.id));
   const exit = (eligibleExits.length > 0 ? eligibleExits : exits)[
-    Math.floor(Math.random() * (eligibleExits.length > 0 ? eligibleExits : exits).length)
+    secureRandomIndex((eligibleExits.length > 0 ? eligibleExits : exits).length)
   ]!;
 
   const path: PathHop[] = [

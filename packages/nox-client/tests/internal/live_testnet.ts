@@ -10,23 +10,33 @@
 // Node.js 18 crypto polyfill
 import { webcrypto } from "node:crypto";
 if (typeof globalThis.crypto === "undefined") {
-  (globalThis as any).crypto = webcrypto;
+  (globalThis as unknown as { crypto: Crypto }).crypto = webcrypto as Crypto;
 }
 
 import { NoxClient, encodeServiceRequest } from "../../src/index.js";
 
-const SEED_URL = "https://api.hisoka.io/seed";
+const SEED_URL = requiredEnv("SEED");
+const ETH_RPC_URL = requiredEnv("ETH_RPC_URL");
+const REGISTRY = requiredAddressEnv("REGISTRY_ADDRESS");
 const TIMEOUT_MS = 60_000;
 const SURBS = 10;
 
-// Known working entry nodes (have ingress server on port 15002)
-const KNOWN_ENTRY_URLS = [
-  "http://3.236.170.102:15002",  // nox-1
-  "http://18.214.97.24:15002",   // nox-2
-];
-
 // Arbitrum Sepolia RPC (public, used by exit nodes)
 const ARB_CHAIN_ID = "0x66eee"; // 421614
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value.length === 0) throw new Error(`${name} is required`);
+  return value;
+}
+
+function requiredAddressEnv(name: string): string {
+  const value = requiredEnv(name);
+  if (!/^0x[0-9a-fA-F]{40}$/u.test(value)) {
+    throw new Error(`${name} must be a 20-byte Ethereum address`);
+  }
+  return value;
+}
 
 function log(msg: string) {
   console.log(`[${new Date().toISOString().slice(11, 23)}] ${msg}`);
@@ -58,15 +68,16 @@ async function runTest(
     const ms = Date.now() - start;
     results.push({ name, passed: true, durationMs: ms });
     log(`  PASS ${name} (${ms}ms)`);
-  } catch (err: any) {
+  } catch (err: unknown) {
     const ms = Date.now() - start;
+    const message = err instanceof Error ? err.message.slice(0, 120) : String(err).slice(0, 120);
     results.push({
       name,
       passed: false,
       durationMs: ms,
-      error: err.message?.slice(0, 120),
+      error: message,
     });
-    log(`  FAIL ${name} (${ms}ms): ${err.message?.slice(0, 120)}`);
+    log(`  FAIL ${name} (${ms}ms): ${message}`);
   }
 }
 
@@ -85,7 +96,8 @@ async function main() {
         powDifficulty: 3, // must match node min_pow_difficulty
         timeoutMs: TIMEOUT_MS,
         surbsPerRequest: SURBS,
-        dangerouslySkipFingerprintCheck: true,
+        ethRpcUrl: ETH_RPC_URL,
+        registryAddress: REGISTRY,
       });
       // Quick echo to verify the full path works end to end
       const probe = new Uint8Array([0x42]);
@@ -95,8 +107,9 @@ async function main() {
       client = c;
       log(`Connected on attempt ${attempt + 1}.`);
       break;
-    } catch (err: any) {
-      log(`  attempt ${attempt + 1}: ${err.message?.slice(0, 100)}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      log(`  attempt ${attempt + 1}: ${message.slice(0, 100)}`);
     }
   }
   if (!client) {
@@ -138,7 +151,7 @@ async function main() {
 
   await runTest("http_1kb", async () => {
     const resp = await client.httpRequest(
-      "GET", "https://httpbin.org/bytes/1024", {}, new Uint8Array(0),
+      "GET", "https://httpbin.org/bytes/1024", [], new Uint8Array(0),
     );
     if (resp.length < 500) throw new Error(`Too small: ${resp.length}B`);
     results[results.length - 1]!.size = resp.length;
@@ -146,7 +159,7 @@ async function main() {
 
   await runTest("http_1mb", async () => {
     const resp = await client.httpRequest(
-      "GET", "https://speed.cloudflare.com/__down?bytes=1048576", {}, new Uint8Array(0),
+      "GET", "https://speed.cloudflare.com/__down?bytes=1048576", [], new Uint8Array(0),
     );
     if (resp.length < 500_000) throw new Error(`Too small: ${resp.length}B`);
     results[results.length - 1]!.size = resp.length;
@@ -154,7 +167,7 @@ async function main() {
 
   await runTest("http_10mb", async () => {
     const resp = await client.httpRequest(
-      "GET", "https://speed.cloudflare.com/__down?bytes=10485760", {}, new Uint8Array(0),
+      "GET", "https://speed.cloudflare.com/__down?bytes=10485760", [], new Uint8Array(0),
     );
     if (resp.length < 5_000_000) throw new Error(`Too small: ${resp.length}B`);
     results[results.length - 1]!.size = resp.length;
@@ -162,7 +175,7 @@ async function main() {
 
   await runTest("http_100mb", async () => {
     const resp = await client.httpRequest(
-      "GET", "https://speed.cloudflare.com/__down?bytes=104857600", {}, new Uint8Array(0),
+      "GET", "https://speed.cloudflare.com/__down?bytes=104857600", [], new Uint8Array(0),
     );
     if (resp.length < 50_000_000) throw new Error(`Too small: ${resp.length}B`);
     results[results.length - 1]!.size = resp.length;
@@ -175,7 +188,7 @@ async function main() {
 
   await runTest("web_wikipedia", async () => {
     const resp = await client.httpRequest(
-      "GET", "https://en.wikipedia.org/wiki/Tor_(network)", {}, new Uint8Array(0),
+      "GET", "https://en.wikipedia.org/wiki/Tor_(network)", [], new Uint8Array(0),
     );
     if (resp.length < 10_000) throw new Error(`Too small: ${resp.length}B`);
     results[results.length - 1]!.size = resp.length;
@@ -183,7 +196,7 @@ async function main() {
 
   await runTest("web_github_api", async () => {
     const resp = await client.httpRequest(
-      "GET", "https://api.github.com", { "User-Agent": "nox-sdk-test" }, new Uint8Array(0),
+      "GET", "https://api.github.com", [["User-Agent", "nox-sdk-test"]], new Uint8Array(0),
     );
     if (resp.length < 100) throw new Error(`Too small: ${resp.length}B`);
     results[results.length - 1]!.size = resp.length;
@@ -214,9 +227,7 @@ async function main() {
   });
 
   await runTest("rpc_getBalance", async () => {
-    // Check deployer balance (should have ETH)
-    const deployer = "0x8F4eB35a24bF75C2C86917d324Cac34EB2EFc534";
-    const result = await client.rpcCall("eth_getBalance", [deployer, "latest"]);
+    const result = await client.rpcCall("eth_getBalance", [REGISTRY, "latest"]);
     if (typeof result !== "string" || !result.startsWith("0x"))
       throw new Error(`Bad balance: ${result}`);
   });
@@ -226,12 +237,10 @@ async function main() {
     if (!result || typeof result !== "object") throw new Error(`Bad block: ${typeof result}`);
   });
 
-  await runTest("rpc_getCode_darkpool", async () => {
-    // DarkPool contract on Arb Sepolia
-    const darkpool = "0x7A3B2A44559A4b66cCA2E207cd8aDE5b23BE6b7B";
-    const result = await client.rpcCall("eth_getCode", [darkpool, "latest"]);
+  await runTest("rpc_getCode_registry", async () => {
+    const result = await client.rpcCall("eth_getCode", [REGISTRY, "latest"]);
     if (typeof result !== "string" || (result as string).length < 100)
-      throw new Error(`No code at DarkPool address`);
+      throw new Error("No code at Registry address");
   });
 
   // ======================================================================

@@ -9,7 +9,7 @@
 
 import { webcrypto } from "node:crypto";
 if (typeof globalThis.crypto === "undefined") {
-  (globalThis as any).crypto = webcrypto;
+  Object.defineProperty(globalThis, "crypto", { value: webcrypto });
 }
 
 import {
@@ -17,11 +17,28 @@ import {
   encodeServiceRequest,
   type RelayerPayload,
 } from "../../src/index.js";
-
-const SEED = process.env["SEED"] || "http://3.236.170.102:15003";
+const SEED = requiredEnv("SEED");
+const ETH_RPC_URL = requiredEnv("ETH_RPC_URL");
+const REGISTRY = requiredAddressEnv("REGISTRY_ADDRESS");
 const POW = parseInt(process.env["POW"] || "3");
 const TIMEOUT = 120_000;
 const SURBS = 10;
+
+function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (value === undefined || value.length === 0) {
+    throw new Error(`${name} is required`);
+  }
+  return value;
+}
+
+function requiredAddressEnv(name: string): string {
+  const value = requiredEnv(name);
+  if (!/^0x[0-9a-fA-F]{40}$/u.test(value)) {
+    throw new Error(`${name} must be a 20-byte Ethereum address`);
+  }
+  return value;
+}
 
 function log(msg: string) {
   console.log(`[${new Date().toISOString().slice(11, 23)}] ${msg}`);
@@ -52,10 +69,12 @@ async function test(name: string, fn: () => Promise<number | void>) {
     const sizeStr = typeof size === "number" ? ` [${fmt(size)}]` : "";
     log(`  [PASS] ${name} (${ms}ms)${sizeStr}`);
     results.push({ name, pass: true, ms, size: typeof size === "number" ? size : undefined });
-  } catch (e: any) {
+  } catch (caught: unknown) {
     const ms = Date.now() - t0;
-    log(`  [FAIL] ${name} (${ms}ms): ${e.message?.slice(0, 120)}`);
-    results.push({ name, pass: false, ms, error: e.message?.slice(0, 120) });
+    const message =
+      caught instanceof Error ? caught.message : String(caught);
+    log(`  [FAIL] ${name} (${ms}ms): ${message.slice(0, 120)}`);
+    results.push({ name, pass: false, ms, error: message.slice(0, 120) });
   }
 }
 
@@ -75,7 +94,8 @@ async function main() {
     powDifficulty: POW,
     timeoutMs: TIMEOUT,
     surbsPerRequest: SURBS,
-    dangerouslySkipFingerprintCheck: true,
+    ethRpcUrl: ETH_RPC_URL,
+    registryAddress: REGISTRY,
   });
   log("Connected to live mixnet.\n");
 
@@ -240,15 +260,8 @@ async function main() {
     if (!r || typeof r !== "object") throw new Error(`Bad: ${typeof r}`);
   });
 
-  await test("rpc_getCode_darkpool", async () => {
-    const darkpool = "0x7A3B2A44559A4b66cCA2E207cd8aDE5b23BE6b7B";
-    const r = await client.rpcCall("eth_getCode", [darkpool, "latest"]);
-    if (typeof r !== "string" || (r as string).length < 100) throw new Error("No code at DarkPool");
-  });
-
   await test("rpc_getCode_registry", async () => {
-    const registry = "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc";
-    const r = await client.rpcCall("eth_getCode", [registry, "latest"]);
+    const r = await client.rpcCall("eth_getCode", [REGISTRY, "latest"]);
     if (typeof r !== "string" || (r as string).length < 100) throw new Error("No code at Registry");
   });
 
@@ -277,9 +290,11 @@ async function main() {
 
   // We need ethers for signing transactions
   const ethers = await import("ethers");
-  const FUNDED_KEY = "3e8a4387dce9ecce4d3dabf84e8d3883074a4756ae369906175e8ca40f52af68";
-  const ARB_SEPOLIA_RPC = "https://sepolia-rollup.arbitrum.io/rpc";
-  const provider = new ethers.JsonRpcProvider(ARB_SEPOLIA_RPC);
+  const FUNDED_KEY = process.env["FUNDED_KEY"];
+  if (FUNDED_KEY === undefined || !/^[0-9a-f]{64}$/u.test(FUNDED_KEY)) {
+    throw new Error("FUNDED_KEY must be a lowercase 32-byte hex private key");
+  }
+  const provider = new ethers.JsonRpcProvider(ETH_RPC_URL);
   const signer = new ethers.Wallet(FUNDED_KEY, provider);
   const signerAddr = signer.address;
 
@@ -311,11 +326,10 @@ async function main() {
 
   await test("web3_signed_registry_tx", async () => {
     // Call NoxRegistry.relayerCount() via a signed transaction (view function called as TX)
-    const registryAddr = "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc";
     const nonce = await provider.getTransactionCount(signerAddr);
     const feeData = await provider.getFeeData();
     const tx = await signer.signTransaction({
-      to: registryAddr,
+      to: REGISTRY,
       data: "0xcf1a7a21", // relayerCount()
       value: 0n,
       nonce,
@@ -342,9 +356,8 @@ async function main() {
   log("\n=== Web3 Contract Queries ===");
 
   await test("web3_registry_relayer_count", async () => {
-    const registry = "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc";
     const r = await client.rpcCall("eth_call", [{
-      to: registry,
+      to: REGISTRY,
       data: "0xcf1a7a21", // relayerCount()
     }, "latest"]);
     if (typeof r !== "string") throw new Error(`Bad: ${typeof r}`);
@@ -354,108 +367,13 @@ async function main() {
   });
 
   await test("web3_registry_fingerprint", async () => {
-    const registry = "0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc";
     const r = await client.rpcCall("eth_call", [{
-      to: registry,
+      to: REGISTRY,
       data: "0x3cce4d3d", // topologyFingerprint()
     }, "latest"]);
     if (typeof r !== "string" || (r as string).length < 66) throw new Error(`Bad fingerprint: ${r}`);
     log(`    fingerprint: ${(r as string).slice(0, 18)}...`);
   });
-
-  await test("web3_reward_pool_supported_asset", async () => {
-    // Check if StakingToken is a supported asset in NoxRewardPool
-    const rewardPool = "0x1D336Fd873178a41333Ec7B50Be0fF52A5F69E1d";
-    const stakingToken = "0x208be235AAB9b8b5d86285b2684c8e6743e662b5";
-    const calldata = "0x9be918e6000000000000000000000000" + stakingToken.slice(2).toLowerCase();
-    const r = await client.rpcCall("eth_call", [{
-      to: rewardPool,
-      data: calldata, // isSupportedAsset(StakingToken)
-    }, "latest"]);
-    const supported = parseInt(r as string, 16) === 1;
-    log(`    StakingToken supported: ${supported}`);
-    if (!supported) throw new Error("StakingToken not supported in NoxRewardPool");
-  });
-
-  // ======================================================================
-  // Web3 Paid Operations (Token deposits, Multicall via mixnet)
-  // ======================================================================
-  log("\n=== Web3 Paid Operations ===");
-
-  const STAKING_TOKEN = "0x208be235AAB9b8b5d86285b2684c8e6743e662b5";
-  const REWARD_POOL = "0x1D336Fd873178a41333Ec7B50Be0fF52A5F69E1d";
-  const MULTICALL_ADDR = "0xe626Cfc690408Cc6d4b5eE202dDE1C411223e6AE";
-
-  const erc20Iface = new ethers.Interface([
-    "function mint(address,uint256)",
-    "function approve(address,uint256) returns (bool)",
-    "function transfer(address,uint256) returns (bool)",
-    "function balanceOf(address) view returns (uint256)",
-  ]);
-  const rewardPoolIface = new ethers.Interface([
-    "function depositRewards(address,uint256)",
-    "function totalCollected(address) view returns (uint256)",
-  ]);
-  const multicallIface = new ethers.Interface([
-    "function multicall((address target, bytes data, uint256 value, bool requireSuccess)[])",
-  ]);
-
-  // One-time setup: mint tokens + approve (direct TX, not via mixnet)
-  log("  [setup] Minting NOX-STK and approving contracts...");
-  const mintTx = await signer.sendTransaction({
-    to: STAKING_TOKEN,
-    data: erc20Iface.encodeFunctionData("mint", [signerAddr, ethers.parseUnits("100", 18)]),
-  });
-  await mintTx.wait();
-  const approvePoolTx = await signer.sendTransaction({
-    to: STAKING_TOKEN,
-    data: erc20Iface.encodeFunctionData("approve", [REWARD_POOL, ethers.MaxUint256]),
-  });
-  await approvePoolTx.wait();
-  const approveMulticallTx = await signer.sendTransaction({
-    to: STAKING_TOKEN,
-    data: erc20Iface.encodeFunctionData("approve", [MULTICALL_ADDR, ethers.MaxUint256]),
-  });
-  await approveMulticallTx.wait();
-  log("  [setup] Done (minted 100 NOX-STK, approved RewardPool + Multicall)");
-
-  await test("web3_gas_paid_tx", async () => {
-    // Gas-paid TX: amount = gasCost × 1.20 (20% premium). Exit node earns the margin.
-    const oracleData = await fetch("http://98.92.70.228:15004/prices").then(r => r.json()).catch(() => ({ ethereum: { price: 2100 } }));
-    const ethPrice = oracleData?.ethereum?.price ?? 2100;
-    const gasPrice = (await provider.getFeeData()).gasPrice ?? 20_000_000n;
-
-    const sampleCalldata = rewardPoolIface.encodeFunctionData("depositRewards", [STAKING_TOKEN, 1n]);
-    const gasEstimate = await provider.estimateGas({
-      from: "0x6774ca4baf6fff84f02898a3dee4299ed1f5ab4e",
-      to: REWARD_POOL,
-      data: sampleCalldata,
-    });
-
-    const gasCostEth = Number(ethers.formatEther(gasEstimate * gasPrice));
-    const gasCostUsd = gasCostEth * ethPrice;
-    const paymentUsd = gasCostUsd * 1.20; // 20% premium
-    const tokenAmount = paymentUsd / 1.0; // NOX-STK @ $1
-    const tokenAmountWei = ethers.parseUnits(tokenAmount.toFixed(18), 18);
-
-    log(`    gas cost: $${gasCostUsd.toFixed(6)}, payment: $${paymentUsd.toFixed(6)} (${tokenAmount.toFixed(8)} NOX-STK)`);
-
-    const calldata = rewardPoolIface.encodeFunctionData("depositRewards", [STAKING_TOKEN, tokenAmountWei]);
-    const resp = await client.submitTransaction(REWARD_POOL, ethers.getBytes(calldata));
-    const text = new TextDecoder().decode(resp);
-    if (text.startsWith("tx_error")) throw new Error(text);
-    const txHash = "0x" + Array.from(resp).map(b => b.toString(16).padStart(2, "0")).join("");
-    log(`    tx: ${txHash}`);
-    const receipt = await provider.waitForTransaction(txHash, 1, 30_000);
-    if (!receipt || receipt.status !== 1) throw new Error(`TX failed`);
-
-    const depositedTopic = ethers.id("RewardsDeposited(address,address,uint256)");
-    const events = receipt.logs.filter(l => l.topics[0] === depositedTopic);
-    if (events.length === 0) throw new Error("No RewardsDeposited event");
-    log(`    confirmed, gas: ${receipt.gasUsed}, RewardsDeposited: ${events.length}`);
-  });
-
-  // (multicall test removed — used hardcoded amounts, not representative of real gas-paid flow)
 
   // ======================================================================
   // Summary

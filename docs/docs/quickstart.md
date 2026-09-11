@@ -18,7 +18,10 @@ npm install @hisoka-io/nox-client @hisoka-io/nox-wasm
 ```ts
 import { NoxClient } from "@hisoka-io/nox-client";
 
-const client = await NoxClient.connect();
+const client = await NoxClient.connect({
+  ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
+  registryAddress: "0xCURRENT_NOX_REGISTRY",
+});
 ```
 
 This fetches the network topology, loads the WASM crypto module, and connects you to the mixnet.
@@ -47,7 +50,9 @@ const signedTx = await wallet.signTransaction({
   gasLimit: 21000n,
 });
 
-const raw = Uint8Array.from(Buffer.from(signedTx.slice(2), "hex"));
+const raw = Uint8Array.from(
+  signedTx.slice(2).match(/.{1,2}/g)!.map((byte) => Number.parseInt(byte, 16)),
+);
 await client.broadcastSignedTransaction(raw);
 ```
 
@@ -67,14 +72,19 @@ Stops background topology refresh, closes WebSocket connections, and rejects any
 import { NoxClient, NoxClientError } from "@hisoka-io/nox-client";
 
 async function main() {
-  const client = await NoxClient.connect();
+  const client = await NoxClient.connect({
+    ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
+    registryAddress: "0xCURRENT_NOX_REGISTRY",
+  });
 
   try {
     const block = await client.blockNumber();
     console.log("Block:", block);
 
     const signedTx = await wallet.signTransaction(tx);
-    const raw = Uint8Array.from(Buffer.from(signedTx.slice(2), "hex"));
+    const raw = Uint8Array.from(
+      signedTx.slice(2).match(/.{1,2}/g)!.map((byte) => Number.parseInt(byte, 16)),
+    );
     await client.broadcastSignedTransaction(raw);
   } catch (err) {
     if (err instanceof NoxClientError) {
@@ -123,21 +133,12 @@ try {
 
 See [Error Handling](./error-handling) for the full error reference.
 
-## `initNodeCrypto`
+## Web Crypto
 
-In browsers, the SDK uses the native `crypto` API automatically. In Node.js < 20 or environments where `globalThis.crypto` is not available, call `initNodeCrypto()` before connecting:
-
-```ts
-import { initNodeCrypto, NoxClient } from "@hisoka-io/nox-client";
-
-await initNodeCrypto();
-const client = await NoxClient.connect();
-```
-
-`NoxClient.connect()` calls this internally, so you only need it if you're using lower-level SDK functions (like `resolveSeedUrl` or `buildSphinxPacket`) without going through `connect()`.
+The shared SDK uses only the platform Web Crypto API. It does not import a Node crypto fallback, so the same entrypoint is safe to bundle in browsers, extensions, and mobile web runtimes. Node.js users need Node.js 20 or later, where `globalThis.crypto` is available.
 
 ## Requirements
 
-- Node.js >= 18 or any modern browser
+- Node.js >= 20 or any modern browser with Web Crypto
 - Works with webpack, vite, and other bundlers
 - WASM module (~175 KB gzipped) loads automatically

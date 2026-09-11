@@ -1,7 +1,34 @@
 import { NoxClientError, NoxClientErrorCode } from "./types.js";
 import type { FecInfo } from "./fragmentation.js";
+import { bytesToHex } from "./utils.js";
 
 export const PAYLOAD_VERSION = 1;
+export const MAX_SUBMIT_REJECTION_DETAIL_BYTES = 256;
+
+export const SUBMIT_REJECTION_CODES = [
+  "SIMULATION",
+  "PAYMENT_MISSING",
+  "PRICE_UNAVAILABLE",
+  "UNPROFITABLE",
+  "GAS_PLAN",
+  "DUPLICATE",
+  "SUBMISSION",
+] as const;
+
+export type SubmitRejectionCode = (typeof SUBMIT_REJECTION_CODES)[number];
+
+export type SubmitTransactionResponse =
+  | {
+      readonly status: "submitted";
+      readonly transactionHash: string;
+    }
+  | {
+      readonly status: "rejected";
+      readonly code: SubmitRejectionCode;
+      readonly detail: string;
+    };
+
+const SUBMIT_ERROR_PREFIX = new TextEncoder().encode("tx_error:");
 
 export type RelayerPayload =
   | { tag: "SubmitTransaction"; to: Uint8Array; data: Uint8Array }
@@ -11,6 +38,55 @@ export type RelayerPayload =
   | { tag: "AnonymousRequest"; inner: Uint8Array; replySurbs: Uint8Array[] }
   | { tag: "ServiceResponse"; requestId: bigint; fragment: FragmentWire }
   | { tag: "NeedMoreSurbs"; requestId: bigint; fragmentsRemaining: number };
+
+export interface PaidTransactionRequestV2 {
+  readonly chainId: bigint;
+  readonly entryPoint: Uint8Array;
+  readonly calldata: Uint8Array;
+  readonly executionId: Uint8Array;
+  readonly validUntilUnix: bigint;
+}
+
+export interface PaidQuoteRequestV2 {
+  readonly chainId: bigint;
+  readonly entryPoint: Uint8Array;
+  readonly clientIntentId: Uint8Array;
+  readonly paymentAdapter: Uint8Array;
+  readonly paymentId: Uint8Array;
+  readonly feeAsset: Uint8Array;
+  readonly paymentGasLimit: bigint;
+  readonly actionTarget: Uint8Array;
+  readonly actionCalldataHash: Uint8Array;
+  readonly actionGasLimit: bigint;
+  readonly trackedAssetsHash: Uint8Array;
+  readonly maximumTransactionGas: bigint;
+  readonly returnDataLimit: number;
+  readonly validUntilUnix: bigint;
+}
+
+export interface ExecutionQuoteV1 {
+  readonly quoteVersion: number;
+  readonly chainId: Uint8Array;
+  readonly entryPoint: Uint8Array;
+  readonly exitAddress: Uint8Array;
+  readonly clientIntentId: Uint8Array;
+  readonly paymentAdapter: Uint8Array;
+  readonly paymentId: Uint8Array;
+  readonly feeAsset: Uint8Array;
+  readonly exitFee: Uint8Array;
+  readonly networkFee: Uint8Array;
+  readonly paymentGasLimit: Uint8Array;
+  readonly actionTarget: Uint8Array;
+  readonly actionCalldataHash: Uint8Array;
+  readonly actionGasLimit: Uint8Array;
+  readonly trackedAssetsHash: Uint8Array;
+  readonly maximumTransactionGas: Uint8Array;
+  readonly maximumFeePerGas: Uint8Array;
+  readonly returnDataLimit: Uint8Array;
+  readonly validAfterUnix: bigint;
+  readonly validUntilUnix: bigint;
+  readonly quoteNonce: Uint8Array;
+}
 
 export type ServiceRequest =
   | { tag: "Echo"; data: Uint8Array }
@@ -35,7 +111,60 @@ export type ServiceRequest =
       rpcUrl: string | null;
       rpcMethod: string | null;
     }
-  | { tag: "ReplenishSurbs"; requestId: bigint; surbs: Uint8Array[] };
+  | { tag: "ReplenishSurbs"; requestId: bigint; surbs: Uint8Array[] }
+  | ({ tag: "PaidTransactionV2" } & PaidTransactionRequestV2)
+  | ({ tag: "PaidQuoteRequestV2" } & PaidQuoteRequestV2);
+
+export const PAID_TRANSACTION_REJECTION_CODES_V2 = [
+  "MalformedRequest",
+  "WrongChain",
+  "WrongEntryPoint",
+  "UnknownQuote",
+  "ExpiredQuote",
+  "DuplicateExecution",
+  "SimulationFailure",
+  "PaymentMissing",
+  "PaymentReverted",
+  "UnsupportedFeeAsset",
+  "StalePrice",
+  "Unprofitable",
+  "GasCapExceeded",
+  "SubmissionFailure",
+  "UnsupportedPaymentAdapter",
+  "QuoteCapacityExceeded",
+  "PendingLossLimit",
+] as const;
+
+export type PaidTransactionRejectionCodeV2 =
+  (typeof PAID_TRANSACTION_REJECTION_CODES_V2)[number];
+
+export type PaidTransactionOutcomeV2 =
+  | {
+      readonly status: "submitted";
+      readonly executionId: Uint8Array;
+      readonly transactionHash: Uint8Array;
+    }
+  | {
+      readonly status: "rejected";
+      readonly executionId: Uint8Array | null;
+      readonly code: PaidTransactionRejectionCodeV2;
+      readonly retryable: boolean;
+      readonly detail: string;
+    };
+
+export type PaidQuoteOutcomeV2 =
+  | {
+      readonly status: "issued";
+      readonly quote: ExecutionQuoteV1;
+      readonly executionId: Uint8Array;
+      readonly exitSignature: Uint8Array;
+    }
+  | {
+      readonly status: "rejected";
+      readonly code: PaidTransactionRejectionCodeV2;
+      readonly retryable: boolean;
+      readonly detail: string;
+    };
 
 export interface FragmentWire {
   messageId: bigint;
@@ -72,7 +201,333 @@ export function decodeRelayerPayload(bytes: Uint8Array): RelayerPayload {
 export function decodeServiceRequest(bytes: Uint8Array): ServiceRequest {
   checkVersion(bytes);
   const r = new Reader(bytes, 1);
-  return readServiceRequest(r);
+  const request = readServiceRequest(r);
+  r.expectEnd("ServiceRequest");
+  return request;
+}
+
+export function encodePaidTransactionOutcomeV2(
+  outcome: PaidTransactionOutcomeV2,
+): Uint8Array {
+  const writer = new Writer();
+  writer.u8(PAYLOAD_VERSION);
+  if (outcome.status === "submitted") {
+    writer.u32(0);
+    assertLen(outcome.executionId, 32, "PaidTransactionOutcomeV2.executionId");
+    assertLen(
+      outcome.transactionHash,
+      32,
+      "PaidTransactionOutcomeV2.transactionHash",
+    );
+    writer.fixedBytes(outcome.executionId);
+    writer.fixedBytes(outcome.transactionHash);
+  } else {
+    writer.u32(1);
+    if (outcome.executionId === null) {
+      writer.u8(0);
+    } else {
+      writer.u8(1);
+      assertLen(
+        outcome.executionId,
+        32,
+        "PaidTransactionOutcomeV2.executionId",
+      );
+      writer.fixedBytes(outcome.executionId);
+    }
+    writePaidV2Rejection(writer, outcome);
+  }
+  return writer.finish();
+}
+
+export function decodePaidTransactionOutcomeV2(
+  bytes: Uint8Array,
+): PaidTransactionOutcomeV2 {
+  checkVersion(bytes);
+  const reader = new Reader(bytes, 1);
+  const variant = reader.u32();
+  let outcome: PaidTransactionOutcomeV2;
+  if (variant === 0) {
+    outcome = {
+      status: "submitted",
+      executionId: reader.fixedBytes(32),
+      transactionHash: reader.fixedBytes(32),
+    };
+  } else if (variant === 1) {
+    const option = reader.u8();
+    if (option !== 0 && option !== 1) {
+      throw invalidV2Outcome("execution_id option tag is invalid");
+    }
+    const executionId = option === 1 ? reader.fixedBytes(32) : null;
+    outcome = {
+      status: "rejected",
+      executionId,
+      ...readPaidV2Rejection(reader, invalidV2Outcome),
+    };
+  } else {
+    throw invalidV2Outcome(`unknown outcome variant ${variant}`);
+  }
+  reader.expectEnd("PaidTransactionOutcomeV2");
+  return outcome;
+}
+
+export function encodePaidQuoteOutcomeV2(
+  outcome: PaidQuoteOutcomeV2,
+): Uint8Array {
+  const writer = new Writer();
+  writer.u8(PAYLOAD_VERSION);
+  if (outcome.status === "issued") {
+    writer.u32(0);
+    writeExecutionQuoteV1(writer, outcome.quote);
+    assertLen(outcome.executionId, 32, "PaidQuoteOutcomeV2.executionId");
+    assertLen(outcome.exitSignature, 65, "PaidQuoteOutcomeV2.exitSignature");
+    writer.fixedBytes(outcome.executionId);
+    writer.bytes(outcome.exitSignature);
+  } else {
+    writer.u32(1);
+    writePaidV2Rejection(writer, outcome);
+  }
+  return writer.finish();
+}
+
+export function decodePaidQuoteOutcomeV2(
+  bytes: Uint8Array,
+): PaidQuoteOutcomeV2 {
+  checkVersion(bytes);
+  const reader = new Reader(bytes, 1);
+  const variant = reader.u32();
+  let outcome: PaidQuoteOutcomeV2;
+  if (variant === 0) {
+    const quote = readExecutionQuoteV1(reader);
+    const executionId = reader.fixedBytes(32);
+    const exitSignature = reader.bytes();
+    if (exitSignature.length !== 65) {
+      throw invalidQuoteOutcome("exit signature must be 65 bytes");
+    }
+    outcome = {
+      status: "issued",
+      quote,
+      executionId,
+      exitSignature,
+    };
+  } else if (variant === 1) {
+    outcome = {
+      status: "rejected",
+      ...readPaidV2Rejection(reader, invalidQuoteOutcome),
+    };
+  } else {
+    throw invalidQuoteOutcome(`unknown outcome variant ${variant}`);
+  }
+  reader.expectEnd("PaidQuoteOutcomeV2");
+  return outcome;
+}
+
+function writePaidV2Rejection(
+  writer: Writer,
+  rejection: {
+    readonly code: PaidTransactionRejectionCodeV2;
+    readonly retryable: boolean;
+    readonly detail: string;
+  },
+): void {
+  const codeIndex = PAID_TRANSACTION_REJECTION_CODES_V2.indexOf(
+    rejection.code,
+  );
+  if (codeIndex < 0) {
+    throw invalidV2Encoding("rejection code is unsupported");
+  }
+  const detailBytes = new TextEncoder().encode(rejection.detail);
+  if (
+    detailBytes.length === 0 ||
+    detailBytes.length > MAX_SUBMIT_REJECTION_DETAIL_BYTES ||
+    /[\u0000-\u001f\u007f]/u.test(rejection.detail)
+  ) {
+    throw invalidV2Encoding("rejection detail is empty, oversized, or contains controls");
+  }
+  writer.u32(codeIndex);
+  writer.u8(rejection.retryable ? 1 : 0);
+  writer.bytes(detailBytes);
+}
+
+function readPaidV2Rejection(
+  reader: Reader,
+  invalid: (message: string) => NoxClientError,
+): {
+  code: PaidTransactionRejectionCodeV2;
+  retryable: boolean;
+  detail: string;
+} {
+  const code = PAID_TRANSACTION_REJECTION_CODES_V2[reader.u32()];
+  if (code === undefined) {
+    throw invalid("rejection code is unsupported");
+  }
+  const retryable = reader.u8();
+  if (retryable !== 0 && retryable !== 1) {
+    throw invalid("retryable flag is invalid");
+  }
+  const detailBytes = reader.bytes();
+  if (
+    detailBytes.length === 0 ||
+    detailBytes.length > MAX_SUBMIT_REJECTION_DETAIL_BYTES
+  ) {
+    throw invalid("rejection detail is empty or exceeds 256 bytes");
+  }
+  let detail: string;
+  try {
+    detail = new TextDecoder("utf-8", { fatal: true }).decode(detailBytes);
+  } catch {
+    throw invalid("rejection detail is not valid UTF-8");
+  }
+  if (/[\u0000-\u001f\u007f]/u.test(detail)) {
+    throw invalid("rejection detail contains controls");
+  }
+  return { code, retryable: retryable === 1, detail };
+}
+
+function writeExecutionQuoteV1(
+  writer: Writer,
+  quote: ExecutionQuoteV1,
+): void {
+  writer.u8(quote.quoteVersion);
+  writeFixed(writer, quote.chainId, 32, "ExecutionQuoteV1.chainId");
+  writeFixed(writer, quote.entryPoint, 20, "ExecutionQuoteV1.entryPoint");
+  writeFixed(writer, quote.exitAddress, 20, "ExecutionQuoteV1.exitAddress");
+  writeFixed(writer, quote.clientIntentId, 32, "ExecutionQuoteV1.clientIntentId");
+  writeFixed(writer, quote.paymentAdapter, 20, "ExecutionQuoteV1.paymentAdapter");
+  writeFixed(writer, quote.paymentId, 32, "ExecutionQuoteV1.paymentId");
+  writeFixed(writer, quote.feeAsset, 20, "ExecutionQuoteV1.feeAsset");
+  writeFixed(writer, quote.exitFee, 32, "ExecutionQuoteV1.exitFee");
+  writeFixed(writer, quote.networkFee, 32, "ExecutionQuoteV1.networkFee");
+  writeFixed(writer, quote.paymentGasLimit, 32, "ExecutionQuoteV1.paymentGasLimit");
+  writeFixed(writer, quote.actionTarget, 20, "ExecutionQuoteV1.actionTarget");
+  writeFixed(writer, quote.actionCalldataHash, 32, "ExecutionQuoteV1.actionCalldataHash");
+  writeFixed(writer, quote.actionGasLimit, 32, "ExecutionQuoteV1.actionGasLimit");
+  writeFixed(writer, quote.trackedAssetsHash, 32, "ExecutionQuoteV1.trackedAssetsHash");
+  writeFixed(writer, quote.maximumTransactionGas, 32, "ExecutionQuoteV1.maximumTransactionGas");
+  writeFixed(writer, quote.maximumFeePerGas, 32, "ExecutionQuoteV1.maximumFeePerGas");
+  writeFixed(writer, quote.returnDataLimit, 32, "ExecutionQuoteV1.returnDataLimit");
+  writer.u64(quote.validAfterUnix);
+  writer.u64(quote.validUntilUnix);
+  writeFixed(writer, quote.quoteNonce, 32, "ExecutionQuoteV1.quoteNonce");
+}
+
+function readExecutionQuoteV1(reader: Reader): ExecutionQuoteV1 {
+  return {
+    quoteVersion: reader.u8(),
+    chainId: reader.fixedBytes(32),
+    entryPoint: reader.fixedBytes(20),
+    exitAddress: reader.fixedBytes(20),
+    clientIntentId: reader.fixedBytes(32),
+    paymentAdapter: reader.fixedBytes(20),
+    paymentId: reader.fixedBytes(32),
+    feeAsset: reader.fixedBytes(20),
+    exitFee: reader.fixedBytes(32),
+    networkFee: reader.fixedBytes(32),
+    paymentGasLimit: reader.fixedBytes(32),
+    actionTarget: reader.fixedBytes(20),
+    actionCalldataHash: reader.fixedBytes(32),
+    actionGasLimit: reader.fixedBytes(32),
+    trackedAssetsHash: reader.fixedBytes(32),
+    maximumTransactionGas: reader.fixedBytes(32),
+    maximumFeePerGas: reader.fixedBytes(32),
+    returnDataLimit: reader.fixedBytes(32),
+    validAfterUnix: reader.u64(),
+    validUntilUnix: reader.u64(),
+    quoteNonce: reader.fixedBytes(32),
+  };
+}
+
+function writeFixed(
+  writer: Writer,
+  value: Uint8Array,
+  length: number,
+  name: string,
+): void {
+  assertLen(value, length, name);
+  writer.fixedBytes(value);
+}
+
+export function decodeSubmitTransactionResponse(
+  bytes: Uint8Array,
+): SubmitTransactionResponse {
+  if (startsWith(bytes, SUBMIT_ERROR_PREFIX)) {
+    return decodeSubmitRejection(bytes);
+  }
+  if (bytes.length === 32) {
+    return {
+      status: "submitted",
+      transactionHash: `0x${bytesToHex(bytes)}`,
+    };
+  }
+  throw invalidSubmitResponse("expected a 32-byte hash or typed rejection");
+}
+
+function decodeSubmitRejection(bytes: Uint8Array): SubmitTransactionResponse {
+  let text: string;
+  try {
+    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw invalidSubmitResponse("rejection is not valid UTF-8");
+  }
+
+  const encoded = text.slice("tx_error:".length);
+  const separator = encoded.indexOf(":");
+  if (separator <= 0) {
+    throw invalidSubmitResponse("rejection is missing its code or detail");
+  }
+
+  const code = encoded.slice(0, separator);
+  if (!SUBMIT_REJECTION_CODES.some((candidate) => candidate === code)) {
+    throw invalidSubmitResponse("rejection code is unsupported");
+  }
+
+  const detail = encoded.slice(separator + 1);
+  if (detail.length === 0 || /[\u0000-\u001f\u007f]/u.test(detail)) {
+    throw invalidSubmitResponse("rejection detail is empty or contains controls");
+  }
+  if (new TextEncoder().encode(detail).length > MAX_SUBMIT_REJECTION_DETAIL_BYTES) {
+    throw invalidSubmitResponse("rejection detail exceeds 256 bytes");
+  }
+
+  return {
+    status: "rejected",
+    code: code as SubmitRejectionCode,
+    detail,
+  };
+}
+
+function startsWith(bytes: Uint8Array, prefix: Uint8Array): boolean {
+  return (
+    bytes.length >= prefix.length &&
+    prefix.every((byte, index) => bytes[index] === byte)
+  );
+}
+
+function invalidSubmitResponse(message: string): NoxClientError {
+  return new NoxClientError(
+    `Invalid submit transaction response: ${message}`,
+    NoxClientErrorCode.DecryptionFailed,
+  );
+}
+
+function invalidV2Outcome(message: string): NoxClientError {
+  return new NoxClientError(
+    `Invalid PaidTransactionOutcomeV2: ${message}`,
+    NoxClientErrorCode.DecryptionFailed,
+  );
+}
+
+function invalidQuoteOutcome(message: string): NoxClientError {
+  return new NoxClientError(
+    `Invalid PaidQuoteOutcomeV2: ${message}`,
+    NoxClientErrorCode.DecryptionFailed,
+  );
+}
+
+function invalidV2Encoding(message: string): NoxClientError {
+  return new NoxClientError(
+    `Invalid paid-v2 encoding: ${message}`,
+    NoxClientErrorCode.PacketBuildFailed,
+  );
 }
 
 function checkVersion(bytes: Uint8Array): void {
@@ -209,6 +664,15 @@ class Reader {
 
   optString(): string | null {
     return this.u8() === 0 ? null : this.string();
+  }
+
+  expectEnd(typeName: string): void {
+    if (this.pos !== this.buf.length) {
+      throw new NoxClientError(
+        `${typeName} has ${this.buf.length - this.pos} trailing bytes`,
+        NoxClientErrorCode.DecryptionFailed,
+      );
+    }
   }
 }
 
@@ -370,7 +834,43 @@ function writeServiceRequest(w: Writer, req: ServiceRequest): void {
       w.u64(BigInt(req.surbs.length));
       for (const surb of req.surbs) writeSurbOpaque(w, surb);
       return;
+    case "PaidTransactionV2":
+      w.u32(6);
+      w.u64(req.chainId);
+      assertLen(
+        req.entryPoint,
+        20,
+        "ServiceRequest.PaidTransactionV2.entryPoint",
+      );
+      w.fixedBytes(req.entryPoint);
+      w.bytes(req.calldata);
+      assertLen(
+        req.executionId,
+        32,
+        "ServiceRequest.PaidTransactionV2.executionId",
+      );
+      w.fixedBytes(req.executionId);
+      w.u64(req.validUntilUnix);
+      return;
+    case "PaidQuoteRequestV2":
+      w.u32(7);
+      w.u64(req.chainId);
+      writeFixed(w, req.entryPoint, 20, "PaidQuoteRequestV2.entryPoint");
+      writeFixed(w, req.clientIntentId, 32, "PaidQuoteRequestV2.clientIntentId");
+      writeFixed(w, req.paymentAdapter, 20, "PaidQuoteRequestV2.paymentAdapter");
+      writeFixed(w, req.paymentId, 32, "PaidQuoteRequestV2.paymentId");
+      writeFixed(w, req.feeAsset, 20, "PaidQuoteRequestV2.feeAsset");
+      w.u64(req.paymentGasLimit);
+      writeFixed(w, req.actionTarget, 20, "PaidQuoteRequestV2.actionTarget");
+      writeFixed(w, req.actionCalldataHash, 32, "PaidQuoteRequestV2.actionCalldataHash");
+      w.u64(req.actionGasLimit);
+      writeFixed(w, req.trackedAssetsHash, 32, "PaidQuoteRequestV2.trackedAssetsHash");
+      w.u64(req.maximumTransactionGas);
+      w.u32(req.returnDataLimit);
+      w.u64(req.validUntilUnix);
+      return;
   }
+  return assertNever(req);
 }
 
 function readServiceRequest(r: Reader): ServiceRequest {
@@ -415,12 +915,46 @@ function readServiceRequest(r: Reader): ServiceRequest {
       }
       return { tag: "ReplenishSurbs", requestId, surbs: [] };
     }
+    case 6:
+      return {
+        tag: "PaidTransactionV2",
+        chainId: r.u64(),
+        entryPoint: r.fixedBytes(20),
+        calldata: r.bytes(),
+        executionId: r.fixedBytes(32),
+        validUntilUnix: r.u64(),
+      };
+    case 7:
+      return {
+        tag: "PaidQuoteRequestV2",
+        chainId: r.u64(),
+        entryPoint: r.fixedBytes(20),
+        clientIntentId: r.fixedBytes(32),
+        paymentAdapter: r.fixedBytes(20),
+        paymentId: r.fixedBytes(32),
+        feeAsset: r.fixedBytes(20),
+        paymentGasLimit: r.u64(),
+        actionTarget: r.fixedBytes(20),
+        actionCalldataHash: r.fixedBytes(32),
+        actionGasLimit: r.u64(),
+        trackedAssetsHash: r.fixedBytes(32),
+        maximumTransactionGas: r.u64(),
+        returnDataLimit: r.u32(),
+        validUntilUnix: r.u64(),
+      };
     default:
       throw new NoxClientError(
         `Unknown ServiceRequest variant index ${variant}`,
         NoxClientErrorCode.DecryptionFailed,
       );
   }
+}
+
+function assertNever(value: never): never {
+  throw new NoxClientError(
+    `Unsupported service request: ${String(value)}`,
+    NoxClientErrorCode.PacketBuildFailed,
+  );
 }
 
 export interface RpcResponse {
