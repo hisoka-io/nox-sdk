@@ -1,6 +1,6 @@
 [package]
 name = "nox-wasm"
-version = "0.1.0"
+version = "0.1.5"
 edition = "2021"
 authors = ["Hisoka Labs"]
 description = "WASM bindings for NOX mixnet Sphinx crypto (for browser/Node.js clients)"

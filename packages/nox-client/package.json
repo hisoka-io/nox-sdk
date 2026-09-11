@@ -26,7 +26,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@hisoka-io/nox-wasm": "^0.1.1",
+    "@hisoka-io/nox-wasm": "0.1.5",
     "ethers": "6.16.0",
     "js-sha3": "^0.9.3"
   },
