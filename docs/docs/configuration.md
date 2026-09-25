@@ -11,7 +11,7 @@ Pass options to `NoxClient.connect()` to control how the SDK discovers nodes, ve
 const client = await NoxClient.connect({
   seeds: ["https://seed.example.com"],
   ethRpcUrl: "https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
   timeoutMs: 30_000,
   topologyRefreshMs: 60_000,
   livenessMaxAgeMs: 180_000,
@@ -46,8 +46,9 @@ This catches compromised or stale seed nodes. If the fingerprints don't match, `
 
 Address of the NoxRegistry contract. Required alongside `ethRpcUrl`.
 
-Use the address from the current signed deployment record. `0xCURRENT_NOX_REGISTRY` in examples is an
-intentional fail-closed placeholder, not a deployed address.
+The current Arbitrum Sepolia testnet registry (deployed 2026-09-25) is `0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6`, used in the
+examples on this page. See [Deployments](./deployments.mdx) for the full contract set. The retired April 2026
+registry `0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc` fails verification.
 
 ### `timeoutMs`
 
@@ -115,7 +116,7 @@ Production connections require both verification inputs and fail before seed dis
 ```ts
 const client = await NoxClient.connect({
   ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 ```
 
@@ -130,7 +131,7 @@ The SDK verifies both the snapshot's self-consistency and its fingerprint agains
 ```ts
 const client = await NoxClient.connect({
   ethRpcUrl: "https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 ```
 
