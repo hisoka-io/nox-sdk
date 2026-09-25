@@ -17,7 +17,7 @@ import { NoxClient } from "@hisoka-io/nox-client";
 
 const client = await NoxClient.connect({
   ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 
 await client.submitTransaction("0xContractAddress", calldata);
@@ -31,8 +31,10 @@ const resp = await client.httpRequest("GET", "https://api.example.com/price", []
 client.disconnect();
 ```
 
-Replace the registry placeholder with the address in the current signed deployment record. The retired April
-testnet Registry is not ABI-compatible with this client and is rejected during full profile verification.
+`0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6` is the NoxRegistry proxy of the current Arbitrum Sepolia testnet deployment (2026-09-25). The April
+2026 registry `0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc` is retired: it is not ABI-compatible with this client
+and is rejected during full profile verification. See [Deployments](docs/docs/deployments.mdx) for the full
+contract set.
 
 You can pass config to `connect()`:
 
@@ -40,7 +42,7 @@ You can pass config to `connect()`:
 const client = await NoxClient.connect({
   seeds: ["https://api.hisoka.io/seed"],
   ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
   powDifficulty: 3,
   timeoutMs: 30_000,
   topologyRefreshMs: 60_000,

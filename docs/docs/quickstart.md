@@ -20,7 +20,7 @@ import { NoxClient } from "@hisoka-io/nox-client";
 
 const client = await NoxClient.connect({
   ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 ```
 
@@ -74,7 +74,7 @@ import { NoxClient, NoxClientError } from "@hisoka-io/nox-client";
 async function main() {
   const client = await NoxClient.connect({
     ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-    registryAddress: "0xCURRENT_NOX_REGISTRY",
+    registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
   });
 
   try {

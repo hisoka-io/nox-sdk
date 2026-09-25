@@ -8,15 +8,34 @@ hide_title: true
 
 Deployment status for the NOX protocol.
 
-## Testnet
+## Testnet: Arbitrum Sepolia (chain ID 421614)
 
-The previous Arbitrum Sepolia Registry is retired. It exposes the old seven-field profile ABI and cannot satisfy
-the SDK's complete topology verification. No current paid-execution deployment is published yet.
+Live since 2026-09-25, with 13 registered nodes. Registry deployment block: `312414608`.
 
-The next release will publish the Registry proxy and implementation, RewardPool proxy and implementation,
-NoxEntryPoint, sandbox implementation, payment adapter, BundleExecutor, runtime code hashes, proxy slots, fee
-assets, and start block in one signed deployment record. Clients and operators must consume that record instead
-of copying an address from historical documentation.
+| Contract | Address |
+|---|---|
+| NoxRegistry (UUPS proxy) | `0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6` |
+| NoxRewardPool (UUPS proxy) | `0xA487BAa4f2C3fAA01C70066EE88b6F7fD6f1361D` |
+| NoxEntryPoint | `0xad911Ca217C6dC779fCE6A6538bDda3071c38E7E` |
+| NoxSandbox implementation | `0x750F8d57AE1fCdBfCB191D7eB1E5E9D5d09fF738` |
+| HowlPaymentAdapter | `0xfC874B702F8D59B60B35582855505F4f60cE766D` |
+| BundleExecutor | `0xD1051dA177fEf52531AAcc3A6a2E44fE2191d058` |
+| DarkPool (UUPS proxy) | `0x6DABb5682A62b3827eE7e0E02F1DACE896AD457a` |
+| SOKA (staking and fee asset, 18 decimals) | `0x0F69cf1c9F4FF72471701036dd789c934458e630` |
+
+Governance: a Timelock (`0xe128389c997a7Ff0CB921b257547e497c5FA9c11`, 0 s delay on this testnet) holds the
+admin and upgrader roles. A 3-of-5 governance Safe (`0x776652ab08563Ffd39043a259B6d6B5F7dFf1ae2`) is its only
+proposer and executor, and it registers nodes. A 2-of-3 guardian Safe
+(`0x248dEb4eD675e5b727f199E32D3675aa284612F5`) is the DarkPool pauser, the NoxRegistry slasher, and the
+NoxRewardPool admin and distributor.
+
+Node operators get the complete record, with runtime code hashes, proxy implementation slots and pinned node
+images, from [`run-nox/configs/arbitrum-sepolia.deployment.json`](https://github.com/hisoka-io/run-nox/blob/main/configs/arbitrum-sepolia.deployment.json).
+
+### Retired
+
+The April 2026 Arbitrum Sepolia registry `0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc` was retired on 2026-09-25.
+It exposes the old seven-field profile ABI and cannot satisfy the SDK's complete topology verification.
 
 ## Seed nodes
 
@@ -26,7 +45,7 @@ The SDK resolves seed nodes automatically via the seed API (`api.hisoka.io/seed`
 const client = await NoxClient.connect({
   seeds: ["https://api.hisoka.io/seed"],
   ethRpcUrl: "https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 ```
 
@@ -37,7 +56,7 @@ Topology verification is mandatory outside an explicit loopback test mesh:
 ```ts
 const client = await NoxClient.connect({
   ethRpcUrl: "https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 ```
 

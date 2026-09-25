@@ -122,7 +122,7 @@ verified member set but are excluded from routing. This catches:
 ```ts
 const client = await NoxClient.connect({
   ethRpcUrl: "https://arb-sepolia.g.alchemy.com/v2/YOUR_KEY",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 ```
 

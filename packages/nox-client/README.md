@@ -17,7 +17,7 @@ import { NoxClient } from "@hisoka-io/nox-client";
 
 const client = await NoxClient.init({
   ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 
 const balance = await client.rpcCall("eth_getBalance", ["0xd8dA6BF26964aF9D7eEd9e03E53415D37aA96045", "latest"]);
@@ -28,8 +28,9 @@ client.disconnect();
 
 `init()` connects to the Hisoka testnet and verifies the discovered topology against the configured registry.
 Both verification inputs are required outside a loopback test mesh.
-Replace `0xCURRENT_NOX_REGISTRY` with the current signed deployment address. Historical testnet addresses are
-not compatible with the complete profile verifier.
+`0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6` is the NoxRegistry proxy of the current Arbitrum Sepolia testnet deployment (2026-09-25).
+The retired April 2026 registry `0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc` is not compatible with the complete
+profile verifier.
 
 ## Usage
 
@@ -39,7 +40,7 @@ not compatible with the complete profile verifier.
 // Override specific settings while keeping the rest as defaults
 const client = await NoxClient.init({
   ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
   timeoutMs: 60_000,
   surbsPerRequest: 20,
 });
@@ -160,7 +161,7 @@ const client = await NoxClient.connect({
   ...DEFAULTS,
   timeoutMs: 60_000,
   ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
-  registryAddress: "0xCURRENT_NOX_REGISTRY",
+  registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 ```
 
