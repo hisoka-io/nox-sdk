@@ -1,4 +1,4 @@
-import type { TopologyNode, PathHop } from "./types.js";
+import type { NoxFetch, TopologyNode, PathHop } from "./types.js";
 import { encodeRelayerPayload } from "./bincode.js";
 import { postPacket } from "./transport.js";
 import {
@@ -28,6 +28,7 @@ export class CoverTrafficController {
   private readonly getEntryUrl: () => string;
   private readonly getWasm: () => Record<string, unknown> | null;
   private readonly getPowDifficulty: () => number;
+  private readonly getFetch: (() => NoxFetch | undefined) | undefined;
 
   private lambdaP = 1.0;
   private maxPaddingBytes = 512;
@@ -38,11 +39,13 @@ export class CoverTrafficController {
     getEntryUrl: () => string;
     getWasm: () => Record<string, unknown> | null;
     getPowDifficulty: () => number;
+    getFetch?: () => NoxFetch | undefined;
   }) {
     this.getNodes = opts.getNodes;
     this.getEntryUrl = opts.getEntryUrl;
     this.getWasm = opts.getWasm;
     this.getPowDifficulty = opts.getPowDifficulty;
+    this.getFetch = opts.getFetch;
   }
 
   /** Start emitting cover packets. Safe to call multiple times. */
@@ -117,7 +120,7 @@ export class CoverTrafficController {
     }
 
     const entryUrl = this.getEntryUrl();
-    await postPacket(entryUrl, packet);
+    await postPacket(entryUrl, packet, undefined, this.getFetch?.());
   }
 }
 
@@ -126,6 +129,8 @@ export interface CoverClientAccessor {
   readonly entryUrl: string;
   readonly wasm: Record<string, unknown> | null;
   readonly config: { powDifficulty: number };
+  /** HTTP client used for packet delivery. Defaults to the global `fetch`. */
+  readonly fetch?: NoxFetch;
 }
 
 /** Create a `CoverTrafficController` wired to a `NoxClient`-like accessor. */
@@ -137,6 +142,7 @@ export function createCoverController(
     getEntryUrl: () => client.entryUrl,
     getWasm: () => client.wasm,
     getPowDifficulty: () => client.config.powDifficulty,
+    getFetch: () => client.fetch,
   });
 }
 

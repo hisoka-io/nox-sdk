@@ -17,6 +17,8 @@ import {
 import { NoxClientError, NoxClientErrorCode } from "../src/types.js";
 import { computeTopologyFingerprint } from "../src/topology.js";
 import { parseNodes } from "../src/topology.js";
+import { Interface } from "ethers";
+import type { Route, TopologyNode } from "../src/types.js";
 
 // ── Mock infrastructure ────────────────────────────────────────────────────
 
@@ -332,8 +334,12 @@ describe("paid route freshness", () => {
   it("performs one bounded refresh attempt for a reachable invalid seed", async () => {
     const client = detachedClient(0);
     let topologyFetches = 0;
+    let nodeTopologyFetches = 0;
     globalThis.fetch = vi.fn().mockImplementation(async (url: string) => {
-      if (url.endsWith("/topology")) {
+      if (url.endsWith("/topology") && !url.startsWith("https://seed.test")) {
+        nodeTopologyFetches += 1;
+      }
+      if (url.endsWith("/topology") && url.startsWith("https://seed.test")) {
         topologyFetches += 1;
         return {
           ok: true,
@@ -350,6 +356,8 @@ describe("paid route freshness", () => {
     await refresh.call(client, "https://seed.test");
 
     expect(topologyFetches).toBe(1);
+    // Node-served topology fallbacks are bounded too.
+    expect(nodeTopologyFetches).toBeLessThanOrEqual(3);
     expect(client.topologyRefreshError).toMatchObject({
       code: NoxClientErrorCode.TopologyVerificationFailed,
     });
@@ -461,5 +469,403 @@ describe("NoxClientConfig defaults", () => {
     const { DEFAULTS } = await import("../src/index.js");
     expect(DEFAULTS).toBeDefined();
     expect(DEFAULTS.seeds.length).toBeGreaterThan(0);
+  });
+});
+
+// ── Seeds, verification and refresh ───────────────────────────────────────
+
+const REGISTRY = new Interface([
+  "function topologyFingerprint() view returns (bytes32)",
+  "function relayerCount() view returns (uint256)",
+  "function relayers(address) view returns (bytes32 sphinxKey,string url,string ingressUrl,string metadataUrl,uint256 stakedAmount,uint256 unlockTime,bool isRegistered,uint8 status,bool frozen)",
+  "function getNodeRole(address) view returns (uint8)",
+]);
+
+type TestNode = ReturnType<typeof makeNode>;
+
+/** Answer registry eth_calls (single or batched) for `nodes`. */
+function registryAnswer(nodes: TestNode[], body: { id?: number; params: [{ data: string }] }) {
+  const call = REGISTRY.parseTransaction({ data: body.params[0].data })!;
+  const node = call.fragment.inputs.length === 0
+    ? undefined
+    : nodes.find((n) => n.address.toLowerCase() === String(call.args[0]).toLowerCase())!;
+  let result: string;
+  switch (call.name) {
+    case "topologyFingerprint":
+      result = REGISTRY.encodeFunctionResult(call.name, [`0x${computeTopologyFingerprint(nodes)}`]);
+      break;
+    case "relayerCount":
+      result = REGISTRY.encodeFunctionResult(call.name, [BigInt(nodes.length)]);
+      break;
+    case "relayers":
+      result = REGISTRY.encodeFunctionResult(call.name, [
+        `0x${node!.sphinx_key}`, node!.url, node!.ingress_url ?? "", "",
+        BigInt(node!.stake), 0n, true, 1, false,
+      ]);
+      break;
+    default:
+      result = REGISTRY.encodeFunctionResult(call.name, [node!.role]);
+  }
+  return { jsonrpc: "2.0", id: body.id ?? 1, result };
+}
+
+function liveV2(nodes: TestNode[], extra: Record<string, unknown> = {}) {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    nodes,
+    fingerprint: computeTopologyFingerprint(nodes),
+    schema_version: 2,
+    block_number: 4_660,
+    timestamp: now,
+    pow_difficulty: 0,
+    liveness: nodes.map((node) => ({
+      address: node.address,
+      status: "online",
+      observed_at_unix: now,
+    })),
+    ...extra,
+  };
+}
+
+/** Canonically ordered v2 topology (addresses ascending, exits on layer 2). */
+function verifiedNodes(): TestNode[] {
+  // Layer must match sha256(address)[0] % 2 for relays, so pick relays whose
+  // primary layer is valid by construction: read it back from the checker.
+  return [makeNode(0, 1, 1), makeNode(0, 1, 2), makeNode(2, 2, 3), makeNode(2, 2, 4)];
+}
+
+function mockNetwork(
+  topologies: Record<string, unknown>,
+  nodes: TestNode[],
+): ReturnType<typeof vi.fn> {
+  const mock = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
+    if (url.endsWith("/topology")) {
+      const base = url.slice(0, -"/topology".length);
+      if (!(base in topologies)) throw new Error(`unreachable ${base}`);
+      return { ok: true, status: 200, json: async () => topologies[base] };
+    }
+    if (url === "http://rpc.test") {
+      const body = JSON.parse(String(init?.body));
+      const reply = Array.isArray(body)
+        ? body.map((entry) => registryAnswer(nodes, entry))
+        : registryAnswer(nodes, body);
+      return { ok: true, status: 200, json: async () => reply };
+    }
+    throw new Error(`unexpected ${url}`);
+  });
+  return mock;
+}
+
+const VERIFY = {
+  ethRpcUrl: "http://rpc.test",
+  registryAddress: "0x1111111111111111111111111111111111111111",
+};
+
+/** Fix relay layers so they satisfy the schema v2 primary-layer rule. */
+async function canonical(nodes: TestNode[]): Promise<TestNode[]> {
+  const { sha256, toUtf8Bytes } = await import("ethers");
+  return nodes.map((node) => {
+    if (node.role !== 1) return node;
+    const first = Number.parseInt(sha256(toUtf8Bytes(node.address.toLowerCase())).slice(2, 4), 16);
+    return { ...node, layer: first % 2 };
+  });
+}
+
+describe("seed fallback and transport injection", () => {
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("moves on to the next seed when the first serves the legacy schema", async () => {
+    const nodes = await canonical(verifiedNodes());
+    const legacy = { nodes, fingerprint: computeTopologyFingerprint(nodes) };
+    const fetchMock = mockNetwork(
+      { "https://node.test": legacy, "https://seed.test": liveV2(nodes) },
+      nodes,
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const client = await NoxClient.connect({
+      ...VERIFY,
+      seeds: ["https://node.test", "https://seed.test"],
+      transport: { WebSocket: null },
+    });
+    try {
+      expect(client.nodes).toHaveLength(4);
+      expect(Reflect.get(client, "_seedUrl")).toBe("https://seed.test");
+      // One batched registry read for 4 members.
+      const rpcCalls = fetchMock.mock.calls.filter(([url]) => url === "http://rpc.test");
+      expect(rpcCalls).toHaveLength(1);
+    } finally {
+      client.disconnect();
+    }
+  });
+
+  it("uses the injected fetch for seeds and registry reads", async () => {
+    const nodes = await canonical(verifiedNodes());
+    const injected = mockNetwork({ "https://seed.test": liveV2(nodes) }, nodes);
+    const globalFetch = vi.fn().mockRejectedValue(new Error("global fetch used"));
+    globalThis.fetch = globalFetch as unknown as typeof fetch;
+
+    const client = await NoxClient.connect({
+      ...VERIFY,
+      seeds: ["https://seed.test"],
+      transport: {
+        fetch: injected as unknown as (input: string, init?: RequestInit) => Promise<Response>,
+        WebSocket: null,
+      },
+    });
+    client.disconnect();
+
+    expect(injected).toHaveBeenCalled();
+    expect(globalFetch).not.toHaveBeenCalled();
+  });
+
+  it("follows the seed PoW difficulty unless the caller raised it", async () => {
+    const nodes = await canonical(verifiedNodes());
+    globalThis.fetch = mockNetwork(
+      { "https://seed.test": liveV2(nodes, { pow_difficulty: 5 }) },
+      nodes,
+    ) as unknown as typeof fetch;
+
+    const viaInit = await NoxClient.init({ ...VERIFY, seeds: ["https://seed.test"], transport: { WebSocket: null } });
+    viaInit.disconnect();
+    expect(viaInit.config.powDifficulty).toBe(5);
+
+    const pinnedLow = await NoxClient.connect({
+      ...VERIFY, seeds: ["https://seed.test"], powDifficulty: 0, transport: { WebSocket: null },
+    });
+    pinnedLow.disconnect();
+    expect(pinnedLow.config.powDifficulty).toBe(5);
+
+    const pinnedHigh = await NoxClient.connect({
+      ...VERIFY, seeds: ["https://seed.test"], powDifficulty: 8, transport: { WebSocket: null },
+    });
+    pinnedHigh.disconnect();
+    expect(pinnedHigh.config.powDifficulty).toBe(8);
+  });
+
+  it("does not fall back to the public seed for a loopback test mesh", async () => {
+    const fetchMock = vi.fn().mockRejectedValue(new Error("down"));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(
+      NoxClient.connect({ seeds: ["http://127.0.0.1:1"], dangerouslySkipFingerprintCheck: true }),
+    ).rejects.toThrow("No seed nodes reachable");
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["http://127.0.0.1:1/topology"]);
+  });
+
+  it("shares one in-flight refresh between concurrent callers", async () => {
+    const nodes = await canonical(verifiedNodes());
+    const fetchMock = mockNetwork({ "https://seed.test": liveV2(nodes) }, nodes);
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const client = await NoxClient.connect({
+      ...VERIFY, seeds: ["https://seed.test"], transport: { WebSocket: null },
+    });
+    try {
+      fetchMock.mockClear();
+      const refresh = Reflect.get(client, "_refreshTopology") as () => Promise<void>;
+      await Promise.all([refresh.call(client), refresh.call(client), refresh.call(client)]);
+      const topologyFetches = fetchMock.mock.calls.filter(([url]) => String(url).endsWith("/topology"));
+      expect(topologyFetches).toHaveLength(1);
+    } finally {
+      client.disconnect();
+    }
+  });
+
+  it("refreshes from a verified node's topology when every seed is down", async () => {
+    const nodes = await canonical(verifiedNodes());
+    const topologies: Record<string, unknown> = { "https://seed.test": liveV2(nodes) };
+    const fetchMock = mockNetwork(topologies, nodes);
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    const client = await NoxClient.connect({
+      ...VERIFY, seeds: ["https://seed.test"], transport: { WebSocket: null },
+    });
+    try {
+      delete topologies["https://seed.test"];
+      for (const node of nodes) {
+        if (node.ingress_url) topologies[node.ingress_url] = liveV2(nodes);
+      }
+      Reflect.set(client, "_topologyVerifiedAtMs", 1);
+      const refresh = Reflect.get(client, "_refreshTopology") as () => Promise<void>;
+      await refresh.call(client);
+      expect(client.topologyRefreshError).toBeNull();
+      expect(Reflect.get(client, "_topologyVerifiedAtMs")).toBeGreaterThan(1);
+      expect(nodes.map((n) => n.ingress_url)).toContain(Reflect.get(client, "_seedUrl"));
+    } finally {
+      client.disconnect();
+    }
+  });
+});
+
+// ── Retry after a response timeout ─────────────────────────────────────────
+
+describe("retry on a different route", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  function retryClient(): { client: NoxClient; routes: Route[]; outcomes: (Uint8Array | Error)[] } {
+    const nodes: TopologyNode[] = [
+      { id: "0x01", address: "https://entry.test", routingAddress: "/e", publicKey: new Uint8Array(32), layer: 0, role: 1 },
+      { id: "0x02", address: "", routingAddress: "/m1", publicKey: new Uint8Array(32), layer: 1, role: 1 },
+      { id: "0x03", address: "", routingAddress: "/m2", publicKey: new Uint8Array(32), layer: 1, role: 1 },
+      { id: "0x04", address: "", routingAddress: "/x1", publicKey: new Uint8Array(32), layer: 2, role: 2 },
+      { id: "0x05", address: "", routingAddress: "/x2", publicKey: new Uint8Array(32), layer: 2, role: 2 },
+    ];
+    const client = Object.create(NoxClient.prototype) as NoxClient;
+    Reflect.set(client, "_nodes", nodes);
+    Reflect.set(client, "_entryUrl", "https://entry.test");
+    Reflect.set(client, "_wasm", {});
+    Reflect.set(client, "_avoidUntil", new Map());
+    Reflect.set(client, "_config", { retryOnTimeout: true, surbsPerRequest: 2, fecRatio: 0 });
+    Reflect.set(client, "adaptive", new AdaptiveSurbBudget());
+    Reflect.set(client, "nextRequestId", 0n);
+    const routes: Route[] = [];
+    const outcomes: (Uint8Array | Error)[] = [];
+    Reflect.set(client, "_sendOnRoute", async (_p: unknown, _s: number, _t: unknown, route: Route) => {
+      routes.push(route);
+      const next = outcomes.shift() ?? new Uint8Array([1]);
+      if (next instanceof Error) throw next;
+      return next;
+    });
+    return { client, routes, outcomes };
+  }
+
+  const timeout = () =>
+    new NoxClientError("timed out", NoxClientErrorCode.ResponseTimeout);
+
+  it("resends an echo once on a different mix and exit", async () => {
+    const { client, routes, outcomes } = retryClient();
+    outcomes.push(timeout(), new Uint8Array([7]));
+
+    await expect(client.sendEcho(new Uint8Array([7]))).resolves.toEqual(new Uint8Array([7]));
+
+    expect(routes).toHaveLength(2);
+    expect(routes[1]!.mix.id).not.toBe(routes[0]!.mix.id);
+    expect(routes[1]!.exit.id).not.toBe(routes[0]!.exit.id);
+  });
+
+  it("avoids the timed-out hops on later requests until they answer", async () => {
+    const { client, routes, outcomes } = retryClient();
+    outcomes.push(timeout(), timeout());
+
+    await expect(client.sendEcho(new Uint8Array([1]))).rejects.toMatchObject({
+      code: NoxClientErrorCode.ResponseTimeout,
+    });
+    expect(routes).toHaveLength(2);
+
+    await client.sendEcho(new Uint8Array([2]));
+    // Every mix and exit timed out once, so the third route reuses some;
+    // the successful reply clears them.
+    const avoided = Reflect.get(client, "_avoidUntil") as Map<string, number>;
+    expect(avoided.has(routes[2]!.mix.id)).toBe(false);
+    expect(avoided.has(routes[2]!.exit.id)).toBe(false);
+  });
+
+  it("does not resend a non-idempotent transaction submission", async () => {
+    const { client, routes, outcomes } = retryClient();
+    outcomes.push(timeout());
+
+    await expect(
+      client.submitTransaction("0x" + "11".repeat(20), new Uint8Array([1])),
+    ).rejects.toMatchObject({ code: NoxClientErrorCode.ResponseTimeout });
+    expect(routes).toHaveLength(1);
+  });
+
+  it("does not resend when retryOnTimeout is off", async () => {
+    const { client, routes, outcomes } = retryClient();
+    Reflect.set(client, "_config", { retryOnTimeout: false, surbsPerRequest: 2, fecRatio: 0 });
+    outcomes.push(timeout());
+
+    await expect(client.sendEcho(new Uint8Array([1]))).rejects.toMatchObject({
+      code: NoxClientErrorCode.ResponseTimeout,
+    });
+    expect(routes).toHaveLength(1);
+  });
+
+  it("only resends GET-like HTTP requests", async () => {
+    const { client, routes, outcomes } = retryClient();
+    outcomes.push(timeout());
+    await expect(
+      client.httpRequest("POST", "https://api.test", [], new Uint8Array()),
+    ).rejects.toMatchObject({ code: NoxClientErrorCode.ResponseTimeout });
+    expect(routes).toHaveLength(1);
+
+    outcomes.push(timeout(), new Uint8Array([3]));
+    await expect(
+      client.httpRequest("GET", "https://api.test", [], new Uint8Array()),
+    ).resolves.toEqual(new Uint8Array([3]));
+    expect(routes).toHaveLength(3);
+  });
+
+  it("sends a paid quote retry to a different exit", async () => {
+    const { client, routes, outcomes } = retryClient();
+    outcomes.push(timeout(), new Uint8Array([9]));
+    const nodes = client.nodes;
+    const send = Reflect.get(client, "_sendWithRetry") as (
+      ...args: unknown[]
+    ) => Promise<{ response: Uint8Array; exit: TopologyNode }>;
+
+    const result = await send.call(
+      client,
+      { tag: "AnonymousRequest", inner: new Uint8Array(), replySurbs: [] },
+      2,
+      undefined,
+      nodes[3],
+      "exit",
+    );
+
+    expect(routes[0]!.exit.id).toBe("0x04");
+    expect(routes[1]!.exit.id).toBe("0x05");
+    expect(result.exit.id).toBe("0x05");
+  });
+});
+
+// ── Paid exit capability ───────────────────────────────────────────────────
+
+describe("paid exit capability", () => {
+  function capabilityClient(capabilities: (readonly string[] | undefined)[]): NoxClient {
+    const base: TopologyNode[] = [
+      { id: "0x0000000000000000000000000000000000000001", address: "https://entry.test", routingAddress: "/e", publicKey: new Uint8Array(32), layer: 0, role: 1 },
+      { id: "0x0000000000000000000000000000000000000002", address: "", routingAddress: "/m", publicKey: new Uint8Array(32), layer: 1, role: 1 },
+      { id: "0x0000000000000000000000000000000000000004", address: "", routingAddress: "/x1", publicKey: new Uint8Array(32), layer: 2, role: 2 },
+      { id: "0x0000000000000000000000000000000000000005", address: "", routingAddress: "/x2", publicKey: new Uint8Array(32), layer: 2, role: 2 },
+    ];
+    const nodes = base.map((node, index) => {
+      const nodeCapabilities = capabilities[index];
+      return nodeCapabilities === undefined ? node : { ...node, capabilities: nodeCapabilities };
+    });
+    const client = Object.create(NoxClient.prototype) as NoxClient;
+    Reflect.set(client, "_nodes", nodes);
+    Reflect.set(client, "_entryUrl", "https://entry.test");
+    Reflect.set(client, "_avoidUntil", new Map());
+    return client;
+  }
+
+  it("chooses only exits that advertise paid_v2 when the seed publishes capabilities", () => {
+    const client = capabilityClient([[], [], [], ["paid_v2"]]);
+    for (let i = 0; i < 10; i++) {
+      expect(client.selectPaidExit().id).toBe("0x0000000000000000000000000000000000000005");
+    }
+  });
+
+  it("fails fast when no exit advertises paid_v2", () => {
+    const client = capabilityClient([[], [], ["echo"], []]);
+    expect(() => client.selectPaidExit()).toThrow(
+      expect.objectContaining({ code: NoxClientErrorCode.PaidExitUnavailable }),
+    );
+    const resolve = Reflect.get(client, "_resolvePaidExit") as (exit: TopologyNode) => TopologyNode;
+    expect(() => resolve.call(client, client.nodes[2]!)).toThrow(
+      expect.objectContaining({ code: NoxClientErrorCode.PaidExitUnavailable }),
+    );
+  });
+
+  it("keeps every exit eligible when the seed publishes no capability data", () => {
+    const client = capabilityClient([undefined, undefined, undefined, undefined]);
+    const seen = new Set<string>();
+    for (let i = 0; i < 40; i++) seen.add(client.selectPaidExit().id);
+    expect(seen.size).toBe(2);
   });
 });

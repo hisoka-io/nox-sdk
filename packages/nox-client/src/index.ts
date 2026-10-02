@@ -6,12 +6,18 @@ export type {
   Route,
   BatchResponseItem,
   NoxClientConfig,
+  NoxClientSettings,
+  NoxFetch,
+  NoxTransport,
+  NoxWebSocketConstructor,
+  TopologyLiveness,
 } from "./types.js";
 
 export {
   NoxClientError,
   NoxClientErrorCode,
   DEFAULTS,
+  PAID_V2_CAPABILITY,
 } from "./types.js";
 
 export {
@@ -27,7 +33,7 @@ export {
   hasUsableIngress,
 } from "./topology.js";
 
-export { resolveSeedUrl } from "./seeder.js";
+export { resolveSeedUrl, DEFAULT_SEED } from "./seeder.js";
 
 export {
   postPacket,
@@ -85,6 +91,7 @@ export { NoxClient } from "./client.js";
 export {
   AdaptiveSurbBudget,
   USABLE_RESPONSE_PER_SURB,
+  ROUTE_AVOID_MS,
 } from "./client.js";
 
 export { SurbPool } from "./surb_pool.js";

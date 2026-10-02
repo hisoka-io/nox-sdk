@@ -5,6 +5,7 @@ import {
   encodeServiceRequest,
 } from "./bincode.js";
 import { postPacket } from "./transport.js";
+import type { NoxFetch } from "./types.js";
 import type { SurbPool } from "./surb_pool.js";
 import { buildSphinxPacket } from "./utils.js";
 
@@ -34,6 +35,7 @@ export class ReplenishmentManager {
     entryUrl: string;
     powDifficulty: number;
     minSurbs?: number;
+    fetch?: NoxFetch;
   }): Promise<void> {
     const {
       wasm,
@@ -83,7 +85,7 @@ export class ReplenishmentManager {
     });
 
     const packet = buildSphinxPacket(wasm, forwardPath, payloadBytes, powDifficulty);
-    await postPacket(entryUrl, packet);
+    await postPacket(entryUrl, packet, undefined, opts.fetch);
   }
 
   /** Send multiple ReplenishSurbs packets in a burst to cover all remaining fragments. */
@@ -96,6 +98,7 @@ export class ReplenishmentManager {
     surbPool: SurbPool;
     entryUrl: string;
     powDifficulty: number;
+    fetch?: NoxFetch;
   }): Promise<void> {
     const {
       wasm,
@@ -150,7 +153,9 @@ export class ReplenishmentManager {
 
     for (let start = 0; start < packets.length; start += BATCH_SIZE) {
       const batch = packets.slice(start, start + BATCH_SIZE);
-      await Promise.all(batch.map((pkt) => postPacket(entryUrl, pkt)));
+      await Promise.all(
+        batch.map((pkt) => postPacket(entryUrl, pkt, undefined, opts.fetch)),
+      );
 
       if (start + BATCH_SIZE < packets.length) {
         await new Promise((resolve) => setTimeout(resolve, BATCH_DELAY_MS));
