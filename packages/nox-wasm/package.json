@@ -18,7 +18,8 @@
   "files": [
     "pkg-web",
     "pkg-bundler",
-    "pkg-node"
+    "pkg-node",
+    "nox_wasm.d.ts"
   ],
   "exports": {
     ".": {
