@@ -4,7 +4,13 @@ if (typeof globalThis.crypto === "undefined")
   (globalThis as any).crypto = webcrypto;
 import { NoxClient, encodeServiceRequest } from "../src/index.js";
 
-const SEED = process.env["SEED"] || "https://api.hisoka.io/seed/topology";
+// Live suites run against the public testnet with full chain verification.
+// Override any of these to point at another deployment.
+const SEED = process.env["SEED"] || "https://api.hisoka.io/seed";
+const ETH_RPC_URL =
+  process.env["NOX_ETH_RPC_URL"] || "https://sepolia-rollup.arbitrum.io/rpc";
+const REGISTRY_ADDRESS =
+  process.env["NOX_REGISTRY_ADDRESS"] || "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6";
 const TIMEOUT = 60_000;
 const SURBS = 10;
 
@@ -16,10 +22,10 @@ describe.skipIf(skipUnless)("live testnet", () => {
   beforeAll(async () => {
     client = await NoxClient.connect({
       seeds: [SEED],
-      powDifficulty: 3,
+      ethRpcUrl: ETH_RPC_URL,
+      registryAddress: REGISTRY_ADDRESS,
       timeoutMs: TIMEOUT,
       surbsPerRequest: SURBS,
-      dangerouslySkipFingerprintCheck: true,
     });
   }, 30_000);
 
