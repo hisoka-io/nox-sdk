@@ -16,6 +16,7 @@ import {
   parseNodes,
   selectRoute,
   selectLiveNodes,
+  livenessCapabilities,
 } from "../src/topology.js";
 import type { RelayerNode, TopologySnapshot, TopologyNode } from "../src/types.js";
 import { NoxClientError } from "../src/types.js";
@@ -416,6 +417,67 @@ describe("selectLiveNodes", () => {
 
     expect(selectLiveNodes(snapshot, 1_700_000_000, 180)).toEqual([]);
   });
+
+  function liveSnapshot(observedAtUnix: number, timestamp = 1_700_000_000): {
+    node: RelayerNode;
+    snapshot: TopologySnapshot;
+  } {
+    const node = makeNode();
+    return {
+      node,
+      snapshot: {
+        ...makeSnapshot([node]),
+        schema_version: 2,
+        block_number: 12,
+        timestamp,
+        liveness: [{ address: node.address, status: "online", observed_at_unix: observedAtUnix }],
+      },
+    };
+  }
+
+  it.each([
+    ["70 s behind", -70],
+    ["5 s behind", -5],
+    ["in sync", 0],
+    ["200 s ahead", 200],
+  ])("keeps fresh members when the local clock is %s", (_label, skew) => {
+    const { node, snapshot } = liveSnapshot(1_699_999_990);
+    expect(selectLiveNodes(snapshot, 1_700_000_000 + skew, 180)).toEqual([node]);
+  });
+
+  it("measures observation age on the seed clock", () => {
+    const { snapshot } = liveSnapshot(1_699_999_000);
+    // 1000 s old on the seed clock: stale, whatever the local clock says.
+    expect(selectLiveNodes(snapshot, 1_699_999_100, 180)).toEqual([]);
+  });
+
+  it("rejects a snapshot older than the age limit plus skew tolerance", () => {
+    const { snapshot } = liveSnapshot(1_699_999_990);
+    expect(() => selectLiveNodes(snapshot, 1_700_000_000 + 241, 180)).toThrow(
+      "older than the local clock",
+    );
+    expect(selectLiveNodes(snapshot, 1_700_000_000 + 240, 180)).toHaveLength(1);
+  });
+});
+
+describe("livenessCapabilities", () => {
+  it("returns well-formed capability lists keyed by lowercase address", () => {
+    const upper = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const snapshot = {
+      ...makeSnapshot([]),
+      liveness: [
+        { address: upper, status: "online", observed_at_unix: 1, capabilities: ["paid_v2"] },
+        { address: "0x" + "bb".repeat(20), status: "online", observed_at_unix: 1 },
+        { address: "0x" + "cc".repeat(20), status: "online", observed_at_unix: 1, capabilities: [7] },
+      ],
+    } as unknown as TopologySnapshot;
+
+    const capabilities = livenessCapabilities(snapshot);
+
+    expect(capabilities.get(upper.toLowerCase())).toEqual(["paid_v2"]);
+    expect(capabilities.has("0x" + "bb".repeat(20))).toBe(false);
+    expect(capabilities.has("0x" + "cc".repeat(20))).toBe(false);
+  });
 });
 
 // ── verifyOnChain ──────────────────────────────────────────────────────────
@@ -443,16 +505,13 @@ describe("verifyOnChain", () => {
       registered?: boolean;
       status?: number;
       frozen?: boolean;
+      batchUnsupported?: boolean;
     } = {},
   ): void {
-    globalThis.fetch = vi.fn().mockImplementation(
-      async (_url: string, init: RequestInit) => {
-        const body = JSON.parse(String(init.body)) as {
-          method: string;
-          params: [{ data: string }];
-        };
+    type RpcBody = { id?: number; method: string; params: [{ data: string }] };
+    const answer = (body: RpcBody): Record<string, unknown> => {
         if (body.method === "eth_blockNumber") {
-          return { ok: true, json: async () => ({ result: "0x1234" }) };
+          return { id: body.id, result: "0x1234" };
         }
         const call = registry.parseTransaction({ data: body.params[0].data });
         let result: string;
@@ -488,9 +547,34 @@ describe("verifyOnChain", () => {
           default:
             throw new Error("unexpected registry call");
         }
-        return { ok: true, json: async () => ({ result }) };
+        return { id: body.id, result };
+    };
+    globalThis.fetch = vi.fn().mockImplementation(
+      async (_url: string, init: RequestInit) => {
+        const body = JSON.parse(String(init.body)) as RpcBody | RpcBody[];
+        if (Array.isArray(body)) {
+          if (overrides.batchUnsupported) {
+            return {
+              ok: true,
+              json: async () => ({ error: { message: "batch requests are not supported" } }),
+            };
+          }
+          // Reverse the order: replies are matched by id, not position.
+          return { ok: true, json: async () => body.map(answer).reverse() };
+        }
+        return { ok: true, json: async () => answer(body) };
       },
     );
+  }
+
+  /** Every JSON-RPC call sent, with batches flattened. */
+  function sentCalls(): { method: string; params: unknown[] }[] {
+    return vi.mocked(globalThis.fetch).mock.calls.flatMap(([, init]) => {
+      const body = JSON.parse(String(init?.body)) as
+        | { method: string; params: unknown[] }
+        | { method: string; params: unknown[] }[];
+      return Array.isArray(body) ? body : [body];
+    });
   }
 
   afterEach(() => {
@@ -519,9 +603,7 @@ describe("verifyOnChain", () => {
       "0x1111111111111111111111111111111111111111",
       [node],
     );
-    const calls = vi.mocked(globalThis.fetch).mock.calls;
-    const blockTags = calls
-      .map(([, init]) => JSON.parse(String(init?.body)) as { method: string; params: unknown[] })
+    const blockTags = sentCalls()
       .filter((body) => body.method === "eth_call")
       .map((body) => body.params[1]);
     expect(blockTags).toEqual(new Array(blockTags.length).fill("0x1234"));
@@ -536,15 +618,105 @@ describe("verifyOnChain", () => {
       [node],
       4_660,
     );
-    const bodies = vi.mocked(globalThis.fetch).mock.calls.map(([, init]) =>
-      JSON.parse(String(init?.body)) as { method: string; params: unknown[] },
-    );
+    const bodies = sentCalls();
     expect(bodies.some((body) => body.method === "eth_blockNumber")).toBe(false);
     expect(
       bodies
         .filter((body) => body.method === "eth_call")
         .map((body) => body.params[1]),
     ).toEqual(new Array(4).fill("0x1234"));
+  });
+
+  it("reads every member's profile in one batched request", async () => {
+    const nodes = [
+      makeNode({ address: "0x" + "01".repeat(20) }),
+      makeNode({ address: "0x" + "02".repeat(20) }),
+      makeNode({ address: "0x" + "03".repeat(20) }),
+    ];
+    const fingerprint = computeTopologyFingerprint(nodes);
+    globalThis.fetch = vi.fn().mockImplementation(
+      async (_url: string, init: RequestInit) => {
+        const body = JSON.parse(String(init.body)) as {
+          id: number;
+          params: [{ data: string }];
+        }[];
+        return {
+          ok: true,
+          json: async () => body.map((entry) => {
+            const call = registry.parseTransaction({ data: entry.params[0].data })!;
+            const node = call.fragment.inputs.length === 0
+              ? undefined
+              : nodes.find(
+                (candidate) =>
+                  candidate.address.toLowerCase() === String(call.args[0]).toLowerCase(),
+              );
+            let result: string;
+            switch (call.name) {
+              case "topologyFingerprint":
+                result = registry.encodeFunctionResult(call.name, [`0x${fingerprint}`]);
+                break;
+              case "relayerCount":
+                result = registry.encodeFunctionResult(call.name, [3n]);
+                break;
+              case "relayers":
+                result = registry.encodeFunctionResult(call.name, [
+                  `0x${node!.sphinx_key}`, node!.url, node!.ingress_url ?? "",
+                  node!.metadata_url ?? "", BigInt(node!.stake), 0n, true, 1, false,
+                ]);
+                break;
+              default:
+                result = registry.encodeFunctionResult(call.name, [node!.role]);
+            }
+            return { jsonrpc: "2.0", id: entry.id, result };
+          }),
+        };
+      },
+    );
+
+    const eligible = await verifyOnChainWithEligibility(
+      "http://rpc.test",
+      "0x1111111111111111111111111111111111111111",
+      nodes,
+      4_660,
+    );
+
+    expect(eligible.size).toBe(3);
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledOnce();
+  });
+
+  it("falls back to single calls when the endpoint rejects batches", async () => {
+    const node = makeNode();
+    mockRegistry(node, { batchUnsupported: true });
+
+    await expect(
+      verifyOnChainWithEligibility(
+        "http://rpc.test",
+        "0x1111111111111111111111111111111111111111",
+        [node],
+        4_660,
+      ),
+    ).resolves.toEqual(new Set([node.address.toLowerCase()]));
+    // One rejected batch, then the four reads one by one.
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(5);
+  });
+
+  it("uses an injected fetch instead of the global one", async () => {
+    const node = makeNode();
+    mockRegistry(node);
+    const injected = vi.mocked(globalThis.fetch);
+    const globalFetch = vi.fn();
+    globalThis.fetch = globalFetch;
+
+    await verifyOnChain(
+      "http://rpc.test",
+      "0x1111111111111111111111111111111111111111",
+      [node],
+      4_660,
+      { fetch: injected as unknown as (input: string, init?: RequestInit) => Promise<Response> },
+    );
+
+    expect(injected).toHaveBeenCalled();
+    expect(globalFetch).not.toHaveBeenCalled();
   });
 
   it("throws when on-chain fingerprint mismatches", async () => {
@@ -735,6 +907,33 @@ describe("selectRoute", () => {
       expect(ids.size).toBe(3);
       expect([2, 3]).toContain(route.exit.role);
     }
+  });
+
+  it("steers the random mix and exit away from avoided nodes", () => {
+    const nodes: TopologyNode[] = [
+      makeTopologyNode({ id: "0x01", layer: 0, role: 1 }),
+      makeTopologyNode({ id: "0x02", layer: 1, role: 1 }),
+      makeTopologyNode({ id: "0x03", layer: 1, role: 1 }),
+      makeTopologyNode({ id: "0x04", layer: 2, role: 2 }),
+      makeTopologyNode({ id: "0x05", layer: 2, role: 2 }),
+    ];
+    const entry = nodes[0]!;
+    for (let i = 0; i < 20; i++) {
+      const route = selectRoute(nodes, entry, undefined, new Set(["0x02", "0x04"]));
+      expect(route.mix.id).toBe("0x03");
+      expect(route.exit.id).toBe("0x05");
+    }
+  });
+
+  it("still routes through an avoided node when it is the only candidate", () => {
+    const nodes: TopologyNode[] = [
+      makeTopologyNode({ id: "0x01", layer: 0, role: 1 }),
+      makeTopologyNode({ id: "0x02", layer: 1, role: 1 }),
+      makeTopologyNode({ id: "0x04", layer: 2, role: 2 }),
+    ];
+    const route = selectRoute(nodes, nodes[0], undefined, new Set(["0x02", "0x04"]));
+    expect(route.mix.id).toBe("0x02");
+    expect(route.exit.id).toBe("0x04");
   });
 
   it("throws when no entry-capable nodes", () => {

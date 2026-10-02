@@ -1,44 +1,60 @@
 /**
- * Seed node bootstrap resolution.
+ * Seed bootstrap resolution.
  *
- * Tries user-provided seeds first, then falls back to the default seed API.
- * Returns the URL of the first seed that responds successfully.
+ * A seed is any base URL that serves `GET {seed}/topology`: the indexer seed
+ * API or a node ingress URL. The client itself tries each seed in order and
+ * keeps the first one whose topology verifies (see `NoxClient.connect`); this
+ * helper only probes reachability.
  */
 
-const DNS_SEED = "https://api.hisoka.io/seed";
+import type { NoxFetch } from "./types.js";
+import { defaultFetch } from "./rpc.js";
 
-const HARDCODED_SEEDS: readonly string[] = [
-  "https://entry1.nox.hisoka.io",
-  "https://entry2.nox.hisoka.io",
-  "https://entry3.nox.hisoka.io",
-];
+/** The Hisoka testnet seed API. */
+export const DEFAULT_SEED = "https://api.hisoka.io/seed";
+
+/** Strip a trailing `/topology` (and slashes) so seeds compare by base URL. */
+export function seedBaseUrl(seed: string): string {
+  const trimmed = seed.replace(/\/+$/u, "");
+  return trimmed.endsWith("/topology")
+    ? trimmed.slice(0, -"/topology".length)
+    : trimmed;
+}
+
+/** Seed base URLs in try order, without duplicates. */
+export function seedCandidates(
+  userSeeds: readonly string[],
+  includeDefault = true,
+): string[] {
+  const candidates = userSeeds.map(seedBaseUrl);
+  if (includeDefault) candidates.push(DEFAULT_SEED);
+  return Array.from(new Set(candidates));
+}
 
 /**
- * Resolve a working seed node URL.
+ * Resolve a reachable seed URL.
  *
- * @param userSeeds - Optional user-provided seed URLs (tried first, before DNS seed).
+ * @param userSeeds - Optional user-provided seed URLs (tried first, before the default seed).
  * @param timeoutMs - Per-seed request timeout in milliseconds.
- * @returns The first seed URL that responded, or `null` if all failed.
+ * @param fetchImpl - HTTP client. Defaults to the global `fetch`.
+ * @returns The first seed base URL that responded, or `null` if all failed.
  */
 export async function resolveSeedUrl(
   userSeeds: string[] = [],
   timeoutMs = 5_000,
+  fetchImpl: NoxFetch = defaultFetch,
 ): Promise<string | null> {
-  const candidates = [...userSeeds, DNS_SEED, ...HARDCODED_SEEDS];
-
-  for (const seed of candidates) {
-    const url = seed.endsWith("/topology") ? seed : `${seed}/topology`;
+  for (const seed of seedCandidates(userSeeds)) {
+    const url = `${seed}/topology`;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      const resp = await fetch(url, { signal: controller.signal });
-      clearTimeout(timer);
-      if (resp.ok) {
-        // Base URL without the /topology suffix
-        return seed.endsWith("/topology") ? seed.slice(0, -"/topology".length) : seed;
-      }
+      const resp = await fetchImpl(url, { signal: controller.signal });
+      if (resp.ok) return seed;
     } catch {
-      // Timeout or network error — try next seed
+      // Timeout or network error: try the next seed.
+    } finally {
+      clearTimeout(timer);
     }
   }
 

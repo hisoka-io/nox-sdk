@@ -1,5 +1,6 @@
 import { NoxClientError, NoxClientErrorCode } from "./types.js";
 import type {
+  NoxFetch,
   TopologySnapshot,
   RelayerNode,
   TopologyLiveness,
@@ -7,6 +8,7 @@ import type {
   Route,
 } from "./types.js";
 import { hexToBytes, bytesToHex, secureRandomIndex } from "./utils.js";
+import { defaultFetch, jsonRpcCall, jsonRpcCalls, type JsonRpcCall } from "./rpc.js";
 
 import sha3 from "js-sha3"; // CJS — no named ESM exports
 import { Interface, sha256, toUtf8Bytes } from "ethers";
@@ -19,17 +21,23 @@ const REGISTRY_INTERFACE = new Interface([
   "function getNodeRole(address) view returns (uint8)",
 ]);
 
+/**
+ * Fetch `{seedBaseUrl}/topology`. The seed can be an indexer seed API
+ * (`https://api.hisoka.io/seed`) or a node ingress URL that serves the same
+ * topology document.
+ */
 export async function fetchTopology(
   seedBaseUrl: string,
   timeoutMs = 5_000,
+  fetchImpl: NoxFetch = defaultFetch,
 ): Promise<TopologySnapshot> {
-  const url = `${seedBaseUrl}/topology`;
+  const url = `${seedBaseUrl.replace(/\/+$/u, "")}/topology`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   let resp: Response;
   try {
-    resp = await fetch(url, { signal: controller.signal });
+    resp = await fetchImpl(url, { signal: controller.signal });
   } catch (err) {
     clearTimeout(timer);
     throw new NoxClientError(
@@ -261,17 +269,35 @@ function primaryLayerForRole(address: string, role: number): number {
   }
 }
 
-/** Select only indexer-live members after membership has been chain-verified. */
+/**
+ * Tolerated difference between the local clock and the seed's clock. Liveness
+ * ages are measured on the seed's clock, so this only bounds how old a whole
+ * snapshot may look to a client whose clock runs ahead.
+ */
+export const DEFAULT_CLOCK_SKEW_TOLERANCE_SECONDS = 60;
+
+/**
+ * Select only indexer-live members after membership has been chain-verified.
+ *
+ * Observation ages are measured against the snapshot's own `timestamp`, which
+ * the seed stamps with the same clock it uses for `observed_at_unix`, so a
+ * client whose clock drifts still sees the seed's view. The local clock only
+ * rejects a snapshot that is older than `maxAgeSeconds` plus
+ * `clockSkewToleranceSeconds`, which catches a stale or replayed document.
+ */
 export function selectLiveNodes(
   snapshot: TopologySnapshot,
   nowUnix: number,
   maxAgeSeconds: number,
+  clockSkewToleranceSeconds = DEFAULT_CLOCK_SKEW_TOLERANCE_SECONDS,
 ): RelayerNode[] {
   if (
     !Number.isSafeInteger(nowUnix) ||
     nowUnix < 0 ||
     !Number.isSafeInteger(maxAgeSeconds) ||
-    maxAgeSeconds <= 0
+    maxAgeSeconds <= 0 ||
+    !Number.isSafeInteger(clockSkewToleranceSeconds) ||
+    clockSkewToleranceSeconds < 0
   ) {
     throw new NoxClientError(
       "Liveness selection requires non-negative time and positive maximum age",
@@ -279,6 +305,14 @@ export function selectLiveNodes(
     );
   }
   validateLiveness(snapshot, true);
+  const snapshotUnix = snapshot.timestamp!;
+  if (nowUnix - snapshotUnix > maxAgeSeconds + clockSkewToleranceSeconds) {
+    throw new NoxClientError(
+      `Topology snapshot is ${nowUnix - snapshotUnix}s older than the local clock ` +
+        `(limit ${maxAgeSeconds + clockSkewToleranceSeconds}s); the seed is serving stale data or the local clock is wrong`,
+      NoxClientErrorCode.TopologyVerificationFailed,
+    );
+  }
   const livenessByAddress = new Map(
     snapshot.liveness!.map((observation) => [
       normalizeAddress(observation.address),
@@ -289,9 +323,47 @@ export function selectLiveNodes(
     const observation = livenessByAddress.get(normalizeAddress(node.address));
     return observation !== undefined &&
       observation.status === "online" &&
-      observation.observed_at_unix <= nowUnix &&
-      nowUnix - observation.observed_at_unix <= maxAgeSeconds;
+      observation.observed_at_unix <= snapshotUnix &&
+      snapshotUnix - observation.observed_at_unix <= maxAgeSeconds;
   });
+}
+
+const MAX_CAPABILITIES = 32;
+const MAX_CAPABILITY_LENGTH = 64;
+
+/**
+ * Capabilities the snapshot's liveness set reports for each member, keyed by
+ * lowercase address. Members whose observation carries no well-formed
+ * `capabilities` array are absent from the map.
+ */
+export function livenessCapabilities(
+  snapshot: TopologySnapshot,
+): Map<string, readonly string[]> {
+  const capabilities = new Map<string, readonly string[]>();
+  for (const observation of snapshot.liveness ?? []) {
+    const candidate: unknown = observation.capabilities;
+    if (
+      Array.isArray(candidate) &&
+      candidate.length <= MAX_CAPABILITIES &&
+      candidate.every(
+        (entry) =>
+          typeof entry === "string" &&
+          entry.length > 0 &&
+          entry.length <= MAX_CAPABILITY_LENGTH,
+      )
+    ) {
+      capabilities.set(
+        normalizeAddress(observation.address),
+        Object.freeze([...(candidate as string[])]),
+      );
+    }
+  }
+  return capabilities;
+}
+
+export interface OnChainVerificationOptions {
+  /** HTTP client for the RPC requests. Defaults to the global `fetch`. */
+  fetch?: NoxFetch;
 }
 
 /** Verify the topology fingerprint against the on-chain NoxRegistry contract. */
@@ -300,22 +372,32 @@ export async function verifyOnChain(
   registryAddress: string,
   nodes: RelayerNode[],
   snapshotBlockNumber?: number,
+  options: OnChainVerificationOptions = {},
 ): Promise<void> {
   await verifyOnChainWithEligibility(
     ethRpcUrl,
     registryAddress,
     nodes,
     snapshotBlockNumber,
+    options,
   );
 }
 
-/** Verify every registered member, then return the subset eligible for routing. */
+/**
+ * Verify every registered member, then return the subset eligible for routing.
+ *
+ * All registry reads are pinned to one block and sent as JSON-RPC batches
+ * (one HTTP request for up to 24 members), falling back to individual calls
+ * when the endpoint does not accept batches.
+ */
 export async function verifyOnChainWithEligibility(
   ethRpcUrl: string,
   registryAddress: string,
   nodes: RelayerNode[],
   snapshotBlockNumber?: number,
+  options: OnChainVerificationOptions = {},
 ): Promise<Set<string>> {
+  const fetchImpl = options.fetch ?? defaultFetch;
   validateSnapshotNodes(nodes);
   const expectedFingerprint = computeTopologyFingerprint(nodes);
   if (
@@ -328,15 +410,24 @@ export async function verifyOnChainWithEligibility(
     );
   }
   const blockTag = snapshotBlockNumber === undefined || snapshotBlockNumber === 0
-    ? await rpcRequest(ethRpcUrl, "eth_blockNumber", [])
+    ? await rpcRequest(ethRpcUrl, "eth_blockNumber", [], fetchImpl)
     : `0x${snapshotBlockNumber.toString(16)}`;
-  const fingerprint = await registryCall(
+  const reads: RegistryRead[] = [
+    { method: "topologyFingerprint", args: [] },
+    { method: "relayerCount", args: [] },
+  ];
+  for (const node of nodes) {
+    reads.push({ method: "relayers", args: [node.address] });
+    reads.push({ method: "getNodeRole", args: [node.address] });
+  }
+  const results = await registryReads(
     ethRpcUrl,
     registryAddress,
-    "topologyFingerprint",
-    [],
+    reads,
     blockTag,
+    fetchImpl,
   );
+  const fingerprint = results[0]!;
   const onChainFingerprint = String(fingerprint[0]).replace(/^0x/u, "").toLowerCase();
   if (onChainFingerprint !== expectedFingerprint) {
     throw new NoxClientError(
@@ -345,13 +436,7 @@ export async function verifyOnChainWithEligibility(
     );
   }
 
-  const count = await registryCall(
-    ethRpcUrl,
-    registryAddress,
-    "relayerCount",
-    [],
-    blockTag,
-  );
+  const count = results[1]!;
   if (BigInt(String(count[0])) !== BigInt(nodes.length)) {
     throw new NoxClientError(
       `On-chain relayer count mismatch: seed=${nodes.length}, chain=${String(count[0])}`,
@@ -360,21 +445,9 @@ export async function verifyOnChainWithEligibility(
   }
 
   const eligibleAddresses = new Set<string>();
-  for (const node of nodes) {
-    const profile = await registryCall(
-      ethRpcUrl,
-      registryAddress,
-      "relayers",
-      [node.address],
-      blockTag,
-    );
-    const role = await registryCall(
-      ethRpcUrl,
-      registryAddress,
-      "getNodeRole",
-      [node.address],
-      blockTag,
-    );
+  for (const [index, node] of nodes.entries()) {
+    const profile = results[2 + index * 2]!;
+    const role = results[3 + index * 2]!;
     const chainStake = BigInt(String(profile[4]));
     const mismatches: string[] = [];
     recordMismatch(
@@ -444,72 +517,67 @@ function boundedValue(value: unknown): string {
   return rendered.length <= 96 ? rendered : `${rendered.slice(0, 93)}...`;
 }
 
-async function registryCall(
+interface RegistryRead {
+  readonly method: string;
+  readonly args: readonly unknown[];
+}
+
+async function registryReads(
   ethRpcUrl: string,
   registryAddress: string,
-  method: string,
-  args: readonly unknown[],
+  reads: readonly RegistryRead[],
   blockTag: string,
-): Promise<readonly unknown[]> {
-  const data = REGISTRY_INTERFACE.encodeFunctionData(method, args);
-  const result = await rpcRequest(ethRpcUrl, "eth_call", [
-    { to: registryAddress, data },
-    blockTag,
-  ]);
+  fetchImpl: NoxFetch,
+): Promise<(readonly unknown[])[]> {
+  const calls: JsonRpcCall[] = reads.map((read) => ({
+    method: "eth_call",
+    params: [
+      {
+        to: registryAddress,
+        data: REGISTRY_INTERFACE.encodeFunctionData(read.method, read.args),
+      },
+      blockTag,
+    ],
+  }));
+  let results: string[];
   try {
-    return REGISTRY_INTERFACE.decodeFunctionResult(method, result);
+    results = await jsonRpcCalls(ethRpcUrl, calls, fetchImpl);
   } catch (error) {
-    throw new NoxClientError(
-      `On-chain topology verification failed decoding ${method}: ${String(error)}`,
-      NoxClientErrorCode.TopologyVerificationFailed,
-      error,
-    );
+    throw verificationRpcError("eth_call", error);
   }
+  return reads.map((read, index) => {
+    try {
+      return REGISTRY_INTERFACE.decodeFunctionResult(read.method, results[index]!);
+    } catch (error) {
+      throw new NoxClientError(
+        `On-chain topology verification failed decoding ${read.method}: ${String(error)}`,
+        NoxClientErrorCode.TopologyVerificationFailed,
+        error,
+      );
+    }
+  });
 }
 
 async function rpcRequest(
   ethRpcUrl: string,
   method: string,
   params: readonly unknown[],
+  fetchImpl: NoxFetch,
 ): Promise<string> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 10_000);
   try {
-    const response = await fetch(ethRpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method,
-        params,
-      }),
-      signal: controller.signal,
-    });
-    const json = (await response.json()) as {
-      result?: unknown;
-      error?: { message?: unknown };
-    };
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    if (typeof json.error?.message === "string") {
-      throw new Error(json.error.message);
-    }
-    if (typeof json.result !== "string") {
-      throw new Error("RPC response has no hex result");
-    }
-    return json.result;
+    return await jsonRpcCall(ethRpcUrl, { method, params }, fetchImpl);
   } catch (error) {
-    if (error instanceof NoxClientError) throw error;
-    throw new NoxClientError(
-      `On-chain topology verification failed during ${method}: ${String(error)}`,
-      NoxClientErrorCode.TopologyVerificationFailed,
-      error,
-    );
-  } finally {
-    clearTimeout(timer);
+    throw verificationRpcError(method, error);
   }
+}
+
+function verificationRpcError(method: string, error: unknown): NoxClientError {
+  if (error instanceof NoxClientError) return error;
+  return new NoxClientError(
+    `On-chain topology verification failed during ${method}: ${String(error)}`,
+    NoxClientErrorCode.TopologyVerificationFailed,
+    error,
+  );
 }
 
 function validateSnapshotNodes(nodes: RelayerNode[]): void {
@@ -591,11 +659,18 @@ export function parseNodes(snapshot: TopologySnapshot): TopologyNode[] {
   return snapshot.nodes.map(parseNode);
 }
 
-/** Select a random 3-hop route (entry, mix, exit). */
+/**
+ * Select a random 3-hop route (entry, mix, exit).
+ *
+ * `avoid` holds node IDs to leave out of the random mix and exit choice when
+ * another candidate exists. It never overrides `pinnedEntry` or `selectedExit`,
+ * and it never makes an otherwise possible route impossible.
+ */
 export function selectRoute(
   nodes: TopologyNode[],
   pinnedEntry?: TopologyNode,
   selectedExit?: TopologyNode,
+  avoid?: ReadonlySet<string>,
 ): Route {
   const entries = nodes.filter(
     (node) =>
@@ -664,7 +739,8 @@ export function selectRoute(
     (n) => n.id !== entry.id && n.id !== pinnedExit?.id,
   );
   const mixOnly = eligibleMixes.filter((n) => !exits.some((e) => e.id === n.id));
-  const mix = pickRandom(mixOnly) ?? pickRandom(eligibleMixes);
+  const mix = pickRandom(preferNotAvoided(mixOnly, avoid)) ??
+    pickRandom(preferNotAvoided(eligibleMixes, avoid));
   if (mix === undefined) {
     throw new NoxClientError(
       "No distinct mix node is available for the selected exit",
@@ -673,7 +749,7 @@ export function selectRoute(
   }
 
   const eligibleExits = exits.filter((n) => n.id !== entry.id && n.id !== mix.id);
-  const exit = pinnedExit ?? pickRandom(eligibleExits);
+  const exit = pinnedExit ?? pickRandom(preferNotAvoided(eligibleExits, avoid));
   if (exit === undefined) {
     throw new NoxClientError(
       "No distinct exit node is available",
@@ -704,6 +780,15 @@ export function layersForRole(role: number): number[] {
     default:
       return [0, 1, 2];
   }
+}
+
+function preferNotAvoided(
+  candidates: TopologyNode[],
+  avoid: ReadonlySet<string> | undefined,
+): TopologyNode[] {
+  if (avoid === undefined || avoid.size === 0) return candidates;
+  const preferred = candidates.filter((node) => !avoid.has(node.id));
+  return preferred.length > 0 ? preferred : candidates;
 }
 
 function pickRandom<T>(arr: T[]): T | undefined {
