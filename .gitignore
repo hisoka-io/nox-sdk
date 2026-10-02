@@ -35,7 +35,7 @@ Thumbs.db
 # Test coverage
 coverage/
 
-# Session/AI context (never committed)
+# Local notes (never committed)
 no-commit/
 CLAUDE.md
 MEMORY.md

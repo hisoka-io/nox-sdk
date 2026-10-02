@@ -49,9 +49,13 @@ const client = await NoxClient.connect({
   livenessMaxAgeMs: 180_000,
   surbsPerRequest: 10,
   fecRatio: 0.3,
+  retryOnTimeout: true,
   dangerouslySkipFingerprintCheck: false,
 });
 ```
+
+Every option is described in the [client README](./packages/nox-client/README.md#configuration-reference),
+and changes between versions are in the [changelog](./packages/nox-client/CHANGELOG.md).
 
 See the full API and architecture docs at [docs.hisoka.io](https://docs.hisoka.io/docs/nox/sdk).
 
