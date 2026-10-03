@@ -1005,8 +1005,12 @@ describe("reply block format selection", () => {
   });
 
   it("never resends a timed-out v2 request as v1, even through another entry", async () => {
-    // entry-b exists but does not advertise surb_v2.
-    const { client, sent, outcomes } = formatClient({ capable: ["0x01", "0x02", "0x03", "0x04", "0x05"] });
+    // entry-b exists but does not advertise surb_v2. Strict mode makes the
+    // first route v2 deterministically; auto takes the same retry path.
+    const { client, sent, outcomes } = formatClient({
+      surbFormat: "v2",
+      capable: ["0x01", "0x02", "0x03", "0x04", "0x05"],
+    });
     outcomes.push(timeout());
     await expect(client.sendEcho(new Uint8Array([1]))).rejects.toMatchObject({
       code: NoxClientErrorCode.ResponseTimeout,
