@@ -175,6 +175,7 @@ client.disconnect();
 | `registryAddress` | `string` | `""` | NoxRegistry contract address |
 | `dangerouslySkipFingerprintCheck` | `boolean` | `false` | Skip verification on a loopback test mesh only |
 | `retryOnTimeout` | `boolean` | `true` | Resend idempotent requests once on another route after a timeout (worst case about 2x `timeoutMs`) |
+| `surbFormat` | `"auto" \| "v1" \| "v2"` | `"auto"` | Reply block format. `auto` uses v2 only when every hop of the route advertises `surb_v2`; `v2` requires it and throws `SURB_V2_UNAVAILABLE` otherwise |
 | `transport` | `{ fetch?, WebSocket? }` | runtime globals | Network primitives; `WebSocket: null` uses HTTP polling |
 
 `ethRpcUrl` and `registryAddress` are required together. Connection fails before fetching a seed if either is

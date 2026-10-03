@@ -11,6 +11,7 @@ export type {
   NoxTransport,
   NoxWebSocketConstructor,
   TopologyLiveness,
+  SurbFormat,
 } from "./types.js";
 
 export {
@@ -18,6 +19,7 @@ export {
   NoxClientErrorCode,
   DEFAULTS,
   PAID_V2_CAPABILITY,
+  SURB_V2_CAPABILITY,
 } from "./types.js";
 
 export {
@@ -31,6 +33,9 @@ export {
   selectRoute,
   layersForRole,
   hasUsableIngress,
+  supportsSurbV2,
+  routeSupportsSurbV2,
+  MAX_SURB_V2_ADDRESS_BYTES,
 } from "./topology.js";
 
 export { resolveSeedUrl, DEFAULT_SEED } from "./seeder.js";
@@ -94,7 +99,8 @@ export {
   ROUTE_AVOID_MS,
 } from "./client.js";
 
-export { SurbPool } from "./surb_pool.js";
+export { SurbPool, wasmSupportsSurbV2 } from "./surb_pool.js";
+export type { SurbEntry, SurbVersion } from "./surb_pool.js";
 
 export { ReplenishmentManager, buildReturnPath } from "./replenishment.js";
 

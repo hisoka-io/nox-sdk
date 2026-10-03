@@ -49,6 +49,12 @@ impl JsSurbRecovery {
         self.id_hex.clone()
     }
 
+    /// Reply format: 1, or 2 when replies carry a reply tag.
+    #[wasm_bindgen(getter)]
+    pub fn version(&self) -> u8 {
+        self.inner.version
+    }
+
     pub fn to_json(&self) -> Result<String, JsValue> {
         serde_json::to_string(&self.inner).map_err(|e| JsValue::from_str(&e.to_string()))
     }
@@ -105,6 +111,34 @@ pub fn create_surb(
     })
 }
 
+/// Create a format 2 SURB for the given reverse path.
+///
+/// The recovery's `id_hex` is the delivery ID that the final hop derives from
+/// its shared secret. Claim the reply with it; it is never sent anywhere.
+/// Replies are checked with a reply tag on decryption.
+#[wasm_bindgen]
+pub fn create_surb_v2(
+    path: Vec<JsPathHop>,
+    pow_difficulty: u32,
+) -> Result<JsSurbCreateResult, JsValue> {
+    let rust_path = parse_hops(&path)?;
+
+    let (surb, recovery) = Surb::new_v2(&rust_path, pow_difficulty)
+        .map_err(|e| JsValue::from_str(&format!("SURB creation failed: {e}")))?;
+
+    let surb_bytes = bincode::serialize(&surb)
+        .map_err(|e| JsValue::from_str(&format!("SURB serialization failed: {e}")))?;
+
+    let recovery_id_hex = hex::encode(recovery.id);
+    Ok(JsSurbCreateResult {
+        surb_bytes,
+        recovery: JsSurbRecovery {
+            inner: recovery,
+            id_hex: recovery_id_hex,
+        },
+    })
+}
+
 #[wasm_bindgen]
 pub struct JsSurbCreateResult {
     surb_bytes: Vec<u8>,
@@ -124,7 +158,8 @@ impl JsSurbCreateResult {
     }
 }
 
-/// Decrypt a SURB response body using the stored recovery.
+/// Decrypt a SURB response body using the stored recovery. For a format 2
+/// recovery the reply tag is checked before anything is returned.
 #[wasm_bindgen]
 pub fn decrypt_surb_response(
     recovery: &JsSurbRecovery,
@@ -260,6 +295,60 @@ mod tests {
         let payload = b"hello mixnet";
         let packet = build_sphinx_packet(vec![hop1, hop2], payload, 0).unwrap();
         assert_eq!(packet.len(), 32_768);
+    }
+
+    #[test]
+    fn v1_recovery_json_without_version_loads_as_v1() {
+        let hop = JsPathHop::new("aa".repeat(32), "/ip4/1.1.1.1/tcp/9000".to_string());
+        let created = create_surb(vec![hop], &"11".repeat(16), 0).unwrap();
+        let json = created.recovery().to_json().unwrap();
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("version");
+        let loaded = JsSurbRecovery::from_json(&value.to_string()).unwrap();
+        assert_eq!(loaded.version(), 1);
+        assert_eq!(loaded.id_hex(), "11".repeat(16));
+    }
+
+    #[test]
+    fn v2_surb_uses_marker_and_delivery_id() {
+        let hops = vec![
+            JsPathHop::new(hex::encode([9u8; 32]), "/ip4/1.1.1.1/tcp/9000".to_string()),
+            JsPathHop::new(hex::encode([7u8; 32]), "/ip4/2.2.2.2/tcp/9000".to_string()),
+        ];
+        let created = create_surb_v2(hops, 0).unwrap();
+        let surb: Surb = bincode::deserialize(&created.surb_bytes()).unwrap();
+        assert!(surb.is_v2());
+        let recovery = created.recovery();
+        assert_eq!(recovery.version(), 2);
+        assert_ne!(recovery.id_hex(), hex::encode(surb.id));
+        let json = recovery.to_json().unwrap();
+        assert_eq!(JsSurbRecovery::from_json(&json).unwrap().version(), 2);
+    }
+
+    #[test]
+    fn v2_reply_roundtrip_and_tamper_rejected() {
+        let hop = JsPathHop::new(hex::encode([5u8; 32]), "/ip4/1.1.1.1/tcp/9000".to_string());
+        let created = create_surb_v2(vec![hop], 0).unwrap();
+        let surb: Surb = bincode::deserialize(&created.surb_bytes()).unwrap();
+        let recovery = created.recovery();
+        let packet = surb.encapsulate_v2(b"\x01reply").unwrap();
+        let body = &packet.as_bytes()[nox_crypto::sphinx::HEADER_SIZE..];
+        // Undo the single hop's layer as the hop would have applied it.
+        let mut inner = recovery.inner.clone();
+        inner.layer_keys = vec![];
+        let no_layers = JsSurbRecovery {
+            inner,
+            id_hex: recovery.id_hex(),
+        };
+        assert_eq!(decrypt_surb_response(&no_layers, body).unwrap(), b"\x01reply");
+        let mut tampered = body.to_vec();
+        tampered[3] ^= 1;
+        // Error paths build a JsValue, which only exists on wasm targets.
+        assert!(no_layers.inner.decrypt(&tampered).is_err());
+        // A format 1 reply cannot pass a format 2 recovery.
+        let untagged = surb.encapsulate(b"\x01reply").unwrap();
+        let untagged_body = &untagged.as_bytes()[nox_crypto::sphinx::HEADER_SIZE..];
+        assert!(no_layers.inner.decrypt(untagged_body).is_err());
     }
 
     #[wasm_bindgen_test]

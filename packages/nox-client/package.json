@@ -1,6 +1,6 @@
 {
   "name": "@hisoka-io/nox-client",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "TypeScript client SDK for the NOX mixnet - anonymous DeFi transactions and HTTP proxying",
   "license": "Apache-2.0",
   "repository": {
@@ -26,7 +26,7 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "@hisoka-io/nox-wasm": "0.1.5",
+    "@hisoka-io/nox-wasm": "workspace:*",
     "ethers": "6.16.0",
     "js-sha3": "^0.9.3"
   },

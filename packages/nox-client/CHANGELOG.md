@@ -2,6 +2,41 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
+## 0.4.0 (unreleased)
+
+Needs `@hisoka-io/nox-wasm` 0.2.0. Wire-compatible with nox 0.4.0-rc.2 and
+rc.3 nodes and with mixed meshes; on a mesh without `surb_v2` capability data
+it behaves exactly like 0.3.0.
+
+### Added
+
+- `surbFormat: "auto" | "v1" | "v2"` (default `"auto"`). Format v2 reply
+  blocks are claimed with a delivery ID that only the client and the entry can
+  compute, so the exit and mixes cannot claim or link the reply, and replies
+  carry a 128-bit reply tag that the client checks before decoding.
+  - `"auto"` uses v2 only when every hop of the chosen route (entry, mix and
+    exit) advertises `surb_v2` in the seed's liveness data and the loaded WASM
+    module can build v2 reply blocks; otherwise v1.
+  - `"v2"` routes only over nodes that advertise `surb_v2` and fails fast with
+    `NoxClientErrorCode.SurbV2Unavailable` when there is no such route. Use it
+    if you do not want a seed to be able to push you back to v1.
+  - `"v1"` is the 0.3.0 behaviour.
+- After a timeout on a v2 route, the resend uses v2 again through a different
+  entry, and replies are claimed from that entry. A v2 request is never resent
+  with v1 reply blocks. If no other fully capable entry exists, the timeout is
+  returned.
+- SURB replenishment uses the format and the entry of the request it tops up.
+- New exports: `SurbFormat`, `SURB_V2_CAPABILITY`, `supportsSurbV2`,
+  `routeSupportsSurbV2`, `MAX_SURB_V2_ADDRESS_BYTES`, `wasmSupportsSurbV2`,
+  `SurbEntry`, `SurbVersion`.
+
+### Changed
+
+- The fragment `messageId` of a large request and the JSON-RPC `id` of
+  `rpcCall` are random 64-bit values instead of per-client counters.
+- v2 reply blocks are only matched by their delivery ID; trial decryption is
+  kept for v1 only.
+
 ## 0.3.0 (unreleased)
 
 Wire-compatible with nox 0.4.0-rc.1 nodes and the 0.2.0 client: packets, SURBs

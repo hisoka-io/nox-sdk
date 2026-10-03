@@ -11,8 +11,8 @@ importers:
   packages/nox-client:
     dependencies:
       '@hisoka-io/nox-wasm':
-        specifier: 0.1.5
-        version: 0.1.5
+        specifier: workspace:*
+        version: link:../nox-wasm
       ethers:
         specifier: 6.16.0
         version: 6.16.0
@@ -333,9 +333,6 @@ packages:
     engines: {node: '>=18'}
     cpu: [x64]
     os: [win32]
-
-  '@hisoka-io/nox-wasm@0.1.5':
-    resolution: {integrity: sha512-kA3eoQlPkEZIglxB6iC6ps7YMlEJHnvyjIgsuguqMtks3Lr62J/OF2MWPmQ42FcFCi7mdCJAhOs0IYCgJXH58Q==}
 
   '@jest/schemas@29.6.3':
     resolution: {integrity: sha512-mo5j5X+jIZmJQveBKeS/clAueipV7KgiX1vMgCxam1RNYiqE1w62n0/tJJnHtjW8ZHcQco5gY85jA3mi0L+nSA==}
@@ -1160,8 +1157,6 @@ snapshots:
 
   '@esbuild/win32-x64@0.27.3':
     optional: true
-
-  '@hisoka-io/nox-wasm@0.1.5': {}
 
   '@jest/schemas@29.6.3':
     dependencies:

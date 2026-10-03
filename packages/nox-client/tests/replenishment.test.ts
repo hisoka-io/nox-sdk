@@ -132,6 +132,48 @@ describe("ReplenishmentManager.handleNeedMoreSurbs", () => {
   });
 });
 
+describe("ReplenishmentManager route binding", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("replenishes through the request's entry with the request's format", async () => {
+    const mgr = new ReplenishmentManager();
+    const path: PathHop[] = [
+      { pubKeyHex: "aa".repeat(32), address: "entry" },
+      { pubKeyHex: "bb".repeat(32), address: "mix" },
+      { pubKeyHex: "cc".repeat(32), address: "exit" },
+    ];
+    mgr.stashPath(5n, path, { entryUrl: "https://entry-b.test", version: 2 });
+    const pool = makeMockSurbPool();
+    const urls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string) => {
+      urls.push(url);
+      return new Response("ok", { status: 202 });
+    });
+
+    await mgr.burstReplenish({
+      wasm: makeMockWasm(),
+      clientRequestId: 5n,
+      serverRequestId: 99n,
+      packetsNeeded: 2,
+      surbsPerPacket: 3,
+      surbPool: pool as never,
+      entryUrl: "https://entry-a.test",
+      powDifficulty: 0,
+      fetch: fetchImpl,
+    });
+
+    expect(urls.every((u) => u.startsWith("https://entry-b.test"))).toBe(true);
+    expect(urls).toHaveLength(2);
+    expect(pool.generate.mock.calls.every((c) => c[4] === 2)).toBe(true);
+    expect(mgr.entryFor(5n)).toBe("https://entry-b.test");
+    mgr.clearPath(5n);
+    expect(mgr.entryFor(5n)).toBeUndefined();
+    expect(mgr.versionFor(5n)).toBe(1);
+  });
+});
+
 // ── mock helpers ───────────────────────────────────────────────────────────
 
 function makeMockWasm() {

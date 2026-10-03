@@ -17,6 +17,8 @@ import {
   selectRoute,
   selectLiveNodes,
   livenessCapabilities,
+  routeSupportsSurbV2,
+  MAX_SURB_V2_ADDRESS_BYTES,
 } from "../src/topology.js";
 import type { RelayerNode, TopologySnapshot, TopologyNode } from "../src/types.js";
 import { NoxClientError } from "../src/types.js";
@@ -1115,5 +1117,26 @@ describe("selectRoute", () => {
         3,
       );
     }
+  });
+});
+
+describe("routeSupportsSurbV2", () => {
+  const node = (id: string, routingAddress: string, capabilities?: readonly string[]) => ({
+    id, address: "https://n.test", routingAddress, publicKey: new Uint8Array(32), layer: 0, role: 1,
+    ...(capabilities === undefined ? {} : { capabilities }),
+  });
+  const v2 = ["surb_v2"];
+  const peer = "/ip4/100.31.45.211/tcp/15000/p2p/12D3KooWBgyfbGTjYZPLHhGD4d5q9ootMaNBga3VjYXALD2kzrHV";
+
+  it("requires every hop to advertise surb_v2", () => {
+    expect(routeSupportsSurbV2({ entry: node("e", peer, v2), mix: node("m", peer, v2), exit: node("x", peer, v2) })).toBe(true);
+    expect(routeSupportsSurbV2({ entry: node("e", peer, v2), mix: node("m", peer), exit: node("x", peer, v2) })).toBe(false);
+    expect(routeSupportsSurbV2({ entry: node("e", peer, v2), mix: node("m", peer, v2), exit: node("x", peer, ["paid_v2"]) })).toBe(false);
+    expect(routeSupportsSurbV2({ entry: node("e", peer), mix: node("m", peer, v2), exit: node("x", peer, v2) })).toBe(false);
+  });
+
+  it("rejects an entry routing address too long for a v2 reply block", () => {
+    const long = "/dns4/" + "a".repeat(MAX_SURB_V2_ADDRESS_BYTES) + "/tcp/1";
+    expect(routeSupportsSurbV2({ entry: node("e", long, v2), mix: node("m", peer, v2), exit: node("x", peer, v2) })).toBe(false);
   });
 });

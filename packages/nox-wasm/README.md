@@ -20,6 +20,7 @@ Operations included:
 |----------|---------|
 | `build_sphinx_packet` | Construct a layered Sphinx packet for 3 hop routing |
 | `create_surb` | Generate a Single Use Reply Block for anonymous responses |
+| `create_surb_v2` | Generate a format 2 reply block, claimed by delivery ID, with a checked reply tag |
 | `decrypt_surb_response` | Decrypt a SURB encrypted response body |
 | `verify_pow` | Verify proof of work on incoming packets |
 | `compute_pow` | Compute proof of work for outgoing packets |
