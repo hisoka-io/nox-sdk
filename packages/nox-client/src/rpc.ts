@@ -18,9 +18,12 @@ export const RPC_TIMEOUT_MS = 10_000;
  * Run read-only JSON-RPC calls and return their hex results in input order.
  *
  * Calls go out as JSON-RPC batches of at most `MAX_RPC_BATCH_SIZE`. An endpoint
- * that rejects batches (non-array reply or HTTP error) gets the same calls one
- * by one, at most `RPC_CONCURRENCY` at a time. The first RPC error rejects the
- * whole set with that error's message.
+ * that rejects batches (a non-array reply, or a client error such as HTTP 400,
+ * 405 or 413) gets the same calls one by one, at most `RPC_CONCURRENCY` at a
+ * time. Rate limiting (HTTP 429), timeouts (408) and server errors (5xx) are
+ * reported as errors instead, so a throttled endpoint is not sent more
+ * requests. The first RPC error rejects the whole set with that error's
+ * message.
  */
 export async function jsonRpcCalls(
   ethRpcUrl: string,
@@ -84,6 +87,9 @@ async function jsonRpcBatch(
       fetchImpl,
       timeoutMs,
     );
+    if (!json.ok && !batchRejectedByStatus(json.status)) {
+      throw new Error(`HTTP ${json.status}`);
+    }
     if (!json.ok || !Array.isArray(json.body)) {
       throw new BatchUnsupported();
     }
@@ -105,6 +111,15 @@ async function jsonRpcBatch(
       jsonRpcCall(ethRpcUrl, call, fetchImpl, timeoutMs)
     );
   }
+}
+
+/**
+ * Whether an HTTP status means the endpoint refused the batch itself, so the
+ * calls are worth retrying one by one. 408, 429 and 5xx mean the endpoint is
+ * slow, throttling or failing, and more requests would not help.
+ */
+function batchRejectedByStatus(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 async function postJson(

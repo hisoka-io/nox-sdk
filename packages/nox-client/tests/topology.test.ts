@@ -506,6 +506,7 @@ describe("verifyOnChain", () => {
       status?: number;
       frozen?: boolean;
       batchUnsupported?: boolean;
+      batchStatus?: number;
     } = {},
   ): void {
     type RpcBody = { id?: number; method: string; params: [{ data: string }] };
@@ -553,6 +554,9 @@ describe("verifyOnChain", () => {
       async (_url: string, init: RequestInit) => {
         const body = JSON.parse(String(init.body)) as RpcBody | RpcBody[];
         if (Array.isArray(body)) {
+          if (overrides.batchStatus !== undefined) {
+            return { ok: false, status: overrides.batchStatus, json: async () => ({}) };
+          }
           if (overrides.batchUnsupported) {
             return {
               ok: true,
@@ -699,6 +703,39 @@ describe("verifyOnChain", () => {
     // One rejected batch, then the four reads one by one.
     expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(5);
   });
+
+  it("falls back to single calls when the endpoint refuses a batch with HTTP 413", async () => {
+    const node = makeNode();
+    mockRegistry(node, { batchStatus: 413 });
+
+    await expect(
+      verifyOnChainWithEligibility(
+        "http://rpc.test",
+        "0x1111111111111111111111111111111111111111",
+        [node],
+        4_660,
+      ),
+    ).resolves.toEqual(new Set([node.address.toLowerCase()]));
+    expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(5);
+  });
+
+  it.each([429, 503])(
+    "does not fan out into single calls after HTTP %i",
+    async (status) => {
+      const node = makeNode();
+      mockRegistry(node, { batchStatus: status });
+
+      await expect(
+        verifyOnChainWithEligibility(
+          "http://rpc.test",
+          "0x1111111111111111111111111111111111111111",
+          [node],
+          4_660,
+        ),
+      ).rejects.toThrow(`HTTP ${status}`);
+      expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledOnce();
+    },
+  );
 
   it("uses an injected fetch instead of the global one", async () => {
     const node = makeNode();
