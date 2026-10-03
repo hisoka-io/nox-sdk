@@ -15,14 +15,18 @@ and service requests are unchanged.
   once to a different paid-capable exit. `submitTransaction`,
   `submitPaidTransaction` and `send` are never resent. The mix and exit of a
   timed-out route are avoided for 5 minutes (`ROUTE_AVOID_MS`) while other
-  candidates exist; a reply through a hop clears it.
+  candidates exist; a reply through a hop clears it. A resent call can take up
+  to about twice `timeoutMs`. With `retryOnTimeout: false` nothing is resent
+  and timeouts do not affect later route choice.
 - `transport: { fetch, WebSocket }` to supply the network primitives instead of
   the runtime globals. `WebSocket: null` selects HTTP claim polling.
 - Seed liveness may carry `capabilities` (for example `["paid_v2"]`) and
   `build_version`. When a seed publishes capabilities, `selectPaidExit()` and
   `requestPaidQuote()` only use exits that advertise `paid_v2`, and fail fast
   with `NoxClientErrorCode.PaidExitUnavailable` when none does. Seeds that
-  publish no capability data keep the 0.2.0 behaviour.
+  publish no capability data keep the 0.2.0 behaviour. Once any node carries
+  capabilities, exits without them count as not paid-capable, so a seed must
+  publish capabilities for every exit.
 - New exports: `NoxTransport`, `NoxFetch`, `NoxWebSocketConstructor`,
   `NoxClientSettings`, `TopologyLiveness`, `PAID_V2_CAPABILITY`, `DEFAULT_SEED`,
   `ROUTE_AVOID_MS`.
@@ -32,7 +36,9 @@ and service requests are unchanged.
 - Registry verification sends all reads as JSON-RPC batches pinned to the
   snapshot block: one HTTP request for up to 24 members instead of 2N+2
   sequential calls (a 10-node connect drops from about 7 s to under 1 s).
-  Endpoints that reject batches get individual calls, four at a time.
+  Endpoints that reject batches (a non-array reply or an HTTP 4xx other than
+  408 and 429) get individual calls, four at a time. HTTP 408, 429 and 5xx are
+  reported as errors without fanning out.
 - Background topology refreshes no longer overlap; the paid freshness gate
   waits for a refresh that is already running.
 - Liveness ages are measured against the snapshot's own `timestamp`, so a
@@ -43,10 +49,16 @@ and service requests are unchanged.
   if its topology then failed verification.
 - A seed can be a node ingress URL (`https://nox-1.hisoka.io`) as well as the
   seed API, as long as it serves schema v2 at `/topology`. When every seed
-  fails, background refreshes also try the topology served by the current
-  entry and up to two other verified nodes.
+  fails, background refreshes also read the topology served by the current
+  entry and up to two other verified nodes, but only to confirm membership:
+  the snapshot must be pinned at or after the last seed's block, it can only
+  remove nodes that left the registry or were frozen, and liveness,
+  capabilities and PoW difficulty stay as the last seed reported. Every
+  refresh tries the seeds first.
 - Paid quote and submission read the chain timestamp through the mixnet
   (`eth_getBlockByNumber` via an exit) instead of calling `ethRpcUrl` directly.
+  This adds one mixnet round trip (typically 1-2 s) before each quote and each
+  submission.
 - `NoxClient.init(overrides)` is now exactly `NoxClient.connect(overrides)`.
   A PoW difficulty advertised by the seed (above 0) is adopted unless the
   caller passed a higher one, capped at 16.

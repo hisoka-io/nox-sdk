@@ -58,9 +58,8 @@ export type PaidQuoteResultV2 =
 /**
  * Read the latest block timestamp directly from `ethRpcUrl`.
  *
- * `NoxClient` does not use this for paid requests: it reads the block through
- * the mixnet (`rpcCall`) so the RPC provider never sees the client address next
- * to a quote or submission. Kept for callers that need a direct read.
+ * `NoxClient` does not use this for paid requests; it reads the block through
+ * the mixnet with `rpcCall`. Kept for callers that need a direct read.
  */
 export async function fetchPaidChainTimestamp(
   ethRpcUrl: string,
