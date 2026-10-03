@@ -27,7 +27,8 @@ client.disconnect();
 ```
 
 `init()` connects to the Hisoka testnet and verifies the discovered topology against the configured registry.
-Both verification inputs are required outside a loopback test mesh.
+Both verification inputs are required outside a loopback test mesh. Use your own RPC endpoint for
+`ethRpcUrl` when you can: the public one is rate limited.
 `0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6` is the NoxRegistry proxy of the current Arbitrum Sepolia testnet deployment (2026-09-25).
 The retired April 2026 registry `0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc` is not compatible with the complete
 profile verifier.
@@ -85,9 +86,20 @@ if (quote.status === "rejected") {
 const outcome = await client.submitPaidTransaction(quote, entryPointCalldata);
 ```
 
-The quote request and paid submission use the same selected exit. The client re-resolves that exit from a
+The quote request and paid submission use the same exit: always submit with the quote returned by
+`requestPaidQuote`, whose `selectedExit` is the exit that signed it. If the chosen exit does not answer in
+time, the quote request is sent once more to a different exit. The client re-resolves that exit from a
 recently chain-verified topology, verifies the EIP-712 quote and execution ID, and returns a typed submission or
 rejection outcome. Applications provide opaque EntryPoint calldata; Nox does not parse Howl proofs.
+
+When the seed publishes node capabilities, only exits that advertise `paid_v2` are used, and
+`selectPaidExit()` throws `PAID_EXIT_UNAVAILABLE` if none does. An exit with no capability data counts as
+not paid-capable once any node in the topology has some, so a seed must publish capabilities for every
+exit or for none.
+
+The client reads the chain time for quote checks through the mixnet, which adds one mixnet round trip
+(typically 1-2 s) before each quote and each submission. Send any simulation of your own (`eth_call`,
+`eth_estimateGas`) the same way, with `client.rpcCall`.
 
 ### Broadcast a signed transaction
 
@@ -128,6 +140,20 @@ cover.start({ lambdaP: 1.0 }); // ~1 packet/sec (Poisson)
 cover.stop();
 ```
 
+### Errors
+
+```ts
+import { NoxClientError, NoxClientErrorCode } from "@hisoka-io/nox-client";
+
+try {
+  await client.sendEcho(new Uint8Array([1]));
+} catch (error) {
+  if (error instanceof NoxClientError && error.code === NoxClientErrorCode.ResponseTimeout) {
+    // The request and its single retry on another route both timed out.
+  }
+}
+```
+
 ### Disconnect
 
 ```ts
@@ -148,9 +174,27 @@ client.disconnect();
 | `ethRpcUrl` | `string` | `""` | Ethereum RPC for on-chain topology verification |
 | `registryAddress` | `string` | `""` | NoxRegistry contract address |
 | `dangerouslySkipFingerprintCheck` | `boolean` | `false` | Skip verification on a loopback test mesh only |
+| `retryOnTimeout` | `boolean` | `true` | Resend idempotent requests once on another route after a timeout (worst case about 2x `timeoutMs`) |
+| `transport` | `{ fetch?, WebSocket? }` | runtime globals | Network primitives; `WebSocket: null` uses HTTP polling |
 
 `ethRpcUrl` and `registryAddress` are required together. Connection fails before fetching a seed if either is
 missing. `dangerouslySkipFingerprintCheck: true` is accepted only when every seed URL is loopback.
+
+### Seeds
+
+A seed is any base URL that serves the topology document at `{seed}/topology`: the seed API
+(`https://api.hisoka.io/seed`) or a node's ingress URL. `connect()` tries your seeds in order, then the
+default seed API, and uses the first one whose topology passes every check. Membership is verified against
+the registry, so a seed cannot add nodes or change their keys or roles. Liveness is not on chain: the seed
+decides which registered nodes count as online, and that decides which nodes the client routes through, so
+only add seeds you trust. Liveness ages are measured on the seed's clock, so a client clock that is off by a
+few minutes still connects.
+
+Background refreshes always try the seeds first: the last seed that worked, then your seeds and the default
+seed API. Only when all of them fail does the client fetch the topology from up to three verified nodes, and
+then only to confirm membership: a node-served snapshot must be pinned at or after the last seed's block,
+can only remove nodes that left the registry or were frozen, and does not change liveness, capabilities or
+the PoW difficulty. The next refresh tries the seeds again.
 
 To inspect or spread the defaults programmatically:
 
@@ -181,6 +225,8 @@ Large responses are automatically fragmented and reassembled with Reed-Solomon f
 ## Requirements
 
 Node.js 20+ or a browser runtime with Web Crypto and WASM support.
+
+See [CHANGELOG.md](./CHANGELOG.md) for changes between versions, including the 0.1.x to 0.2.0 migration.
 
 ## License
 

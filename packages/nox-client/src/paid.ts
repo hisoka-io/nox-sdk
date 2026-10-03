@@ -10,7 +10,8 @@ import type {
   PaidQuoteRequestV2,
 } from "./bincode.js";
 import { NoxClientError, NoxClientErrorCode } from "./types.js";
-import type { TopologyNode } from "./types.js";
+import type { NoxFetch, TopologyNode } from "./types.js";
+import { defaultFetch } from "./rpc.js";
 
 const QUOTE_VERSION = 1;
 const ENTRY_POINT_GAS_RESERVE = 250_000n;
@@ -54,14 +55,21 @@ export type PaidQuoteResultV2 =
   | IssuedPaidQuoteV2
   | Extract<PaidQuoteOutcomeV2, { readonly status: "rejected" }>;
 
+/**
+ * Read the latest block timestamp directly from `ethRpcUrl`.
+ *
+ * `NoxClient` does not use this for paid requests; it reads the block through
+ * the mixnet with `rpcCall`. Kept for callers that need a direct read.
+ */
 export async function fetchPaidChainTimestamp(
   ethRpcUrl: string,
   timeoutMs: number,
+  fetchImpl: NoxFetch = defaultFetch,
 ): Promise<bigint> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(ethRpcUrl, {
+    const response = await fetchImpl(ethRpcUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -79,22 +87,7 @@ export async function fetchPaidChainTimestamp(
     if (!isRecord(payload)) {
       throw new Error("response root is not an object");
     }
-    const block = payload["result"];
-    if (!isRecord(block)) {
-      throw new Error("latest block is missing");
-    }
-    const timestamp = block["timestamp"];
-    if (
-      typeof timestamp !== "string" ||
-      !/^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/u.test(timestamp)
-    ) {
-      throw new Error("timestamp is not a canonical hex u64");
-    }
-    const decoded = BigInt(timestamp);
-    if (decoded > MAX_U64) {
-      throw new Error("timestamp is not a canonical hex u64");
-    }
-    return decoded;
+    return blockTimestamp(payload["result"]);
   } catch (error) {
     throw new NoxClientError(
       `Paid chain timestamp query failed: ${safeExternalError(error)}`,
@@ -104,6 +97,40 @@ export async function fetchPaidChainTimestamp(
   } finally {
     clearTimeout(timer);
   }
+}
+
+/**
+ * Decode the timestamp of an `eth_getBlockByNumber` result.
+ * Throws `NoxClientError` (`TransportFailed`) on a missing or non-canonical value.
+ */
+export function parsePaidChainTimestamp(block: unknown): bigint {
+  try {
+    return blockTimestamp(block);
+  } catch (error) {
+    throw new NoxClientError(
+      `Paid chain timestamp query failed: ${safeExternalError(error)}`,
+      NoxClientErrorCode.TransportFailed,
+      error,
+    );
+  }
+}
+
+function blockTimestamp(block: unknown): bigint {
+  if (!isRecord(block)) {
+    throw new Error("latest block is missing");
+  }
+  const timestamp = block["timestamp"];
+  if (
+    typeof timestamp !== "string" ||
+    !/^0x(?:0|[1-9a-fA-F][0-9a-fA-F]*)$/u.test(timestamp)
+  ) {
+    throw new Error("timestamp is not a canonical hex u64");
+  }
+  const decoded = BigInt(timestamp);
+  if (decoded > MAX_U64) {
+    throw new Error("timestamp is not a canonical hex u64");
+  }
+  return decoded;
 }
 
 export function quoteTypedData(quote: ExecutionQuoteV1) {

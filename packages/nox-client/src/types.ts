@@ -18,7 +18,17 @@ export interface TopologyLiveness {
   address: string;
   status: TopologyLivenessStatus;
   observed_at_unix: number;
+  /**
+   * Optional service capabilities observed for this member, for example
+   * `"paid_v2"`. Seeds that do not publish capabilities omit the field.
+   */
+  capabilities?: string[];
+  /** Optional build version observed for this member. Informational only. */
+  build_version?: string;
 }
+
+/** Capability an exit must advertise before it is chosen for paid execution. */
+export const PAID_V2_CAPABILITY = "paid_v2";
 
 export interface TopologySnapshot {
   nodes: RelayerNode[];
@@ -40,6 +50,11 @@ export interface TopologyNode {
   publicKey: Uint8Array;
   layer: number;
   role: number;
+  /**
+   * Capabilities the seed observed for this node. `undefined` means the seed
+   * published no capability data for it.
+   */
+  capabilities?: readonly string[];
 }
 
 export interface PathHop {
@@ -58,6 +73,23 @@ export interface BatchResponseItem {
   data: number[];
 }
 
+/** `fetch`-compatible function used for every HTTP request the client makes. */
+export type NoxFetch = (input: string, init?: RequestInit) => Promise<Response>;
+
+/** Constructor used for the response stream. Same shape as the WHATWG `WebSocket`. */
+export type NoxWebSocketConstructor = new (url: string) => WebSocket;
+
+/**
+ * Network primitives used by the client. Each one defaults to the runtime
+ * global, so most applications never set this. Set it to run the client in an
+ * environment that restricts or wraps ambient network APIs.
+ */
+export interface NoxTransport {
+  fetch?: NoxFetch;
+  /** Set to `null` to disable the WebSocket stream and use HTTP claim polling. */
+  WebSocket?: NoxWebSocketConstructor | null;
+}
+
 /** Configuration for `NoxClient.connect()`. */
 export interface NoxClientConfig {
   seeds?: string[];
@@ -74,16 +106,34 @@ export interface NoxClientConfig {
   dangerouslySkipFingerprintCheck?: boolean;
   /** FEC (Forward Error Correction) ratio for redundancy shards. Range: 0.0-1.0. Default: 0.3. */
   fecRatio?: number;
+  /**
+   * Retry an idempotent request once on a different route after a response
+   * timeout, and avoid the hops of the failed route for a while. A retried
+   * call can take up to about twice `timeoutMs`. When false, a timeout is
+   * returned at once and does not affect later route choice. Default: true.
+   */
+  retryOnTimeout?: boolean;
+  /** Network primitives. Defaults to the runtime's global `fetch` and `WebSocket`. */
+  transport?: NoxTransport;
 }
 
+/** Resolved client settings: every `NoxClientConfig` field except `transport`. */
+export type NoxClientSettings = Required<Omit<NoxClientConfig, "transport">>;
+
 /**
- * Transport defaults. Production callers must supply ethRpcUrl and registryAddress.
- * Pass directly to `NoxClient.connect()` or spread with overrides:
+ * Transport defaults. `ethRpcUrl` and `registryAddress` are empty on purpose:
+ * every caller must supply both, so spread the defaults with them:
  *
- *   await NoxClient.connect(DEFAULTS)
- *   await NoxClient.connect({ ...DEFAULTS, timeoutMs: 60_000 })
+ *   await NoxClient.connect({
+ *     ...DEFAULTS,
+ *     ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
+ *     registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
+ *   })
+ *
+ * `connect()` fills any field you leave out from these defaults, so spreading
+ * them is optional.
  */
-export const DEFAULTS: Required<NoxClientConfig> = {
+export const DEFAULTS: NoxClientSettings = {
   seeds: ["https://api.hisoka.io/seed"],
   ethRpcUrl: "",
   registryAddress: "",
@@ -94,6 +144,7 @@ export const DEFAULTS: Required<NoxClientConfig> = {
   powDifficulty: 3,
   dangerouslySkipFingerprintCheck: false,
   fecRatio: 0.3,
+  retryOnTimeout: true,
 };
 
 export class NoxClientError extends Error {
@@ -107,7 +158,9 @@ export class NoxClientError extends Error {
   }
 }
 
-export const enum NoxClientErrorCode {
+// A regular enum (not `const enum`) so that `NoxClientErrorCode.X` compiles
+// under `isolatedModules` and `verbatimModuleSyntax`.
+export enum NoxClientErrorCode {
   TopologyFetchFailed = "TOPOLOGY_FETCH_FAILED",
   TopologyVerificationFailed = "TOPOLOGY_VERIFICATION_FAILED",
   NoNodesAvailable = "NO_NODES_AVAILABLE",
@@ -117,4 +170,6 @@ export const enum NoxClientErrorCode {
   DecryptionFailed = "DECRYPTION_FAILED",
   WasmNotInitialized = "WASM_NOT_INITIALIZED",
   InvalidConfig = "INVALID_CONFIG",
+  /** No exit in the verified topology advertises paid execution support. */
+  PaidExitUnavailable = "PAID_EXIT_UNAVAILABLE",
 }

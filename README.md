@@ -33,8 +33,8 @@ client.disconnect();
 
 `0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6` is the NoxRegistry proxy of the current Arbitrum Sepolia testnet deployment (2026-09-25). The April
 2026 registry `0x8626aF80db409BeD3C19871FAdf9b0Ce7Aa641Bc` is retired: it is not ABI-compatible with this client
-and is rejected during full profile verification. See [Deployments](docs/docs/deployments.mdx) for the full
-contract set.
+and is rejected during full profile verification. The full contract set, with code hashes and pinned node
+images, is in [`run-nox/configs/arbitrum-sepolia.deployment.json`](https://github.com/hisoka-io/run-nox/blob/main/configs/arbitrum-sepolia.deployment.json).
 
 You can pass config to `connect()`:
 
@@ -49,11 +49,15 @@ const client = await NoxClient.connect({
   livenessMaxAgeMs: 180_000,
   surbsPerRequest: 10,
   fecRatio: 0.3,
+  retryOnTimeout: true,
   dangerouslySkipFingerprintCheck: false,
 });
 ```
 
-See the full API and architecture docs at [docs.hisoka.io](https://docs.hisoka.io).
+Every option is described in the [client README](./packages/nox-client/README.md#configuration-reference),
+and changes between versions are in the [changelog](./packages/nox-client/CHANGELOG.md).
+
+See the full API and architecture docs at [docs.hisoka.io](https://docs.hisoka.io/docs/nox/sdk).
 
 ## License
 

@@ -1,5 +1,6 @@
 import { NoxClientError, NoxClientErrorCode } from "./types.js";
-import type { BatchResponseItem } from "./types.js";
+import type { BatchResponseItem, NoxFetch, NoxWebSocketConstructor } from "./types.js";
+import { defaultFetch } from "./rpc.js";
 
 export const SPHINX_PACKET_SIZE = 32_768;
 
@@ -7,6 +8,7 @@ export async function postPacket(
   entryUrl: string,
   packet: Uint8Array,
   timeoutMs = 30_000,
+  fetchImpl: NoxFetch = defaultFetch,
 ): Promise<void> {
   if (packet.length !== SPHINX_PACKET_SIZE) {
     throw new NoxClientError(
@@ -21,7 +23,7 @@ export async function postPacket(
 
   let resp: Response;
   try {
-    resp = await fetch(url, {
+    resp = await fetchImpl(url, {
       method: "POST",
       headers: { "Content-Type": "application/octet-stream" },
       // Fresh copy satisfies TS 5.9+ BodyInit constraint (Uint8Array<ArrayBuffer>)
@@ -51,6 +53,7 @@ export async function claimResponses(
   entryUrl: string,
   surbIds: string[],
   timeoutMs = 10_000,
+  fetchImpl: NoxFetch = defaultFetch,
 ): Promise<BatchResponseItem[]> {
   if (surbIds.length === 0) return [];
 
@@ -60,7 +63,7 @@ export async function claimResponses(
 
   let resp: Response;
   try {
-    resp = await fetch(url, {
+    resp = await fetchImpl(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ surb_ids: surbIds }),
@@ -112,6 +115,7 @@ export async function claimResponses(
 export async function pollResponses(
   entryUrl: string,
   timeoutMs = 10_000,
+  fetchImpl: NoxFetch = defaultFetch,
 ): Promise<BatchResponseItem[]> {
   const url = `${entryUrl.replace(/\/$/, "")}/api/v1/responses/pending`;
   const controller = new AbortController();
@@ -119,7 +123,7 @@ export async function pollResponses(
 
   let resp: Response;
   try {
-    resp = await fetch(url, { signal: controller.signal });
+    resp = await fetchImpl(url, { signal: controller.signal });
   } catch (err) {
     clearTimeout(timer);
     throw new NoxClientError(
@@ -167,6 +171,10 @@ export function hasWebSocket(): boolean {
   return typeof globalThis.WebSocket === "function";
 }
 
+// WebSocket readyState OPEN. Read as a constant so an injected constructor
+// without static fields still works.
+const WS_OPEN = 1;
+
 /** Convert HTTP entry URL to WebSocket URL. */
 function toWsUrl(entryUrl: string): string {
   return entryUrl
@@ -186,10 +194,16 @@ export class ResponseWebSocket {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private closed = false;
   private pendingSubscribes: string[] = [];
+  private readonly WebSocketImpl: NoxWebSocketConstructor;
 
-  constructor(entryUrl: string, onResponse: WsResponseHandler) {
+  constructor(
+    entryUrl: string,
+    onResponse: WsResponseHandler,
+    WebSocketImpl: NoxWebSocketConstructor = globalThis.WebSocket,
+  ) {
     this.url = toWsUrl(entryUrl);
     this.onResponse = onResponse;
+    this.WebSocketImpl = WebSocketImpl;
     this.connect();
   }
 
@@ -197,7 +211,7 @@ export class ResponseWebSocket {
     if (this.closed) return;
 
     try {
-      this.ws = new WebSocket(this.url);
+      this.ws = new this.WebSocketImpl(this.url);
     } catch {
       return;
     }
@@ -233,7 +247,7 @@ export class ResponseWebSocket {
 
   subscribe(surbIds: string[]): void {
     if (surbIds.length === 0) return;
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (!this.ws || this.ws.readyState !== WS_OPEN) {
       this.pendingSubscribes.push(...surbIds);
       return;
     }
@@ -241,12 +255,12 @@ export class ResponseWebSocket {
   }
 
   unsubscribe(surbIds: string[]): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || surbIds.length === 0) return;
+    if (!this.ws || this.ws.readyState !== WS_OPEN || surbIds.length === 0) return;
     this.ws.send(JSON.stringify({ type: "unsubscribe", surb_ids: surbIds }));
   }
 
   isConnected(): boolean {
-    return this.ws !== null && this.ws.readyState === WebSocket.OPEN;
+    return this.ws !== null && this.ws.readyState === WS_OPEN;
   }
 
   close(): void {
