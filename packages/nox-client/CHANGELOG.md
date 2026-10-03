@@ -2,7 +2,7 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-03)
 
 Needs `@hisoka-io/nox-wasm` 0.2.0. Wire-compatible with nox 0.4.0-rc.2 and
 rc.3 nodes and with mixed meshes; on a mesh without `surb_v2` capability data
@@ -37,7 +37,7 @@ it behaves exactly like 0.3.0.
 - v2 reply blocks are only matched by their delivery ID; trial decryption is
   kept for v1 only.
 
-## 0.3.0 (unreleased)
+## 0.3.0 (2026-10-03)
 
 Wire-compatible with nox 0.4.0-rc.1 nodes and the 0.2.0 client: packets, SURBs
 and service requests are unchanged.

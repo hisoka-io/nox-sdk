@@ -60,37 +60,79 @@ const client = await NoxClient.connect({
 });
 ```
 
-### Submit a transaction
+### Paid execution
+
+`submitPaidTransaction` is the transaction path served by nox 0.4.0-rc.2 and later exits. The client selects
+one exit, requests its signed EIP-712 quote through the mixnet, and submits `NoxEntryPoint.execute` calldata
+through that same exit, which broadcasts it and pays the gas. The quoted exit and network fees are paid on
+chain through the payment adapter named in the quote.
 
 ```ts
-const response = await client.submitTransaction(
-  "0xContractAddress",
-  calldata, // Uint8Array
-);
-const outcome = await client.submitTransactionTyped(
-  "0xContractAddress",
-  calldata,
-);
-```
+import { AbiCoder, Interface, getBytes, hexlify, keccak256, randomBytes } from "ethers";
+import type { PaidQuoteRequestV2 } from "@hisoka-io/nox-client";
 
-The transaction is wrapped in a Sphinx packet, routed through 3 relay nodes, and executed by the exit node. The response comes back through Single-Use Reply Blocks (SURBs) so the exit node never learns who sent the request.
+const NOX_ENTRY_POINT = "0xad911Ca217C6dC779fCE6A6538bDda3071c38E7E"; // Arbitrum Sepolia
+const trackedAssets: string[] = [];
 
-### Protocol-neutral paid execution
+const request: PaidQuoteRequestV2 = {
+  chainId: 421614n,
+  entryPoint: getBytes(NOX_ENTRY_POINT),
+  clientIntentId: randomBytes(32),
+  paymentAdapter: getBytes(paymentAdapter), // e.g. the HowlPaymentAdapter
+  paymentId: getBytes(paymentId), // 32 bytes, defined by the payment adapter
+  feeAsset: getBytes(feeAsset),
+  paymentGasLimit: 4_000_000n,
+  actionTarget: getBytes(actionTarget),
+  actionCalldataHash: getBytes(keccak256(actionData)),
+  actionGasLimit: 4_000_000n,
+  trackedAssetsHash: getBytes(
+    keccak256(AbiCoder.defaultAbiCoder().encode(["address[]"], [trackedAssets])),
+  ),
+  maximumTransactionGas: 12_000_000n, // at least paymentGasLimit + actionGasLimit + 250000
+  returnDataLimit: 256, // up to 4096
+  validUntilUnix: BigInt(Math.floor(Date.now() / 1000) + 120),
+};
 
-```ts
-const selectedExit = client.selectPaidExit();
-const quote = await client.requestPaidQuote(request, selectedExit);
+const quote = await client.requestPaidQuote(request, client.selectPaidExit());
 if (quote.status === "rejected") {
   throw new Error(`${quote.code}: ${quote.detail}`);
 }
+
+// ABI-encode NoxEntryPoint.execute with the signed quote.
+const entryPoint = new Interface([
+  "function execute((uint8 quoteVersion, uint256 chainId, address entryPoint, address exitAddress, bytes32 clientIntentId, address paymentAdapter, bytes32 paymentId, address feeAsset, uint256 exitFee, uint256 networkFee, uint256 paymentGasLimit, address actionTarget, bytes32 actionCalldataHash, uint256 actionGasLimit, bytes32 trackedAssetsHash, uint256 maximumTransactionGas, uint256 maximumFeePerGas, uint256 returnDataLimit, uint64 validAfterUnix, uint64 validUntilUnix, uint256 quoteNonce) quote, bytes exitSignature, bytes actionData, address[] trackedAssets, bytes paymentData)",
+]);
+const quoteTuple = Object.fromEntries(
+  Object.entries(quote.quote).map(([key, value]) => [
+    key,
+    value instanceof Uint8Array ? hexlify(value) : value,
+  ]),
+);
+const entryPointCalldata = getBytes(
+  entryPoint.encodeFunctionData("execute", [
+    quoteTuple,
+    quote.exitSignature,
+    actionData,
+    trackedAssets,
+    paymentData, // built by the payment adapter for quote.executionId
+  ]),
+);
+
 const outcome = await client.submitPaidTransaction(quote, entryPointCalldata);
+if (outcome.status === "submitted") {
+  console.log("tx", hexlify(outcome.transactionHash));
+} else {
+  console.log(outcome.code, outcome.retryable, outcome.detail);
+}
 ```
 
 The quote request and paid submission use the same exit: always submit with the quote returned by
 `requestPaidQuote`, whose `selectedExit` is the exit that signed it. If the chosen exit does not answer in
 time, the quote request is sent once more to a different exit. The client re-resolves that exit from a
 recently chain-verified topology, verifies the EIP-712 quote and execution ID, and returns a typed submission or
-rejection outcome. Applications provide opaque EntryPoint calldata; Nox does not parse Howl proofs.
+rejection outcome. Applications provide opaque EntryPoint calldata; Nox does not parse Howl proofs. The
+payment must cover `exitFee + networkFee` from the quote and be bound to `quote.executionId`; the
+[anonymous paymaster docs](https://docs.hisoka.io/docs/crypto/paymaster) describe the Howl payment path.
 
 When the seed publishes node capabilities, only exits that advertise `paid_v2` are used, and
 `selectPaidExit()` throws `PAID_EXIT_UNAVAILABLE` if none does. An exit with no capability data counts as
@@ -100,6 +142,13 @@ exit or for none.
 The client reads the chain time for quote checks through the mixnet, which adds one mixnet round trip
 (typically 1-2 s) before each quote and each submission. Send any simulation of your own (`eth_call`,
 `eth_estimateGas`) the same way, with `client.rpcCall`.
+
+### Legacy transaction submission
+
+`submitTransaction(to, data)` and `submitTransactionTyped(to, data)` send the legacy `SubmitTransaction`
+request, whose wire encoding is unchanged. Exits running nox 0.4.0-rc.2 or later, including the current
+testnet fleet, answer it with a `SUBMISSION` rejection (`submitTransactionTyped` returns it as
+`{ status: "rejected", code: "SUBMISSION" }`). Use `submitPaidTransaction` for transactions.
 
 ### Broadcast a signed transaction
 
