@@ -303,7 +303,13 @@ export class NoxClient {
     return client;
   }
 
-  /** Submit a transaction via the mixnet. Returns raw response bytes (typically tx hash). */
+  /**
+   * Legacy transaction submission. Returns raw response bytes.
+   *
+   * Exits running nox 0.4.0-rc.2 or later answer with a `SUBMISSION`
+   * rejection; use `requestPaidQuote` and `submitPaidTransaction` for
+   * transactions.
+   */
   async submitTransaction(to: string, data: Uint8Array): Promise<Uint8Array> {
     const toBytes = hexToBytes(to);
     if (toBytes.length !== 20) {
@@ -324,7 +330,11 @@ export class NoxClient {
     return response;
   }
 
-  /** Submit through the legacy wire and decode its bounded response. */
+  /**
+   * Legacy transaction submission with a decoded response. Exits running nox
+   * 0.4.0-rc.2 or later return `{ status: "rejected", code: "SUBMISSION" }`;
+   * use `submitPaidTransaction` for transactions.
+   */
   async submitTransactionTyped(
     to: string,
     data: Uint8Array,
@@ -633,7 +643,7 @@ export class NoxClient {
     return response;
   }
 
-  /** Send a custom `RelayerPayload` directly. Prefer submitTransaction/rpcCall/httpRequest. */
+  /** Send a custom `RelayerPayload` directly. Prefer submitPaidTransaction/rpcCall/httpRequest. */
   async send(payload: RelayerPayload): Promise<Uint8Array> {
     const opKey = payload.tag;
     const surbCount = this.adaptive.surbCount(opKey, this._config.surbsPerRequest, this._config.fecRatio);

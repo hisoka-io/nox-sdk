@@ -20,7 +20,14 @@ const client = await NoxClient.connect({
   registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 
-await client.submitTransaction("0xContractAddress", calldata);
+// Paid execution: quote from one exit, then submit through that same exit.
+const exit = client.selectPaidExit();
+const quote = await client.requestPaidQuote(quoteRequest, exit);
+if (quote.status === "issued") {
+  const outcome = await client.submitPaidTransaction(quote, entryPointCalldata);
+}
+
+// A transaction you signed and pay gas for yourself.
 await client.broadcastSignedTransaction(signedTxBytes);
 
 const balance = await client.rpcCall("eth_getBalance", ["0x...", "latest"]);
@@ -53,6 +60,10 @@ const client = await NoxClient.connect({
   dangerouslySkipFingerprintCheck: false,
 });
 ```
+
+`submitPaidTransaction` is the transaction path served by nox 0.4.0-rc.2 and later exits. The
+[client README](./packages/nox-client/README.md#paid-execution) shows how to build `quoteRequest` and
+`entryPointCalldata`.
 
 Every option is described in the [client README](./packages/nox-client/README.md#configuration-reference),
 and changes between versions are in the [changelog](./packages/nox-client/CHANGELOG.md).
