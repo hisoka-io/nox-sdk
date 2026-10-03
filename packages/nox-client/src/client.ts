@@ -141,7 +141,10 @@ export class NoxClient {
   private nextRequestId = BigInt(0);
   private _nodes: TopologyNode[];
   private _entryUrl: string;
+  /** Last seed whose topology was applied. Never a node's ingress URL. */
   private _seedUrl: string;
+  /** Block the last applied seed snapshot was verified at. */
+  private _seedBlock: number | undefined;
   private _topologyVerifiedAtMs: number;
   private _topologyRefreshError: NoxClientError | null = null;
   private _refreshInFlight: Promise<void> | null = null;
@@ -193,10 +196,12 @@ export class NoxClient {
     seedUrl: string,
     config: NoxClientSettings,
     topologyVerifiedAtMs: number,
+    seedBlock: number | undefined,
   ) {
     this._nodes = nodes;
     this._entryUrl = entryUrl;
     this._seedUrl = seedUrl;
+    this._seedBlock = seedBlock;
     this._config = config;
     this._topologyVerifiedAtMs = topologyVerifiedAtMs;
     this.surbPool = new SurbPool();
@@ -262,6 +267,7 @@ export class NoxClient {
       loaded.seed,
       full,
       full.dangerouslySkipFingerprintCheck ? 0 : Date.now(),
+      loaded.snapshot.block_number,
     );
     client._powDifficultyPinned = powDifficultyPinned;
     client._fetchImpl = transport.fetch;
@@ -696,8 +702,10 @@ export class NoxClient {
 
   /**
    * Send on a fresh route and, for idempotent requests, resend once on a
-   * different route after a response timeout. Hops of a timed-out route are
-   * deprioritised for `ROUTE_AVOID_MS`; a reply through a hop clears it.
+   * different route after a response timeout, so the caller can wait up to
+   * about twice the timeout. Hops of a timed-out route are deprioritised for
+   * `ROUTE_AVOID_MS`; a reply through a hop clears it. With `retryOnTimeout`
+   * off, neither happens.
    */
   private async _sendWithRetry(
     payload: RelayerPayload,
@@ -715,8 +723,10 @@ export class NoxClient {
       return { response, exit: first.exit };
     } catch (error) {
       if (!isResponseTimeout(error)) throw error;
+      // With retryOnTimeout off, a timeout leaves route selection unchanged.
+      if (this._config.retryOnTimeout === false) throw error;
       this._avoidRoute(first);
-      if (retry === "none" || this._config.retryOnTimeout === false) throw error;
+      if (retry === "none") throw error;
 
       // Steer the resend away from this route's hops specifically; hops that
       // timed out earlier are only a soft preference and may be reused.
@@ -1189,31 +1199,46 @@ export class NoxClient {
    * Refresh and re-verify the topology. Concurrent callers (the timer and the
    * paid freshness gate) share one in-flight refresh.
    */
-  private _refreshTopology(seedUrl?: string): Promise<void> {
+  private _refreshTopology(): Promise<void> {
     if (this._refreshInFlight) return this._refreshInFlight;
-    const run = this._refreshTopologyOnce(seedUrl ?? this._seedUrl).finally(() => {
+    const run = this._refreshTopologyOnce().finally(() => {
       this._refreshInFlight = null;
     });
     this._refreshInFlight = run;
     return run;
   }
 
-  private async _refreshTopologyOnce(seedUrl: string): Promise<void> {
+  /**
+   * Seeds are always tried first: the last seed that worked, then the
+   * configured seeds and the default seed. Only when every seed fails does the
+   * client ask verified nodes, and a node can then only confirm membership (see
+   * `_applyNodeMembership`).
+   */
+  private async _refreshTopologyOnce(): Promise<void> {
     const seeds = Array.from(
       new Set([
-        ...seedCandidates([seedUrl]).slice(0, 1),
+        this._seedUrl,
         ...seedCandidates(this._config.seeds, !this._config.dangerouslySkipFingerprintCheck),
       ]),
     );
     let firstError: NoxClientError | null = null;
 
-    for (const seed of [...seeds, ...this._nodeTopologyFallbacks(seeds)]) {
+    for (const seed of seeds) {
       try {
-        const loaded = await loadTopology(seed, this._config, this.fetch);
-        this._applyTopology(loaded);
+        this._applyTopology(await loadTopology(seed, this._config, this.fetch));
         return;
       } catch (error) {
         firstError ??= asTopologyLoadError(seed, error);
+      }
+    }
+    for (const node of this._nodeTopologyFallbacks(seeds)) {
+      try {
+        this._applyNodeMembership(
+          await loadTopology(node, this._config, this.fetch, "membership"),
+        );
+        return;
+      } catch (error) {
+        firstError ??= asTopologyLoadError(node, error);
       }
     }
     this._topologyRefreshError =
@@ -1227,9 +1252,12 @@ export class NoxClient {
   /**
    * Ingress URLs of verified nodes, used as topology sources when every seed
    * fails: the current entry first, then up to two others at random. A node
-   * that serves the legacy schema fails verification and is skipped.
+   * that serves the legacy schema fails verification and is skipped. There are
+   * none without chain verification, since nothing could check what a node
+   * serves.
    */
   private _nodeTopologyFallbacks(seeds: readonly string[]): string[] {
+    if (this._config.dangerouslySkipFingerprintCheck) return [];
     const tried = new Set(seeds);
     const ingress = Array.from(
       new Set(
@@ -1250,22 +1278,59 @@ export class NoxClient {
   }
 
   private _applyTopology(loaded: LoadedTopology): void {
-    this._nodes = loaded.nodes;
     this._seedUrl = loaded.seed;
-    this._topologyVerifiedAtMs = this._config.dangerouslySkipFingerprintCheck
-      ? 0
-      : Date.now();
-    this._topologyRefreshError = null;
+    this._seedBlock = loaded.snapshot.block_number;
     this._config.powDifficulty = effectivePowDifficulty(
       this._config.powDifficulty,
       this._powDifficultyPinned,
       loaded.snapshot.pow_difficulty,
     );
-    const currentStillPresent = loaded.nodes.some(
+    this._setNodes(loaded.nodes);
+  }
+
+  /**
+   * Apply a node-served snapshot while the seeds are unreachable. Membership in
+   * it is chain-verified, but its liveness comes from a single node, so it may
+   * only remove nodes that are no longer registered and eligible on chain. The
+   * online set, capabilities and PoW difficulty stay as the last seed reported,
+   * and the snapshot must be pinned at or after the last seed's block.
+   */
+  private _applyNodeMembership(loaded: LoadedTopology): void {
+    const block = loaded.snapshot.block_number;
+    if (this._seedBlock === undefined || block === undefined || block < this._seedBlock) {
+      throw new NoxClientError(
+        `Topology from ${loaded.seed} is pinned before the last seed snapshot`,
+        NoxClientErrorCode.TopologyVerificationFailed,
+      );
+    }
+    const members = new Map(loaded.nodes.map((node) => [node.id, node]));
+    const nodes = this._nodes.flatMap((previous) => {
+      const member = members.get(previous.id);
+      if (member === undefined) return [];
+      return previous.capabilities === undefined
+        ? [member]
+        : [{ ...member, capabilities: previous.capabilities }];
+    });
+    if (nodes.length === 0) {
+      throw new NoxClientError(
+        `Topology from ${loaded.seed} left no previously online member`,
+        NoxClientErrorCode.NoNodesAvailable,
+      );
+    }
+    this._setNodes(nodes);
+  }
+
+  private _setNodes(nodes: TopologyNode[]): void {
+    this._nodes = nodes;
+    this._topologyVerifiedAtMs = this._config.dangerouslySkipFingerprintCheck
+      ? 0
+      : Date.now();
+    this._topologyRefreshError = null;
+    const currentStillPresent = nodes.some(
       (n) => n.address === this._entryUrl,
     );
     if (!currentStillPresent) {
-      this._entryUrl = pickEntryUrl(loaded.nodes);
+      this._entryUrl = pickEntryUrl(nodes);
       // Reconnect WS to new entry node
       if (this.responseWs !== null) {
         this.responseWs.close();
@@ -1280,7 +1345,7 @@ export class NoxClient {
 
   private async _ensureFreshPaidTopology(): Promise<void> {
     if (this._isPaidTopologyFresh()) return;
-    await this._refreshTopology(this._seedUrl);
+    await this._refreshTopology();
     this._requireFreshPaidTopology();
   }
 
@@ -1496,11 +1561,18 @@ interface LoadedTopology {
   readonly nodes: TopologyNode[];
 }
 
-/** Fetch one seed's topology and run every check the client config requires. */
+/**
+ * Fetch one seed's topology and run every check the client config requires.
+ *
+ * `"membership"` is for a node-served snapshot: it gets the same checks, but
+ * `nodes` lists every chain-eligible member regardless of the liveness it
+ * reports, so the caller can decide liveness from the last seed instead.
+ */
 async function loadTopology(
   seed: string,
   settings: NoxClientSettings,
   fetchImpl: NoxFetch,
+  use: "routing" | "membership" = "routing",
 ): Promise<LoadedTopology> {
   const snapshot = await fetchTopology(seed, settings.timeoutMs, fetchImpl);
   verifySelfConsistency(snapshot, !settings.dangerouslySkipFingerprintCheck);
@@ -1513,7 +1585,9 @@ async function loadTopology(
       snapshot.block_number,
       { fetch: fetchImpl },
     );
-  const nodes = nodesForRouting(snapshot, settings, chainEligibleAddresses);
+  const nodes = use === "routing"
+    ? nodesForRouting(snapshot, settings, chainEligibleAddresses)
+    : eligibleMembers(snapshot, settings, chainEligibleAddresses);
   if (nodes.length === 0) {
     throw new NoxClientError(
       `Topology from ${seed} returned 0 nodes`,
@@ -1637,6 +1711,35 @@ function nodesForRouting(
   return parseNodes({ ...snapshot, nodes: eligibleNodes }).map((node) => {
     const nodeCapabilities = capabilities.get(node.id);
     return nodeCapabilities === undefined ? node : { ...node, capabilities: nodeCapabilities };
+  });
+}
+
+/**
+ * Chain-eligible members of a verified schema v2 snapshot, ignoring the
+ * liveness it reports. The liveness set is still validated, and the snapshot
+ * must be no older than the liveness age limit.
+ */
+function eligibleMembers(
+  snapshot: TopologySnapshot,
+  config: NoxClientSettings,
+  chainEligibleAddresses?: ReadonlySet<string>,
+): TopologyNode[] {
+  if (snapshot.schema_version !== 2 || chainEligibleAddresses === undefined) {
+    throw new NoxClientError(
+      "Node-served topology requires schema_version 2 and chain verification",
+      NoxClientErrorCode.TopologyVerificationFailed,
+    );
+  }
+  selectLiveNodes(
+    snapshot,
+    Math.floor(Date.now() / 1000),
+    Math.ceil(config.livenessMaxAgeMs / 1000),
+  );
+  return parseNodes({
+    ...snapshot,
+    nodes: snapshot.nodes.filter((node) =>
+      chainEligibleAddresses.has(normalizeEthereumAddress(node.address))
+    ),
   });
 }
 
