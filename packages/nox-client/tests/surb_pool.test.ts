@@ -257,3 +257,61 @@ describe("SurbPool.size", () => {
     expect(pool.size).toBe(0);
   });
 });
+
+// ── format v2 ──────────────────────────────────────────────────────────────
+
+describe("SurbPool format v2", () => {
+  function v2Wasm(decryptCalls: string[]) {
+    let n = 0;
+    return {
+      ...makeMockWasm(),
+      create_surb_v2: (_path: unknown[], _pow: number) => {
+        const id = (0xd000 + n++).toString(16).padStart(32, "0");
+        return {
+          surb_bytes: new Uint8Array([0x56, 0x32]),
+          recovery: { id_hex: id, to_json: () => JSON.stringify({ id, version: 2 }) },
+        };
+      },
+      decrypt_surb_response: (recovery: { _data: string }, _data: Uint8Array) => {
+        decryptCalls.push(recovery._data);
+        return new Uint8Array([0x01, 0x42]);
+      },
+    };
+  }
+
+  it("registers v2 reply blocks under the delivery ID the WASM module returns", () => {
+    const pool = new SurbPool();
+    pool.generate(v2Wasm([]), testReturnPath, 7n, 2, 2);
+    expect(pool.activeSurbIds()).toEqual([
+      "0000000000000000000000000000d000",
+      "0000000000000000000000000000d001",
+    ]);
+    expect([...pool.registry.values()].every((e) => e.version === 2)).toBe(true);
+    expect(pool.idsForRequest(7n)).toHaveLength(2);
+    expect(pool.idsForRequest(8n)).toHaveLength(0);
+  });
+
+  it("matches v2 replies by delivery ID only, never by trial decryption", () => {
+    const calls: string[] = [];
+    const pool = new SurbPool();
+    const wasm = v2Wasm(calls);
+    pool.generate(wasm, testReturnPath, 7n, 1, 2);
+    expect(pool.matchAndDecrypt(wasm, new Uint8Array(8))).toBeNull();
+    expect(calls).toHaveLength(0);
+    const hit = pool.decryptById(wasm, "0000000000000000000000000000d000", new Uint8Array(8));
+    expect(hit?.requestId).toBe(7n);
+    expect(pool.size).toBe(0);
+  });
+
+  it("refuses v2 when the WASM module has no v2 builder", () => {
+    const pool = new SurbPool();
+    expect(() => pool.generate(makeMockWasm(), testReturnPath, 1n, 1, 2)).toThrow(/v2/);
+    expect(pool.size).toBe(0);
+  });
+
+  it("keeps v1 generation unchanged by default", () => {
+    const pool = new SurbPool();
+    pool.generate(makeMockWasm(), testReturnPath, 1n, 2);
+    expect([...pool.registry.values()].every((e) => e.version === 1)).toBe(true);
+  });
+});

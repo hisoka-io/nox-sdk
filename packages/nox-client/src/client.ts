@@ -9,6 +9,7 @@ import {
   type NoxWebSocketConstructor,
   type PathHop,
   type Route,
+  type SurbFormat,
   type TopologyNode,
   type TopologySnapshot,
 } from "./types.js";
@@ -23,6 +24,9 @@ import {
   selectRoute,
   hasUsableIngress,
   layersForRole,
+  routeSupportsSurbV2,
+  supportsSurbV2,
+  MAX_SURB_V2_ADDRESS_BYTES,
 } from "./topology.js";
 import { postPacket, claimResponses, ResponseWebSocket } from "./transport.js";
 import { defaultFetch } from "./rpc.js";
@@ -41,13 +45,14 @@ import {
 } from "./bincode.js";
 import type { FragmentWire } from "./bincode.js";
 import { Reassembler } from "./fragmentation.js";
-import { SurbPool } from "./surb_pool.js";
+import { SurbPool, wasmSupportsSurbV2, type SurbVersion } from "./surb_pool.js";
 import { ReplenishmentManager, buildReturnPath } from "./replenishment.js";
 import {
   bytesToHex,
   hexToBytes,
   buildSphinxPacket,
   secureRandomIndex,
+  secureRandomU64,
 } from "./utils.js";
 import {
   validateIssuedPaidQuote,
@@ -76,6 +81,15 @@ const NODE_TOPOLOGY_FALLBACKS = 3;
  * - "exit": resend once to a different paid-capable exit.
  */
 type RetryMode = "none" | "route" | "exit";
+
+/** A route plus the reply block format chosen for it. */
+interface PlannedRoute {
+  route: Route;
+  version: SurbVersion;
+}
+
+/** Interval for claiming replies from an entry other than the pinned one. */
+const AUX_ENTRY_POLL_MS = 200;
 
 interface EmaState {
   ema: number;
@@ -187,6 +201,15 @@ export class NoxClient {
   private stallTimer: ReturnType<typeof setInterval> | null = null;
   private responseWs: ResponseWebSocket | null = null;
   private subscribedSurbIds = new Set<string>();
+  /**
+   * Requests whose route uses an entry other than `_entryUrl`, by entry URL.
+   * Their replies are claimed from that entry, and their SURB IDs are never
+   * sent to the pinned entry.
+   */
+  private readonly _auxEntries = new Map<
+    string,
+    { requests: Set<bigint>; timer: ReturnType<typeof setInterval> }
+  >();
 
   public _debugPoll = false;
 
@@ -503,7 +526,7 @@ export class NoxClient {
         ? rpcUrlOrOpts?.expectedResponseBytes
         : undefined;
 
-    const id = this.nextRequestId++;
+    const id = secureRandomU64();
     const paramsBytes = new TextEncoder().encode(JSON.stringify(params));
 
     const inner = encodeServiceRequest({
@@ -636,6 +659,8 @@ export class NoxClient {
       this.responseWs = null;
     }
     this.subscribedSurbIds.clear();
+    for (const { timer } of this._auxEntries.values()) clearInterval(timer);
+    this._auxEntries.clear();
 
     const err = new NoxClientError(
       "NoxClient disconnected",
@@ -706,6 +731,10 @@ export class NoxClient {
    * about twice the timeout. Hops of a timed-out route are deprioritised for
    * `ROUTE_AVOID_MS`; a reply through a hop clears it. With `retryOnTimeout`
    * off, neither happens.
+   *
+   * A request that used v2 reply blocks is never resent with v1 ones: the
+   * resend uses v2 again, through a different entry. When no such route
+   * exists the timeout is returned.
    */
   private async _sendWithRetry(
     payload: RelayerPayload,
@@ -715,52 +744,145 @@ export class NoxClient {
     retry: RetryMode,
   ): Promise<{ response: Uint8Array; exit: TopologyNode }> {
     this._requireWasm();
-    const pinnedEntry = this._pinnedEntry();
-    const first = selectRoute(this._nodes, pinnedEntry, selectedExit, this._avoidedNodeIds());
+    const first = this._planRoute(selectedExit, this._avoidedNodeIds());
     try {
       const response = await this._sendOnRoute(payload, surbCount, timeoutMs, first);
-      this._clearAvoided(first);
-      return { response, exit: first.exit };
+      this._clearAvoided(first.route);
+      return { response, exit: first.route.exit };
     } catch (error) {
       if (!isResponseTimeout(error)) throw error;
       // With retryOnTimeout off, a timeout leaves route selection unchanged.
       if (this._config.retryOnTimeout === false) throw error;
-      this._avoidRoute(first);
+      this._avoidRoute(first.route);
       if (retry === "none") throw error;
 
       // Steer the resend away from this route's hops specifically; hops that
       // timed out earlier are only a soft preference and may be reused.
-      const avoid = new Set([first.mix.id, first.exit.id]);
-      let second: Route;
+      const avoid = new Set([first.route.mix.id, first.route.exit.id]);
+      let second: PlannedRoute;
       try {
-        const retryExit = retry === "exit"
-          ? this._pickPaidExit(new Set([first.exit.id]))
-          : selectedExit;
-        second = selectRoute(this._nodes, this._pinnedEntry(), retryExit, avoid);
+        second = first.version === 2
+          ? this._planV2Retry(first.route, selectedExit, retry, avoid)
+          : this._planRoute(
+            retry === "exit" ? this._pickPaidExit(new Set([first.route.exit.id])) : selectedExit,
+            avoid,
+          );
       } catch {
         throw error;
       }
-      if (second.mix.id === first.mix.id && second.exit.id === first.exit.id) {
+      if (
+        second.route.entry.id === first.route.entry.id &&
+        second.route.mix.id === first.route.mix.id &&
+        second.route.exit.id === first.route.exit.id
+      ) {
         throw error;
       }
       try {
         const response = await this._sendOnRoute(payload, surbCount, timeoutMs, second);
-        this._clearAvoided(second);
-        return { response, exit: second.exit };
+        this._clearAvoided(second.route);
+        return { response, exit: second.route.exit };
       } catch (retryError) {
-        if (isResponseTimeout(retryError)) this._avoidRoute(second);
+        if (isResponseTimeout(retryError)) this._avoidRoute(second.route);
         throw retryError;
       }
     }
+  }
+
+  /**
+   * Choose a route and its reply block format.
+   *
+   * - "v1": the pinned entry and v1, as in 0.3.0.
+   * - "auto": the pinned entry; v2 only when every hop advertises `surb_v2`
+   *   and the WASM module can build v2 reply blocks.
+   * - "v2": only hops that advertise `surb_v2`; the pinned entry when it
+   *   does, any such entry otherwise.
+   */
+  private _planRoute(
+    selectedExit: TopologyNode | undefined,
+    avoid: ReadonlySet<string>,
+  ): PlannedRoute {
+    const mode = this._config.surbFormat;
+    if (mode === "v2") return this._planStrictV2(selectedExit, avoid, undefined);
+    const route = selectRoute(this._nodes, this._pinnedEntry(), selectedExit, avoid);
+    const version: SurbVersion =
+      mode === "auto" && wasmSupportsSurbV2(this._wasm) && routeSupportsSurbV2(route) ? 2 : 1;
+    return { route, version };
+  }
+
+  /** A v2 route over hops that advertise `surb_v2`, optionally excluding one entry. */
+  private _planStrictV2(
+    selectedExit: TopologyNode | undefined,
+    avoid: ReadonlySet<string>,
+    excludeEntryId: string | undefined,
+  ): PlannedRoute {
+    if (!wasmSupportsSurbV2(this._wasm)) {
+      throw new NoxClientError(
+        "The loaded WASM module cannot build format v2 reply blocks",
+        NoxClientErrorCode.SurbV2Unavailable,
+      );
+    }
+    // Nodes whose routing address does not fit in a v2 reply block are left
+    // out entirely. An /ip4 multiaddr with a peer ID is at most 85 bytes.
+    const capable = this._nodes.filter(
+      (node) =>
+        supportsSurbV2(node) &&
+        node.id !== excludeEntryId &&
+        new TextEncoder().encode(node.routingAddress).length <= MAX_SURB_V2_ADDRESS_BYTES,
+    );
+    if (selectedExit !== undefined && !capable.some((node) => node.id === selectedExit.id)) {
+      throw new NoxClientError(
+        "The selected exit does not advertise format v2 reply support",
+        NoxClientErrorCode.SurbV2Unavailable,
+      );
+    }
+    const pinned = this._pinnedEntry();
+    const entry = pinned !== undefined && capable.some((node) => node.id === pinned.id)
+      ? pinned
+      : undefined;
+    let route: Route;
+    try {
+      route = selectRoute(capable, entry, selectedExit, avoid);
+    } catch (error) {
+      throw new NoxClientError(
+        "No route on which every hop advertises format v2 reply support",
+        NoxClientErrorCode.SurbV2Unavailable,
+        error,
+      );
+    }
+    return { route, version: 2 };
+  }
+
+  /** Resend plan after a v2 timeout: v2 again, through a different entry. */
+  private _planV2Retry(
+    failed: Route,
+    selectedExit: TopologyNode | undefined,
+    retry: RetryMode,
+    avoid: ReadonlySet<string>,
+  ): PlannedRoute {
+    let retryExit = selectedExit;
+    if (retry === "exit") {
+      const candidates = this._paidCapableExits().filter(
+        (node) => node.id !== failed.exit.id && node.id !== failed.entry.id && supportsSurbV2(node),
+      );
+      if (candidates.length === 0) {
+        throw new NoxClientError(
+          "No other paid-capable exit advertises format v2 reply support",
+          NoxClientErrorCode.SurbV2Unavailable,
+        );
+      }
+      retryExit = candidates[secureRandomIndex(candidates.length)];
+    }
+    return this._planStrictV2(retryExit, avoid, failed.entry.id);
   }
 
   private async _sendOnRoute(
     payload: RelayerPayload,
     surbCount: number,
     timeoutMs: number | undefined,
-    route: Route,
+    planned: PlannedRoute,
   ): Promise<Uint8Array> {
     this._requireWasm();
+    const { route, version } = planned;
     const forwardPath: PathHop[] = [
       { pubKeyHex: bytesToHex(route.entry.publicKey), address: route.entry.routingAddress },
       { pubKeyHex: bytesToHex(route.mix.publicKey), address: route.mix.routingAddress },
@@ -769,9 +891,14 @@ export class NoxClient {
     const returnPath = buildReturnPath(forwardPath);
 
     const requestId = this.nextRequestId++;
-    const surbBlobs = this._generateSurbs(returnPath, requestId, surbCount);
+    const surbBlobs = this._generateSurbs(returnPath, requestId, surbCount, version);
 
-    this._wsSubscribe(this.surbPool.activeSurbIds());
+    const entryUrl = route.entry.address;
+    if (entryUrl === this._entryUrl) {
+      this._wsSubscribe(this._pinnedEntrySurbIds());
+    } else {
+      this._watchAuxEntry(entryUrl, requestId);
+    }
 
     const payloadWithSurbs: RelayerPayload =
       payload.tag === "AnonymousRequest"
@@ -790,7 +917,8 @@ export class NoxClient {
       const FRAG_OVERHEAD = 32;
       const chunkSize = MAX_PAYLOAD_SIZE - FRAG_OVERHEAD;
       const totalFragments = Math.ceil(payloadBytes.length / chunkSize);
-      const messageId = requestId;
+      // Random, so fragments from different clients never share an ID at the exit.
+      const messageId = secureRandomU64();
       packets = [];
 
       for (let seq = 0; seq < totalFragments; seq++) {
@@ -844,9 +972,8 @@ export class NoxClient {
       });
     });
 
-    this.replenishment.stashPath(requestId, forwardPath);
+    this.replenishment.stashPath(requestId, forwardPath, { entryUrl, version });
 
-    const entryUrl = route.entry.address;
     const sendAll = Promise.all(
       packets.map((pkt) => postPacket(entryUrl, pkt, undefined, this.fetch)),
     );
@@ -874,9 +1001,68 @@ export class NoxClient {
     returnPath: PathHop[],
     requestId: bigint,
     count: number,
+    version: SurbVersion,
   ): Uint8Array[] {
     const wasm = this._requireWasm();
-    return this.surbPool.generate(wasm, returnPath, requestId, count);
+    return this.surbPool.generate(wasm, returnPath, requestId, count, version);
+  }
+
+  /** Requests whose replies are claimed from an entry other than `_entryUrl`. */
+  private _auxRequestIds(): Set<bigint> {
+    const ids = new Set<bigint>();
+    for (const { requests } of this._auxEntries.values()) {
+      for (const id of requests) ids.add(id);
+    }
+    return ids;
+  }
+
+  /** SURB IDs to claim from the pinned entry: every one not routed elsewhere. */
+  private _pinnedEntrySurbIds(): string[] {
+    const aux = this._auxRequestIds();
+    if (aux.size === 0) return this.surbPool.activeSurbIds();
+    const ids: string[] = [];
+    for (const [id, entry] of this.surbPool.registry) {
+      if (!aux.has(entry.requestId)) ids.push(id);
+    }
+    return ids;
+  }
+
+  /** Claim one request's replies from a non-pinned entry until it settles. */
+  private _watchAuxEntry(entryUrl: string, requestId: bigint): void {
+    const existing = this._auxEntries.get(entryUrl);
+    if (existing !== undefined) {
+      existing.requests.add(requestId);
+      return;
+    }
+    const watch = {
+      requests: new Set([requestId]),
+      timer: setInterval(() => {
+        void this._pollAuxEntry(entryUrl);
+      }, AUX_ENTRY_POLL_MS),
+    };
+    this._auxEntries.set(entryUrl, watch);
+  }
+
+  private async _pollAuxEntry(entryUrl: string): Promise<void> {
+    const watch = this._auxEntries.get(entryUrl);
+    if (watch === undefined) return;
+    for (const requestId of watch.requests) {
+      if (!this.pending.has(requestId)) watch.requests.delete(requestId);
+    }
+    if (watch.requests.size === 0) {
+      clearInterval(watch.timer);
+      this._auxEntries.delete(entryUrl);
+      return;
+    }
+    const ids = [...watch.requests].flatMap((id) => this.surbPool.idsForRequest(id));
+    if (ids.length === 0) return;
+    let items: import("./types.js").BatchResponseItem[];
+    try {
+      items = await claimResponses(entryUrl, ids, undefined, this.fetch);
+    } catch {
+      return;
+    }
+    for (const item of items) this._handleResponseItem(item);
   }
 
   private _buildSphinxPacket(
@@ -916,6 +1102,16 @@ export class NoxClient {
 
   /** Handle a single response item from the WebSocket stream. */
   private _onWsResponse(item: import("./types.js").BatchResponseItem): void {
+    const surbIdHex = parseSurbIdFromPacketId(item.id);
+    if (surbIdHex !== null) this.subscribedSurbIds.delete(surbIdHex);
+    this._handleResponseItem(item);
+  }
+
+  /**
+   * Decrypt and dispatch one claimed reply. A reply whose ID names a v2 reply
+   * block is matched by that ID only; trial decryption never covers v2.
+   */
+  private _handleResponseItem(item: import("./types.js").BatchResponseItem): void {
     if (this._wasm === null) return;
     const wasm = this._wasm;
 
@@ -925,14 +1121,18 @@ export class NoxClient {
     const surbIdHex = parseSurbIdFromPacketId(item.id);
     if (surbIdHex !== null) {
       match = this.surbPool.decryptById(wasm, surbIdHex, encryptedBody);
-      this.subscribedSurbIds.delete(surbIdHex);
     }
 
     if (match === null) {
       match = this.surbPool.matchAndDecrypt(wasm, encryptedBody);
     }
 
-    if (match === null) return;
+    if (match === null) {
+      if (this._debugPoll) {
+        this._debug(`[poll] no matching reply block for item data_len=${encryptedBody.length}`);
+      }
+      return;
+    }
 
     const { requestId, plaintext } = match;
 
@@ -958,7 +1158,7 @@ export class NoxClient {
     if (this._wasm === null || this.pending.size === 0) return;
     const wasm = this._wasm;
 
-    const surbIds = this.surbPool.activeSurbIds();
+    const surbIds = this._pinnedEntrySurbIds();
     if (surbIds.length === 0) return;
 
     let items: import("./types.js").BatchResponseItem[];
@@ -972,66 +1172,10 @@ export class NoxClient {
     }
 
     if (this._debugPoll && items.length > 0) {
-      this._debug(
-        `[poll] got ${items.length} items from ${this._entryUrl}, pending=${this.pending.size}`,
-      );
+      this._debug(`[poll] got ${items.length} items, pending=${this.pending.size}`);
     }
 
-    for (const item of items) {
-      const encryptedBody = new Uint8Array(item.data);
-
-      let match: { requestId: bigint; plaintext: Uint8Array } | null = null;
-      const surbIdHex = parseSurbIdFromPacketId(item.id);
-      if (surbIdHex !== null) {
-        match = this.surbPool.decryptById(wasm, surbIdHex, encryptedBody);
-      }
-
-      if (match === null) {
-        match = this.surbPool.matchAndDecrypt(wasm, encryptedBody);
-      }
-
-      if (match === null) {
-        if (this._debugPoll) {
-          this._debug(
-            `[poll] matchAndDecrypt returned null for item id=${item.id} data_len=${encryptedBody.length}`,
-          );
-        }
-        continue;
-      }
-      const { requestId, plaintext } = match;
-
-      if (this._debugPoll) {
-        this._debug(
-          `[poll] decrypted item id=${item.id} -> requestId=${requestId} plaintext_len=${plaintext.length}`,
-        );
-      }
-
-      let decoded: ReturnType<typeof decodeRelayerPayload>;
-      try {
-        decoded = decodeRelayerPayload(plaintext);
-      } catch (decodeErr) {
-        if (this._debugPoll) {
-          this._debug(
-            `[poll] decodeRelayerPayload failed: ${String(decodeErr).slice(0, 120)}`,
-          );
-        }
-        continue;
-      }
-
-      if (this._debugPoll) {
-        this._debug(`[poll] decoded tag=${decoded.tag}`);
-      }
-
-      if (decoded.tag === "ServiceResponse") {
-        this._handleFragment(requestId, decoded.fragment);
-      } else if (decoded.tag === "NeedMoreSurbs") {
-        void this._handleNeedMoreSurbs(
-          requestId,
-          decoded.requestId,
-          decoded.fragmentsRemaining,
-        );
-      }
-    }
+    for (const item of items) this._handleResponseItem(item);
 
     this._checkBurstStalls();
   }
@@ -1174,7 +1318,7 @@ export class NoxClient {
         powDifficulty: this._config.powDifficulty,
         fetch: this.fetch,
       });
-      this._wsSubscribe(this.surbPool.activeSurbIds());
+      this._wsSubscribe(this._pinnedEntrySurbIds());
     } catch (err) {
       this.burstState.delete(clientRequestId);
       if (this._debugPoll) {
@@ -1338,7 +1482,7 @@ export class NoxClient {
           this._onWsResponse(item);
         }, this._webSocketImpl ?? undefined);
         this.subscribedSurbIds.clear();
-        this._wsSubscribe(this.surbPool.activeSurbIds());
+        this._wsSubscribe(this._pinnedEntrySurbIds());
       }
     }
   }
@@ -1522,7 +1666,17 @@ function resolveSettings(config: NoxClientConfig): NoxClientSettings {
       config.dangerouslySkipFingerprintCheck ?? DEFAULTS.dangerouslySkipFingerprintCheck,
     fecRatio: config.fecRatio ?? DEFAULTS.fecRatio,
     retryOnTimeout: config.retryOnTimeout ?? DEFAULTS.retryOnTimeout,
+    surbFormat: resolveSurbFormat(config.surbFormat),
   };
+}
+
+function resolveSurbFormat(value: unknown): SurbFormat {
+  if (value === undefined) return DEFAULTS.surbFormat;
+  if (value === "auto" || value === "v1" || value === "v2") return value;
+  throw new NoxClientError(
+    `surbFormat must be "auto", "v1" or "v2"`,
+    NoxClientErrorCode.InvalidConfig,
+  );
 }
 
 function resolveTransport(config: NoxClientConfig): {

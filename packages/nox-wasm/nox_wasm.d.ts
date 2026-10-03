@@ -41,7 +41,10 @@ export class JsSurbRecovery {
   free(): void;
   static from_json(json: string): JsSurbRecovery;
   to_json(): string;
+  /** SURB ID (format 1) or delivery ID (format 2). */
   readonly id_hex: string;
+  /** Reply format: 1, or 2 when replies carry a reply tag. */
+  readonly version: number;
 }
 
 /**
@@ -67,6 +70,16 @@ export function count_leading_zero_bits(hash: Uint8Array): number;
 export function create_surb(
   path: JsPathHop[],
   id_hex: string,
+  pow_difficulty: number,
+): JsSurbCreateResult;
+
+/**
+ * Create a format 2 Single-Use Reply Block. The recovery's `id_hex` is the
+ * delivery ID the final hop derives; claim replies with it. Replies carry a
+ * reply tag that `decrypt_surb_response` checks.
+ */
+export function create_surb_v2(
+  path: JsPathHop[],
   pow_difficulty: number,
 ): JsSurbCreateResult;
 

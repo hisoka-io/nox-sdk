@@ -1,4 +1,4 @@
-import { NoxClientError, NoxClientErrorCode } from "./types.js";
+import { NoxClientError, NoxClientErrorCode, SURB_V2_CAPABILITY } from "./types.js";
 import type {
   NoxFetch,
   TopologySnapshot,
@@ -758,6 +758,30 @@ export function selectRoute(
   }
 
   return { entry, mix, exit };
+}
+
+/** True when the seed reports that this node handles format v2 reply blocks. */
+export function supportsSurbV2(node: TopologyNode): boolean {
+  return node.capabilities?.includes(SURB_V2_CAPABILITY) === true;
+}
+
+/**
+ * Longest routing address a v2 reply block can carry for a hop after the
+ * first (the reply flag sits after the address in the same 128-byte segment).
+ */
+export const MAX_SURB_V2_ADDRESS_BYTES = 93;
+
+/**
+ * True only when every hop of the route advertises `surb_v2` and the entry's
+ * routing address fits in a v2 reply block (the reply path is mix, entry).
+ */
+export function routeSupportsSurbV2(route: Route): boolean {
+  return (
+    supportsSurbV2(route.entry) &&
+    supportsSurbV2(route.mix) &&
+    supportsSurbV2(route.exit) &&
+    new TextEncoder().encode(route.entry.routingAddress).length <= MAX_SURB_V2_ADDRESS_BYTES
+  );
 }
 
 export function hasUsableIngress(value: string): boolean {

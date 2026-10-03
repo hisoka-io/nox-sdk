@@ -15,6 +15,7 @@ import {
   USABLE_RESPONSE_PER_SURB,
 } from "../src/client.js";
 import { NoxClientError, NoxClientErrorCode } from "../src/types.js";
+import { SurbPool } from "../src/surb_pool.js";
 import { computeTopologyFingerprint } from "../src/topology.js";
 import { parseNodes } from "../src/topology.js";
 import { Interface } from "ethers";
@@ -784,8 +785,8 @@ describe("retry on a different route", () => {
     Reflect.set(client, "nextRequestId", 0n);
     const routes: Route[] = [];
     const outcomes: (Uint8Array | Error)[] = [];
-    Reflect.set(client, "_sendOnRoute", async (_p: unknown, _s: number, _t: unknown, route: Route) => {
-      routes.push(route);
+    Reflect.set(client, "_sendOnRoute", async (_p: unknown, _s: number, _t: unknown, planned: { route: Route }) => {
+      routes.push(planned.route);
       const next = outcomes.shift() ?? new Uint8Array([1]);
       if (next instanceof Error) throw next;
       return next;
@@ -881,6 +882,209 @@ describe("retry on a different route", () => {
     expect(routes[0]!.exit.id).toBe("0x04");
     expect(routes[1]!.exit.id).toBe("0x05");
     expect(result.exit.id).toBe("0x05");
+  });
+});
+
+// ── Reply block format v2 ──────────────────────────────────────────────────
+
+describe("reply block format selection", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const V2 = ["surb_v2"] as const;
+
+  function formatClient(opts: {
+    surbFormat?: "auto" | "v1" | "v2";
+    capable: string[];
+    wasmV2?: boolean;
+  }): { client: NoxClient; sent: { route: Route; version: number }[]; outcomes: (Uint8Array | Error)[] } {
+    const base: TopologyNode[] = [
+      { id: "0x01", address: "https://entry-a.test", routingAddress: "/ea", publicKey: new Uint8Array(32), layer: 0, role: 1 },
+      { id: "0x06", address: "https://entry-b.test", routingAddress: "/eb", publicKey: new Uint8Array(32), layer: 0, role: 1 },
+      { id: "0x02", address: "", routingAddress: "/m1", publicKey: new Uint8Array(32), layer: 1, role: 1 },
+      { id: "0x03", address: "", routingAddress: "/m2", publicKey: new Uint8Array(32), layer: 1, role: 1 },
+      { id: "0x04", address: "", routingAddress: "/x1", publicKey: new Uint8Array(32), layer: 2, role: 2 },
+      { id: "0x05", address: "", routingAddress: "/x2", publicKey: new Uint8Array(32), layer: 2, role: 2 },
+    ];
+    const nodes = base.map((node) =>
+      opts.capable.includes(node.id) ? { ...node, capabilities: V2 } : node,
+    );
+    const client = Object.create(NoxClient.prototype) as NoxClient;
+    Reflect.set(client, "_nodes", nodes);
+    Reflect.set(client, "_entryUrl", "https://entry-a.test");
+    Reflect.set(client, "_wasm", opts.wasmV2 === false ? {} : { create_surb_v2: () => undefined });
+    Reflect.set(client, "_avoidUntil", new Map());
+    Reflect.set(client, "_config", {
+      retryOnTimeout: true,
+      surbsPerRequest: 2,
+      fecRatio: 0,
+      surbFormat: opts.surbFormat ?? "auto",
+    });
+    Reflect.set(client, "adaptive", new AdaptiveSurbBudget());
+    Reflect.set(client, "nextRequestId", 0n);
+    const sent: { route: Route; version: number }[] = [];
+    const outcomes: (Uint8Array | Error)[] = [];
+    Reflect.set(
+      client,
+      "_sendOnRoute",
+      async (_p: unknown, _s: number, _t: unknown, planned: { route: Route; version: number }) => {
+        sent.push(planned);
+        const next = outcomes.shift() ?? new Uint8Array([1]);
+        if (next instanceof Error) throw next;
+        return next;
+      },
+    );
+    return { client, sent, outcomes };
+  }
+
+  const timeout = () =>
+    new NoxClientError("timed out", NoxClientErrorCode.ResponseTimeout);
+  const ALL = ["0x01", "0x06", "0x02", "0x03", "0x04", "0x05"];
+
+  it("auto uses v2 when every hop advertises surb_v2", async () => {
+    const { client, sent } = formatClient({ capable: ALL });
+    await client.sendEcho(new Uint8Array([1]));
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.version).toBe(2);
+    expect(sent[0]!.route.entry.id).toBe("0x01");
+  });
+
+  it("auto uses v1 when any hop lacks surb_v2", async () => {
+    // Pinned entry, every node that can mix, or both exits without the capability.
+    for (const missing of [["0x01"], ["0x02", "0x03", "0x06"], ["0x04", "0x05"]]) {
+      const capable = ALL.filter((id) => !missing.includes(id));
+      const { client, sent } = formatClient({ capable });
+      await client.sendEcho(new Uint8Array([1]));
+      expect(sent[0]!.version).toBe(1);
+    }
+  });
+
+  it("auto uses v1 with a seed that publishes no capabilities", async () => {
+    const { client, sent } = formatClient({ capable: [] });
+    await client.sendEcho(new Uint8Array([1]));
+    expect(sent[0]!.version).toBe(1);
+  });
+
+  it("auto uses v1 when the WASM module cannot build v2 reply blocks", async () => {
+    const { client, sent } = formatClient({ capable: ALL, wasmV2: false });
+    await client.sendEcho(new Uint8Array([1]));
+    expect(sent[0]!.version).toBe(1);
+  });
+
+  it("v1 mode never uses v2", async () => {
+    const { client, sent } = formatClient({ surbFormat: "v1", capable: ALL });
+    await client.sendEcho(new Uint8Array([1]));
+    expect(sent[0]!.version).toBe(1);
+  });
+
+  it("v2 mode fails fast when no route is fully capable", async () => {
+    const { client, sent } = formatClient({ surbFormat: "v2", capable: ["0x01", "0x06", "0x02", "0x03"] });
+    await expect(client.sendEcho(new Uint8Array([1]))).rejects.toMatchObject({
+      code: NoxClientErrorCode.SurbV2Unavailable,
+    });
+    expect(sent).toHaveLength(0);
+  });
+
+  it("v2 mode uses another capable entry when the pinned one is not", async () => {
+    const { client, sent } = formatClient({ surbFormat: "v2", capable: ["0x06", "0x02", "0x04"] });
+    await client.sendEcho(new Uint8Array([1]));
+    expect(sent[0]!.version).toBe(2);
+    expect(sent[0]!.route.entry.id).toBe("0x06");
+    expect(sent[0]!.route.mix.id).toBe("0x02");
+    expect(sent[0]!.route.exit.id).toBe("0x04");
+  });
+
+  it("resends a timed-out v2 request with v2 through a different entry", async () => {
+    const { client, sent, outcomes } = formatClient({ capable: ALL });
+    outcomes.push(timeout(), new Uint8Array([7]));
+    await expect(client.sendEcho(new Uint8Array([7]))).resolves.toEqual(new Uint8Array([7]));
+    expect(sent).toHaveLength(2);
+    expect(sent.map((s) => s.version)).toEqual([2, 2]);
+    expect(sent[1]!.route.entry.id).not.toBe(sent[0]!.route.entry.id);
+  });
+
+  it("never resends a timed-out v2 request as v1, even through another entry", async () => {
+    // entry-b exists but does not advertise surb_v2. Strict mode makes the
+    // first route v2 deterministically; auto takes the same retry path.
+    const { client, sent, outcomes } = formatClient({
+      surbFormat: "v2",
+      capable: ["0x01", "0x02", "0x03", "0x04", "0x05"],
+    });
+    outcomes.push(timeout());
+    await expect(client.sendEcho(new Uint8Array([1]))).rejects.toMatchObject({
+      code: NoxClientErrorCode.ResponseTimeout,
+    });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.version).toBe(2);
+  });
+
+  it("keeps the 0.3.0 resend for v1 requests (same entry, other mix and exit)", async () => {
+    const { client, sent, outcomes } = formatClient({ capable: [] });
+    outcomes.push(timeout(), new Uint8Array([3]));
+    await client.sendEcho(new Uint8Array([3]));
+    expect(sent.map((s) => s.version)).toEqual([1, 1]);
+    expect(sent[1]!.route.entry.id).toBe(sent[0]!.route.entry.id);
+    expect(sent[1]!.route.mix.id).not.toBe(sent[0]!.route.mix.id);
+  });
+
+  it("sends RPC requests with a random JSON-RPC id", async () => {
+    const { client } = formatClient({ capable: [] });
+    const inners: Uint8Array[] = [];
+    Reflect.set(client, "_sendAnonymous", async (inner: Uint8Array) => {
+      inners.push(inner);
+      throw new NoxClientError("stop", NoxClientErrorCode.TransportFailed);
+    });
+    await expect(client.rpcCall("eth_chainId", [])).rejects.toThrow("stop");
+    await expect(client.rpcCall("eth_chainId", [])).rejects.toThrow("stop");
+    expect(inners).toHaveLength(2);
+    expect(Buffer.from(inners[0]!).equals(Buffer.from(inners[1]!))).toBe(false);
+  });
+});
+
+describe("replies through a non-pinned entry", () => {
+  it("claims them from that entry only and keeps their IDs from the pinned entry", async () => {
+    const client = Object.create(NoxClient.prototype) as NoxClient;
+    const pool = new SurbPool();
+    pool.registry.set("aa".repeat(16), { requestId: 1n, recoveryJson: "{}", version: 1 });
+    pool.registry.set("bb".repeat(16), { requestId: 2n, recoveryJson: "{}", version: 2 });
+    Reflect.set(client, "surbPool", pool);
+    Reflect.set(client, "_auxEntries", new Map());
+    Reflect.set(client, "pending", new Map([[1n, {}], [2n, {}]]));
+    Reflect.set(client, "_wasm", null);
+    const urls: string[] = [];
+    const bodies: string[] = [];
+    Reflect.set(client, "_fetchImpl", async (url: string, init?: RequestInit) => {
+      urls.push(url);
+      bodies.push(String(init?.body));
+      return new Response(JSON.stringify([]), { status: 200 });
+    });
+
+    const watch = Reflect.get(client, "_watchAuxEntry") as (u: string, r: bigint) => void;
+    watch.call(client, "https://entry-b.test", 2n);
+    try {
+      const pinnedIds = (Reflect.get(client, "_pinnedEntrySurbIds") as () => string[]).call(client);
+      expect(pinnedIds).toEqual(["aa".repeat(16)]);
+
+      await (Reflect.get(client, "_pollAuxEntry") as (u: string) => Promise<void>).call(
+        client,
+        "https://entry-b.test",
+      );
+      expect(urls).toEqual(["https://entry-b.test/api/v1/responses/claim"]);
+      expect(JSON.parse(bodies[0]!)).toEqual({ surb_ids: ["bb".repeat(16)] });
+
+      // Settled requests stop the watcher.
+      (Reflect.get(client, "pending") as Map<bigint, unknown>).delete(2n);
+      await (Reflect.get(client, "_pollAuxEntry") as (u: string) => Promise<void>).call(
+        client,
+        "https://entry-b.test",
+      );
+      expect((Reflect.get(client, "_auxEntries") as Map<string, unknown>).size).toBe(0);
+    } finally {
+      for (const { timer } of (Reflect.get(client, "_auxEntries") as Map<string, { timer: ReturnType<typeof setInterval> }>).values()) {
+        clearInterval(timer);
+      }
+    }
   });
 });
 

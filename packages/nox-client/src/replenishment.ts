@@ -6,19 +6,41 @@ import {
 } from "./bincode.js";
 import { postPacket } from "./transport.js";
 import type { NoxFetch } from "./types.js";
-import type { SurbPool } from "./surb_pool.js";
+import type { SurbPool, SurbVersion } from "./surb_pool.js";
 import { buildSphinxPacket } from "./utils.js";
 
 /** Stores forward paths and drives SURB replenishment on demand. */
 export class ReplenishmentManager {
   readonly paths = new Map<bigint, PathHop[]>();
+  /** Entry the request went through; replenishment goes through the same one. */
+  private readonly entries = new Map<bigint, string>();
+  /** Replenishment SURBs use the format of the request they top up. */
+  private readonly versions = new Map<bigint, SurbVersion>();
 
-  stashPath(requestId: bigint, path: PathHop[]): void {
+  stashPath(
+    requestId: bigint,
+    path: PathHop[],
+    route?: { entryUrl: string; version: SurbVersion },
+  ): void {
     this.paths.set(requestId, path);
+    if (route !== undefined) {
+      this.entries.set(requestId, route.entryUrl);
+      this.versions.set(requestId, route.version);
+    }
   }
 
   clearPath(requestId: bigint): void {
     this.paths.delete(requestId);
+    this.entries.delete(requestId);
+    this.versions.delete(requestId);
+  }
+
+  entryFor(requestId: bigint): string | undefined {
+    return this.entries.get(requestId);
+  }
+
+  versionFor(requestId: bigint): SurbVersion {
+    return this.versions.get(requestId) ?? 1;
   }
 
   hasPendingPath(requestId: bigint): boolean {
@@ -57,6 +79,7 @@ export class ReplenishmentManager {
     }
 
     const returnPath = buildReturnPath(forwardPath);
+    const targetEntry = this.entries.get(clientRequestId) ?? entryUrl;
 
     const MAX_SURBS_PER_PACKET = 40; // ~700 bytes/SURB, ~31KB max payload
     const surbCount = Math.min(
@@ -70,6 +93,7 @@ export class ReplenishmentManager {
       returnPath,
       clientRequestId,
       surbCount,
+      this.versionFor(clientRequestId),
     );
 
     const innerBytes = encodeServiceRequest({
@@ -85,7 +109,7 @@ export class ReplenishmentManager {
     });
 
     const packet = buildSphinxPacket(wasm, forwardPath, payloadBytes, powDifficulty);
-    await postPacket(entryUrl, packet, undefined, opts.fetch);
+    await postPacket(targetEntry, packet, undefined, opts.fetch);
   }
 
   /** Send multiple ReplenishSurbs packets in a burst to cover all remaining fragments. */
@@ -120,6 +144,8 @@ export class ReplenishmentManager {
     }
 
     const returnPath = buildReturnPath(forwardPath);
+    const targetEntry = this.entries.get(clientRequestId) ?? entryUrl;
+    const version = this.versionFor(clientRequestId);
 
     const BATCH_SIZE = 5;
     const BATCH_DELAY_MS = 200;
@@ -132,6 +158,7 @@ export class ReplenishmentManager {
         returnPath,
         clientRequestId,
         surbsPerPacket,
+        version,
       );
 
       const innerBytes = encodeServiceRequest({
@@ -154,7 +181,7 @@ export class ReplenishmentManager {
     for (let start = 0; start < packets.length; start += BATCH_SIZE) {
       const batch = packets.slice(start, start + BATCH_SIZE);
       await Promise.all(
-        batch.map((pkt) => postPacket(entryUrl, pkt, undefined, opts.fetch)),
+        batch.map((pkt) => postPacket(targetEntry, pkt, undefined, opts.fetch)),
       );
 
       if (start + BATCH_SIZE < packets.length) {

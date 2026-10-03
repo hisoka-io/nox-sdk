@@ -30,6 +30,16 @@ export function getCrypto(): Crypto {
   );
 }
 
+/** Uniform non-zero 64-bit value from the platform CSPRNG. */
+export function secureRandomU64(): bigint {
+  const words = new Uint32Array(2);
+  for (;;) {
+    getCrypto().getRandomValues(words);
+    const value = (BigInt(words[0]!) << 32n) | BigInt(words[1]!);
+    if (value !== 0n) return value;
+  }
+}
+
 export type RandomFill = (target: Uint32Array) => Uint32Array;
 
 export function secureRandomIndex(

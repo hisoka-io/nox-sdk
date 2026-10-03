@@ -30,6 +30,18 @@ export interface TopologyLiveness {
 /** Capability an exit must advertise before it is chosen for paid execution. */
 export const PAID_V2_CAPABILITY = "paid_v2";
 
+/** Capability a node advertises when it handles format v2 reply blocks. */
+export const SURB_V2_CAPABILITY = "surb_v2";
+
+/**
+ * Reply block format:
+ * - "auto": v2 when every hop of the chosen route advertises `surb_v2`, v1 otherwise;
+ * - "v1": always v1 (the 0.3.0 behaviour);
+ * - "v2": only routes on which every hop advertises `surb_v2`; fails with
+ *   `SurbV2Unavailable` when there is none.
+ */
+export type SurbFormat = "auto" | "v1" | "v2";
+
 export interface TopologySnapshot {
   nodes: RelayerNode[];
   fingerprint: string;
@@ -113,6 +125,8 @@ export interface NoxClientConfig {
    * returned at once and does not affect later route choice. Default: true.
    */
   retryOnTimeout?: boolean;
+  /** Reply block format. Default: "auto". See `SurbFormat`. */
+  surbFormat?: SurbFormat;
   /** Network primitives. Defaults to the runtime's global `fetch` and `WebSocket`. */
   transport?: NoxTransport;
 }
@@ -145,6 +159,7 @@ export const DEFAULTS: NoxClientSettings = {
   dangerouslySkipFingerprintCheck: false,
   fecRatio: 0.3,
   retryOnTimeout: true,
+  surbFormat: "auto",
 };
 
 export class NoxClientError extends Error {
@@ -172,4 +187,6 @@ export enum NoxClientErrorCode {
   InvalidConfig = "INVALID_CONFIG",
   /** No exit in the verified topology advertises paid execution support. */
   PaidExitUnavailable = "PAID_EXIT_UNAVAILABLE",
+  /** `surbFormat: "v2"` and no route on which every hop advertises `surb_v2`. */
+  SurbV2Unavailable = "SURB_V2_UNAVAILABLE",
 }

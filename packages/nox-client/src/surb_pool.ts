@@ -1,9 +1,25 @@
 import type { PathHop } from "./types.js";
+import { NoxClientError, NoxClientErrorCode } from "./types.js";
 import { getCrypto } from "./utils.js";
+
+/** 1: reply block keyed by a client-chosen ID. 2: keyed by the delivery ID, reply MAC checked. */
+export type SurbVersion = 1 | 2;
 
 export interface SurbEntry {
   requestId: bigint;
   recoveryJson: string;
+  /** Absent in entries created before 0.4.0; treated as 1. */
+  version?: SurbVersion;
+}
+
+interface CreateResult {
+  surb_bytes: Uint8Array;
+  recovery: { to_json(): string; id_hex: string };
+}
+
+/** True when the loaded WASM module can build format v2 reply blocks. */
+export function wasmSupportsSurbV2(wasm: Record<string, unknown> | null): boolean {
+  return wasm !== null && typeof wasm["create_surb_v2"] === "function";
 }
 
 /** SURB pre-generation and response decryption. SURBs are single-use and consumed on match. */
@@ -14,12 +30,26 @@ export class SurbPool {
     return [...this.registry.keys()];
   }
 
-  /** Pre-generate `count` SURBs for the return path and register their recoveries. */
+  /** SURB IDs registered for one request. */
+  idsForRequest(requestId: bigint): string[] {
+    const ids: string[] = [];
+    for (const [idHex, entry] of this.registry) {
+      if (entry.requestId === requestId) ids.push(idHex);
+    }
+    return ids;
+  }
+
+  /**
+   * Pre-generate `count` SURBs for the return path and register their recoveries.
+   * Version 2 SURBs are registered under their delivery ID, which the WASM
+   * module derives; it is never sent anywhere.
+   */
   generate(
     wasm: Record<string, unknown>,
     returnPath: PathHop[],
     requestId: bigint,
     count: number,
+    version: SurbVersion = 1,
   ): Uint8Array[] {
     const JsPathHop = wasm["JsPathHop"] as new (
       pubKeyHex: string,
@@ -29,20 +59,33 @@ export class SurbPool {
       path: unknown[],
       idHex: string,
       pow: number,
-    ) => { surb_bytes: Uint8Array; recovery: { to_json(): string } };
+    ) => CreateResult;
+    const createSurbV2 = wasm["create_surb_v2"] as
+      | ((path: unknown[], pow: number) => CreateResult)
+      | undefined;
+    if (version === 2 && typeof createSurbV2 !== "function") {
+      throw new NoxClientError(
+        "The loaded WASM module cannot build format v2 reply blocks",
+        NoxClientErrorCode.SurbV2Unavailable,
+      );
+    }
 
     const surbBlobs: Uint8Array[] = [];
 
     for (let i = 0; i < count; i++) {
-      const idHex = randomIdHex();
       const wasmPath = returnPath.map(
         (hop) => new JsPathHop(hop.pubKeyHex, hop.address),
       );
-      const result = createSurb(wasmPath, idHex, 0);
+      const v1Id = version === 2 ? null : randomIdHex();
+      const result = v1Id === null
+        ? createSurbV2!(wasmPath, 0)
+        : createSurb(wasmPath, v1Id, 0);
       // Must read surb_bytes before recovery - recovery getter consumes the wasm object
       const surbBytes = result.surb_bytes;
-      const recoveryJson = result.recovery.to_json();
-      this.registry.set(idHex, { requestId, recoveryJson });
+      const recovery = result.recovery;
+      const idHex = v1Id ?? recovery.id_hex;
+      const recoveryJson = recovery.to_json();
+      this.registry.set(idHex, { requestId, recoveryJson, version });
       surbBlobs.push(surbBytes);
     }
 
@@ -93,6 +136,8 @@ export class SurbPool {
     ) => Uint8Array;
 
     for (const [idHex, entry] of this.registry) {
+      // Version 2 replies are only ever matched by delivery ID.
+      if (entry.version === 2) continue;
       try {
         const recovery = fromJson(entry.recoveryJson);
         const plaintext = decryptFn(recovery, encryptedBody);
