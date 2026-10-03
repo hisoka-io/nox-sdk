@@ -294,6 +294,7 @@ describe("paid route freshness", () => {
       fingerprint: computeTopologyFingerprint(makeMinimalTopology()),
     }));
     Reflect.set(client, "_topologyVerifiedAtMs", verifiedAtMs);
+    Reflect.set(client, "_seedUrl", "https://seed.test");
     Reflect.set(client, "_config", {
       ...DEFAULTS_FOR_TEST,
       topologyRefreshMs: 60_000,
@@ -349,11 +350,9 @@ describe("paid route freshness", () => {
       }
       return { ok: true, status: 200 };
     });
-    const refresh = Reflect.get(client, "_refreshTopology") as (
-      seed: string,
-    ) => Promise<void>;
+    const refresh = Reflect.get(client, "_refreshTopology") as () => Promise<void>;
 
-    await refresh.call(client, "https://seed.test");
+    await refresh.call(client);
 
     expect(topologyFetches).toBe(1);
     // Node-served topology fallbacks are bounded too.
@@ -674,7 +673,16 @@ describe("seed fallback and transport injection", () => {
     }
   });
 
-  it("refreshes from a verified node's topology when every seed is down", async () => {
+  /** v2 snapshot that reports the members at `offline` as offline. */
+  function withOffline(nodes: TestNode[], offline: number[], extra: Record<string, unknown> = {}) {
+    const snapshot = liveV2(nodes, extra);
+    snapshot.liveness = snapshot.liveness.map((entry, index) =>
+      offline.includes(index) ? { ...entry, status: "offline" } : entry
+    );
+    return snapshot;
+  }
+
+  async function nodeFallbackClient() {
     const nodes = await canonical(verifiedNodes());
     const topologies: Record<string, unknown> = { "https://seed.test": liveV2(nodes) };
     const fetchMock = mockNetwork(topologies, nodes);
@@ -682,17 +690,69 @@ describe("seed fallback and transport injection", () => {
     const client = await NoxClient.connect({
       ...VERIFY, seeds: ["https://seed.test"], transport: { WebSocket: null },
     });
-    try {
+    const refresh = Reflect.get(client, "_refreshTopology") as () => Promise<void>;
+    const seedDown = (nodeSnapshot: unknown) => {
       delete topologies["https://seed.test"];
       for (const node of nodes) {
-        if (node.ingress_url) topologies[node.ingress_url] = liveV2(nodes);
+        if (node.ingress_url) topologies[node.ingress_url] = nodeSnapshot;
       }
+    };
+    return {
+      nodes, topologies, fetchMock, client,
+      refresh: () => refresh.call(client),
+      seedDown,
+    };
+  }
+
+  it("uses a verified node only to confirm membership when every seed is down", async () => {
+    const { nodes, client, refresh, seedDown } = await nodeFallbackClient();
+    try {
+      // The node claims every other member is offline.
+      seedDown(withOffline(nodes, [1, 2, 3]));
       Reflect.set(client, "_topologyVerifiedAtMs", 1);
-      const refresh = Reflect.get(client, "_refreshTopology") as () => Promise<void>;
-      await refresh.call(client);
+      await refresh();
       expect(client.topologyRefreshError).toBeNull();
       expect(Reflect.get(client, "_topologyVerifiedAtMs")).toBeGreaterThan(1);
-      expect(nodes.map((n) => n.ingress_url)).toContain(Reflect.get(client, "_seedUrl"));
+      // Liveness stays as the seed last reported; the seed stays the source.
+      expect(client.nodes.map((n) => n.id)).toEqual(
+        nodes.map((n) => n.address.toLowerCase()),
+      );
+      expect(Reflect.get(client, "_seedUrl")).toBe("https://seed.test");
+    } finally {
+      client.disconnect();
+    }
+  });
+
+  it("goes back to the seed on the next refresh after a node fallback", async () => {
+    const { nodes, topologies, fetchMock, client, refresh, seedDown } = await nodeFallbackClient();
+    try {
+      seedDown(liveV2(nodes));
+      await refresh();
+      expect(client.topologyRefreshError).toBeNull();
+
+      topologies["https://seed.test"] = withOffline(nodes, [3]);
+      fetchMock.mockClear();
+      await refresh();
+      const topologyFetches = fetchMock.mock.calls
+        .map(([url]) => String(url))
+        .filter((url) => url.endsWith("/topology"));
+      expect(topologyFetches).toEqual(["https://seed.test/topology"]);
+      expect(client.nodes).toHaveLength(3);
+    } finally {
+      client.disconnect();
+    }
+  });
+
+  it("rejects a node snapshot pinned before the last seed block", async () => {
+    const { nodes, client, refresh, seedDown } = await nodeFallbackClient();
+    try {
+      seedDown(liveV2(nodes, { block_number: 4_000 }));
+      Reflect.set(client, "_topologyVerifiedAtMs", 1);
+      await refresh();
+      expect(client.topologyRefreshError).toMatchObject({
+        code: NoxClientErrorCode.TopologyFetchFailed,
+      });
+      expect(Reflect.get(client, "_topologyVerifiedAtMs")).toBe(1);
     } finally {
       client.disconnect();
     }
@@ -783,6 +843,7 @@ describe("retry on a different route", () => {
       code: NoxClientErrorCode.ResponseTimeout,
     });
     expect(routes).toHaveLength(1);
+    expect((Reflect.get(client, "_avoidUntil") as Map<string, number>).size).toBe(0);
   });
 
   it("only resends GET-like HTTP requests", async () => {

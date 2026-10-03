@@ -108,7 +108,9 @@ export interface NoxClientConfig {
   fecRatio?: number;
   /**
    * Retry an idempotent request once on a different route after a response
-   * timeout, and avoid the hops of the failed route for a while. Default: true.
+   * timeout, and avoid the hops of the failed route for a while. A retried
+   * call can take up to about twice `timeoutMs`. When false, a timeout is
+   * returned at once and does not affect later route choice. Default: true.
    */
   retryOnTimeout?: boolean;
   /** Network primitives. Defaults to the runtime's global `fetch` and `WebSocket`. */
