@@ -114,7 +114,8 @@ test.describe("reference harness with the upstream passthrough worker", () => {
   }) => {
     const bundle = passthroughBundle(cfg.e2eRoot);
     const tampered = new TextEncoder().encode(`//tampered\n${new TextDecoder().decode(bundle)}`);
-    // Pin the real hash, but let the resolver serve tampered bytes under it.
+    // Pin a hash that no real bytes have, and let the resolver serve tampered
+    // bytes under it: the harness must refuse whatever the resolver returns.
     const fakeHash = keccakHex(new TextEncoder().encode("hash with no bytes behind it"));
     resolver.store.putMismatched(fakeHash, tampered);
     const address = await deploySpecifier(chains.specifier.url, chains.specifier.account, {

@@ -61,7 +61,12 @@ export async function loadClassicSdk(entry: string): Promise<ClassicSdk> {
   return module as ClassicSdk;
 }
 
-/** A local mesh publishes an all-zero topology fingerprint (no registry behind it). */
+/**
+ * True for an all-zero topology fingerprint, which a mesh without a registry
+ * behind it may publish. Current `nox_mesh_server` builds publish the real
+ * fingerprint of their members, so callers verify self-consistency whenever
+ * this is false.
+ */
 export function isZeroFingerprint(fingerprint: string): boolean {
   return /^(?:0x)?0+$/u.test(fingerprint);
 }

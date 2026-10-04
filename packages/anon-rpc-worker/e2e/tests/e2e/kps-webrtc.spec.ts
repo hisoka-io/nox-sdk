@@ -49,6 +49,15 @@ const SERVER_PLANS: readonly ServerPlan[] = [
 const SEQUENTIAL_STREAMS = 10;
 const PARALLEL_STREAMS = 4;
 const DIAL_ATTEMPTS = 3;
+/**
+ * Symptom of the loopback finding: the browser's dial never completes. The KPS
+ * client reports its HELLO deadline or the page's dial deadline, whichever
+ * fires first.
+ */
+const HELLO_TIMEOUT = /kps: (?:HELLO timeout|dial timed out)/u;
+/** Symptom of the window finding: the echo waits past its deadline (shared/kps-probe.ts). */
+const ECHO_STALL = /^echo did not finish within \d+ ms$/u;
+
 /** The KPS client's own HELLO deadline is 15 s; a dial cannot take longer. */
 const DIAL_TIMEOUT_MS = 15_000;
 const STREAM_TIMEOUT_MS = 30_000;
@@ -124,12 +133,10 @@ test.describe("browser WebRTC-KPS against reference KPS servers", () => {
         );
         // The stock kps crate pins WebRTC ICE gathering to interfaces named lo*
         // and expects one candidate per family; a second IPv4 on lo (WSL2 adds
-        // 10.255.255.254) breaks ICE convergence. See README "Findings".
+        // 10.255.255.254) breaks ICE convergence. See README "Findings". The
+        // test is marked as an expected failure only after the run shows that
+        // exact symptom, so any other failure stays unexpected.
         const knownIssue = kind === "rust" && loopbacks.length > 1;
-        test.fail(
-          knownIssue,
-          `stock kps crate on a host whose loopback carries ${loopbacks.join(", ")}: ICE does not converge`,
-        );
 
         const server = await startEchoServer({
           kind,
@@ -228,6 +235,13 @@ test.describe("browser WebRTC-KPS against reference KPS servers", () => {
             record,
           });
 
+          if (knownIssue) {
+            const failures = attempts.filter((attempt) => !attempt.ok).map(failureText);
+            for (const failure of failures) expect(failure, "the pinned symptom of the loopback finding").toMatch(HELLO_TIMEOUT);
+            // With the symptom confirmed (or gone: then the test passes and is
+            // reported as "expected to fail, but passed", flipping the finding).
+            test.fail(true, `stock kps crate on a host whose loopback carries ${loopbacks.join(", ")}: ICE does not converge`);
+          }
           for (const attempt of attempts) expect(attempt.ok, failureText(attempt)).toBe(true);
           for (const probe of harness) {
             expect(probe.status, probe.error).toBe(200);
@@ -251,8 +265,10 @@ test.describe("browser WebRTC-KPS against reference KPS servers", () => {
     const bin = echoServerBinary(cfg.kps.binDir, "go");
     test.skip(!existsSync(bin), `${bin} is missing: run scripts/build-kps-servers.sh`);
     // Expected to fail until the cause is found and fixed upstream: the test
-    // turns red ("expected to fail, but passed") the day the stall is gone.
-    test.fail(true, "single-stream echo at the 1 MiB stream window does not complete");
+    // turns red ("expected to fail, but passed") the day the stall is gone. It
+    // is marked as expected only after the control echo passed and the 1 MiB
+    // echo failed with the pinned symptom, so a server that does not start, a
+    // page that does not load or another error stays an unexpected failure.
     const server = await startEchoServer({
       kind: "go",
       binDir: cfg.kps.binDir,
@@ -274,6 +290,11 @@ test.describe("browser WebRTC-KPS against reference KPS servers", () => {
       });
       writeReport(cfg, runPaths, `kps-echo-window-${testInfo.project.name}`, { samples: result.samples });
       expect(result.samples[0]?.ok, "echo just below the window must pass").toBe(true);
+      const atWindow = result.samples[1];
+      if (atWindow !== undefined && !atWindow.ok) {
+        expect(atWindow.error ?? "", "the pinned symptom of the window finding").toMatch(ECHO_STALL);
+      }
+      test.fail(true, "single-stream echo at the 1 MiB stream window does not complete");
       expect(result.ok, failureText(result)).toBe(true);
     } finally {
       await server.stop();

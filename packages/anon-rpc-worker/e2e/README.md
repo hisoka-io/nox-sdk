@@ -127,24 +127,28 @@ Every port, path, timeout and size comes from `src/config.ts`; each default can 
 
 | Server | Dials | Echo 32 B / 32 KiB / 512 KiB | Response 1 / 4 / 16 MiB |
 |---|---|---|---|
-| Go reference (`libs/go/cmd/server`) | 16/16, 57-71 ms | 2 / 4-17 / 27-38 ms | — |
+| Go reference (`libs/go/cmd/server`) | 16/16, 57-80 ms | 2 / 4-17 / 27-89 ms | — |
 | Rust reference + loopback IP filter | 16/16, 61-89 ms | 2-3 / 7-10 / 71-190 ms | — |
-| Go bulk server (`tools/kps-bulk-server`) | 16/16, 55-77 ms | — | 24-92 / 88-234 / 365-729 ms |
+| Go bulk server (`tools/kps-bulk-server`) | 16/16, 55-77 ms | — | 24-92 / 88-234 / 351-729 ms |
 
-Dials count 3 page dials and 1 harness dial per address and browser profile. Every row holds through the page client and through the harness bridge (`anonRpcWorker.kps.dial` and `openStream`),
+Ranges span the runs of 2026-10-04 between 02:30 and 03:13 UTC (including the full `pnpm e2e:all` run at
+03:08-03:13) and an independent re-run; the per-run figures are in `.run/reports/`. Dials count 3 page dials and 1
+harness dial per address and browser profile. Every row holds through the page client and through the harness bridge (`anonRpcWorker.kps.dial` and `openStream`),
 for loopback and the external interface, with and without the upstream e2e's WebRTC flags.
 
 Two results, each pinned by a test that flips when it changes:
 
 - **Loopback with two IPv4 addresses.** The `kps` crate's WebRTC listener gathers candidates on interfaces named `lo*`
   and expects one address per family. WSL2 adds `10.255.255.254/32` to `lo`, and browser dials to the stock Rust
-  server then end in `kps: HELLO timeout`. Restricting gathering to `127.0.0.1` and `::1`
-  (`scripts/build-kps-ipfilter-probe.sh`, one line, diagnostic build only) brings it to 16/16. Hosts whose `lo`
-  carries only `127.0.0.1/8` and `::1/128` use the stock crate.
+  server then end in `kps: HELLO timeout` or, when the page's dial deadline fires first, `kps: dial timed out`.
+  Restricting gathering to `127.0.0.1` and `::1`
+  (`scripts/build-kps-ipfilter-probe.sh`, one line, diagnostic build only) brings it to 16/16. Verified on WSL2;
+  checking `ip -brief addr show lo` on each fleet host is part of the rollout checks.
 - **Single-stream echo at the window.** One stream echoes up to 1,048,512 bytes in about 60 ms (Go server). A 1 MiB
-  echo on one stream, with both directions in flight at the default 1 MiB stream window, waits past its deadline with
-  both reference servers (Go: from 1,048,560 bytes); the cause is an open item, and the test records it as an
-  expected failure. Nox sends at most 64 KiB per request stream and receives large replies as responses, which the
+  echo on one stream, with both directions in flight at the default 1 MiB stream window, waits past its deadline:
+  with the Go server from 1,048,560 bytes, and with the Rust server (loopback IP filter) at 1,048,576 bytes, the
+  one size tried there. The root cause is the next item to trace, and the test records it as an expected failure
+  with that exact symptom. Nox sends at most 64 KiB per request stream and receives large replies as responses, which the
   16 MiB rows cover.
 
 ## Layout

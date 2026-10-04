@@ -15,5 +15,5 @@ upstream project pins). Regenerate it with:
 pnpm compile:specifier        # or: bash scripts/compile-specifier.sh (SOLC=/path/to/solc-0.8.28)
 ```
 
-`tests/unit/specifier-artifact.test.ts` checks that the artifact records the sha256 of the vendored source,
+`tests/unit/codecs.test.ts` ("vendored WorkerSpecifier artifact") checks that the artifact records the sha256 of the vendored source,
 so the two cannot drift apart silently.

@@ -3,7 +3,10 @@
 // sphinx keys every run, so the bundle has to be built for the running mesh:
 // NOX_WORKER_BUILD_CMD receives testbed.json (nodes, roles, sphinx keys, KPS
 // addresses) and writes the bundle. Without it, NOX_WORKER_BUNDLE (default
-// ../dist/anon-rpc-worker.js) is used as is.
+// ../dist/anon-rpc-worker.js) is used as is. Either way the bundle must pin
+// this run's mesh: every node's sphinx key has to appear in its embedded
+// snapshot, or the run stops with a config error instead of failing later in
+// a confusing way.
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -31,6 +34,32 @@ export function renderBuildCommand(template: string, vars: { testbed_json: strin
   return template.replace(PLACEHOLDER, (_whole, name: "testbed_json" | "out") => vars[name]);
 }
 
+/**
+ * Mesh nodes whose sphinx key the bundle does not carry; empty when the bundle
+ * pins this mesh or when testbed.json describes no mesh.
+ */
+export function meshKeysMissingFromBundle(bundle: Uint8Array, testbedJson: string): string[] {
+  if (!existsSync(testbedJson)) return [];
+  const info = JSON.parse(readFileSync(testbedJson, "utf8")) as {
+    mesh?: { nodes?: readonly { id: number; sphinxPublicKey: string }[] };
+  };
+  const nodes = info.mesh?.nodes ?? [];
+  const text = new TextDecoder().decode(bundle).toLowerCase();
+  return nodes
+    .filter((node) => !text.includes(node.sphinxPublicKey.toLowerCase().replace(/^0x/u, "")))
+    .map((node) => `node ${node.id}`);
+}
+
+function requirePinnedMesh(source: { readonly path: string; readonly bytes: Uint8Array }, testbedJson: string): void {
+  const missing = meshKeysMissingFromBundle(source.bytes, testbedJson);
+  if (missing.length === 0) return;
+  throw new TestbedError(
+    "config",
+    `the worker bundle at ${source.path} pins another topology: the sphinx keys of ${missing.join(", ")} of this run's mesh ` +
+      "are absent. Mesh keys are fresh every run, so build the bundle for it with NOX_WORKER_BUILD_CMD",
+  );
+}
+
 export async function resolveWorkerBundle(
   config: TestbedConfig,
   runRoot: string,
@@ -46,7 +75,9 @@ export async function resolveWorkerBundle(
         reason: `no worker bundle at ${path}; set NOX_WORKER_BUILD_CMD (builds one for this mesh) or NOX_WORKER_BUNDLE`,
       };
     }
-    return { kind: "prebuilt", path, bytes: new Uint8Array(readFileSync(path)) };
+    const prebuilt = { kind: "prebuilt", path, bytes: new Uint8Array(readFileSync(path)) } as const;
+    requirePinnedMesh(prebuilt, testbedJson);
+    return prebuilt;
   }
   const out = join(runRoot, "nox-worker", "anon-rpc-worker.js");
   mkdirSync(dirname(out), { recursive: true });
@@ -77,5 +108,7 @@ export async function resolveWorkerBundle(
   if (!existsSync(out)) {
     throw new TestbedError("process-exit", `worker build succeeded but wrote no bundle at ${out} (log: ${proc.logFile})`);
   }
-  return { kind: "built", path: out, bytes: new Uint8Array(readFileSync(out)), command: rendered };
+  const built = { kind: "built", path: out, bytes: new Uint8Array(readFileSync(out)), command: rendered } as const;
+  requirePinnedMesh(built, testbedJson);
+  return built;
 }

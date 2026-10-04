@@ -8,6 +8,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { TestbedError } from "./errors.js";
+import { assertTcpPortsFree, assertUdpPortsFree } from "./ports.js";
 import { ManagedProcess } from "./process.js";
 
 export interface KpsAddress {
@@ -116,9 +117,23 @@ export async function startEchoServer(options: StartEchoServerOptions): Promise<
     logFile,
     ...(options.env === undefined ? {} : { env: options.env }),
   });
-  const match = await proc.waitForOutput(KPS_ADDRESS_PATTERN, options.addressTimeoutMs, "KPS address");
-  const address = formatKpsAddress(parseKpsAddress(match[1] ?? ""));
+  const address = await readAddressOrStop(proc, options.addressTimeoutMs);
   return { label, address, logFile, stop: () => proc.stop("SIGTERM") };
+}
+
+/**
+ * Wait for the KPS address a server prints. If it never comes (or does not
+ * parse), stop the process before rethrowing, so a hung server never keeps
+ * its UDP port after the run gave up on it.
+ */
+async function readAddressOrStop(proc: ManagedProcess, timeoutMs: number): Promise<string> {
+  try {
+    const match = await proc.waitForOutput(KPS_ADDRESS_PATTERN, timeoutMs, "KPS address");
+    return formatKpsAddress(parseKpsAddress(match[1] ?? ""));
+  } catch (error) {
+    await proc.stop("SIGTERM");
+    throw error;
+  }
 }
 
 /** Values substituted into NOX_KPS_CMD and NOX_KPS_CONFIG_TEMPLATE for mesh node N. */
@@ -199,9 +214,10 @@ export async function startSidecar(options: StartSidecarOptions): Promise<Runnin
       );
     }
   }
+  await assertUdpPortsFree([options.vars.udp_port], `${label} KPS listener`);
+  await assertTcpPortsFree([options.vars.admin_port], `${label} admin endpoint`, "127.0.0.1");
   const { command, args } = splitCommand(renderTemplate(options.commandTemplate, options.vars));
   const proc = ManagedProcess.start({ label, command, args, logFile });
-  const match = await proc.waitForOutput(KPS_ADDRESS_PATTERN, options.addressTimeoutMs, "KPS address");
-  const address = formatKpsAddress(parseKpsAddress(match[1] ?? ""));
+  const address = await readAddressOrStop(proc, options.addressTimeoutMs);
   return { label, address, logFile, stop: () => proc.stop("SIGTERM") };
 }

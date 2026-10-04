@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { loadConfig, sidecarAdminPort, sidecarUdpPort } from "../../src/config.js";
-import { renderBuildCommand, resolveWorkerBundle } from "../../src/worker-bundle.js";
+import { meshKeysMissingFromBundle, renderBuildCommand, resolveWorkerBundle } from "../../src/worker-bundle.js";
 
 describe("bed L port layout", () => {
   it("puts nox-kps at base+10N+5 (UDP) and base+10N+6 (admin)", () => {
@@ -52,5 +52,19 @@ describe("NOX_WORKER_BUILD_CMD", () => {
     const dir = mkdtempSync(join(tmpdir(), "e2e-bundle-"));
     const cfg = loadConfig({ NOX_WORKER_BUILD_CMD: `${process.execPath} -e process.exit(3)` }, dir);
     await expect(resolveWorkerBundle(cfg, dir, join(dir, "t.json"), dir)).rejects.toThrow(/code 3.*worker-build\.log/su);
+  });
+
+  it("refuses a bundle that does not pin this run's mesh keys", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "e2e-bundle-"));
+    const testbed = join(dir, "testbed.json");
+    const keyA = "aa".repeat(32);
+    const keyB = "bb".repeat(32);
+    writeFileSync(testbed, JSON.stringify({ mesh: { nodes: [{ id: 0, sphinxPublicKey: keyA }, { id: 1, sphinxPublicKey: keyB }] } }));
+    expect(meshKeysMissingFromBundle(new TextEncoder().encode(`"${keyA}" "${keyB.toUpperCase()}"`), testbed)).toEqual([]);
+    expect(meshKeysMissingFromBundle(new TextEncoder().encode(`"${keyA}"`), testbed)).toEqual(["node 1"]);
+    const bundle = join(dir, "stale.js");
+    writeFileSync(bundle, `/* ${keyA} */`);
+    const cfg = loadConfig({ NOX_WORKER_BUNDLE: bundle }, dir);
+    await expect(resolveWorkerBundle(cfg, dir, testbed, dir)).rejects.toThrow(/pins another topology: the sphinx keys of node 1/u);
   });
 });

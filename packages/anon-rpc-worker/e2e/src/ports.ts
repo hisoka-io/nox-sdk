@@ -1,6 +1,7 @@
 // Port helpers: pick free ephemeral ports and refuse to start on busy ones, so a
 // leftover mesh from another run fails fast with the port named.
 
+import { createSocket } from "node:dgram";
 import { createServer } from "node:net";
 import { TestbedError } from "./errors.js";
 
@@ -45,6 +46,36 @@ export async function assertTcpPortsFree(
       "port",
       `${purpose}: TCP ports already in use: ${busy.join(", ")}. ` +
         "Stop the process holding them (a leftover mesh?) or pick another range with E2E_BASE_PORT.",
+    );
+  }
+}
+
+function udpPortFree(port: number, host: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = createSocket("udp4");
+    socket.once("error", () => {
+      socket.close();
+      resolve(false);
+    });
+    socket.bind(port, host, () => socket.close(() => resolve(true)));
+  });
+}
+
+/** Throw a "port" error naming every UDP port in `ports` that is already bound. */
+export async function assertUdpPortsFree(
+  ports: readonly number[],
+  purpose: string,
+  host = "0.0.0.0",
+): Promise<void> {
+  const busy: number[] = [];
+  for (const port of ports) {
+    if (!(await udpPortFree(port, host))) busy.push(port);
+  }
+  if (busy.length > 0) {
+    throw new TestbedError(
+      "port",
+      `${purpose}: UDP ports already in use: ${busy.join(", ")}. ` +
+        "Stop the process holding them (a leftover nox-kps?) or pick another range with E2E_BASE_PORT.",
     );
   }
 }
