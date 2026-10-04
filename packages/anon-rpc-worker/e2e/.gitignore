@@ -1,0 +1,9 @@
+# Built helper binaries and cloned sources (scripts/build-kps-servers.sh)
+.cache/
+# Per-run state, node data and logs (src/testbed.ts)
+.run/
+# Playwright output
+test-results/
+playwright-report/
+blob-report/
+node_modules/
