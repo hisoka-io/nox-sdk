@@ -70,7 +70,7 @@ if [ "${E2E_SKIP_BUILD:-0}" != "1" ]; then
         step "installing e2e dependencies"
         (cd "$HERE" && pnpm install --frozen-lockfile --ignore-workspace)
     fi
-    (cd "$HERE" && npx playwright install chromium >"$LOG_DIR/playwright-install.log" 2>&1)
+    (cd "$HERE" && npx playwright install --only-shell chromium >"$LOG_DIR/playwright-install.log" 2>&1)
 fi
 
 if [ -n "${NOX_KPS_REPO:-}" ] && [ -z "${NOX_KPS_CMD:-}" ]; then
