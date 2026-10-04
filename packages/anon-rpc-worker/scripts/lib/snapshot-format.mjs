@@ -301,8 +301,9 @@ export function toRelayerNode(member) {
 /**
  * The single primary layer the SDK's schema-2 validator accepts for a node.
  * Each candidate from the SDK's layersForRole(role) is offered in a one-member
- * schema-2 topology; exactly one must pass verifySelfConsistency. This asks the
- * SDK instead of copying its layer rule.
+ * schema-2 topology; exactly one must pass verifySelfConsistency, and it must
+ * equal the SDK's primaryLayerForRole. This asks the SDK instead of copying
+ * its layer rule.
  * @param {import("@hisoka-io/nox-client").RelayerNode} node
  * @returns {number}
  */
@@ -340,7 +341,17 @@ export function primaryLayer(node) {
       "sdk-rejected",
     );
   }
-  return /** @type {number} */ (accepted[0]);
+  const layer = /** @type {number} */ (accepted[0]);
+  // The validator and the SDK's exported rule (the one the worker uses at boot)
+  // must name the same layer.
+  const exported = sdk.primaryLayerForRole(node.address, node.role);
+  if (exported !== layer) {
+    throw new SnapshotError(
+      `the SDK's validator accepts layer ${layer} for ${node.address} but primaryLayerForRole gives ${exported}`,
+      "sdk-rejected",
+    );
+  }
+  return layer;
 }
 
 /**
