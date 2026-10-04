@@ -94,7 +94,7 @@ const DECIMAL = /^(?:0|[1-9][0-9]*)$/u;
 export class SnapshotError extends Error {
   /**
    * @param {string} message
-   * @param {"chain-mismatch" | "block-unavailable" | "block-unsafe" | "registry-missing" | "scan-failed"
+   * @param {"chain-mismatch" | "block-unavailable" | "block-unsafe" | "state-read-failed" | "registry-missing" | "scan-failed"
    *   | "registry-inconsistent" | "sdk-rejected" | "invalid-document" | "providers-disagree"
    *   | "release-gate" | "config"} code
    */

@@ -37,6 +37,10 @@ export interface FakeChainOptions {
   otherEventBlocks?: number[];
   /** Largest eth_getLogs span accepted; larger spans get a JSON-RPC error. */
   maxLogSpan?: number;
+  /** When set, every eth_call is answered with this JSON-RPC error message. */
+  callError?: string;
+  /** Message for state reads below oldestStateBlock (default: Nitro's wording). */
+  missingStateMessage?: (block: number) => string;
 }
 
 type JsonRpcRequest = { id: unknown; method: string; params: unknown[] };
@@ -99,7 +103,10 @@ export class FakeChain {
     const number = this.blockNumber(tag);
     if (number > this.options.head) throw new Error(`block ${number} is in the future`);
     if (number < (this.options.oldestStateBlock ?? this.options.fromBlock)) {
-      throw new Error(`historical state for block ${number} is not available`);
+      throw new Error(
+        this.options.missingStateMessage?.(number) ??
+          `historical state ${keccak256(toUtf8Bytes(`fake-state-${number}`)).slice(2)} is not available`,
+      );
     }
     return number;
   }
@@ -156,6 +163,7 @@ export class FakeChain {
   }
 
   private call(tx: { to: string; data: string }, tag: unknown): string {
+    if (this.options.callError !== undefined) throw new Error(this.options.callError);
     this.stateAt(tag);
     if (tx.to !== this.options.registry) throw new Error("execution reverted");
     const parsed = iface.parseTransaction({ data: tx.data });

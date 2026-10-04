@@ -432,8 +432,43 @@ export async function registryEventsAfter(rpc, registry, afterBlock, toBlock, tu
 }
 
 /**
- * Run a read of historical state, turning an endpoint's JSON-RPC refusal into
- * an actionable error: pruning nodes keep only recent state.
+ * JSON-RPC error messages that mean "this endpoint keeps no state for that
+ * block", by client: Nitro and Geth ("historical state <root> is not
+ * available", "missing trie node", "required historical state unavailable",
+ * "header not found"), Reth ("state at block #N is pruned"), Nethermind
+ * ("No state available for block"), Erigon ("state history ... not
+ * available"). Only these let verify-snapshot.mjs fall back to the latest
+ * state; any other JSON-RPC error (a rate limit, a revert) fails the read.
+ */
+export const MISSING_STATE_PATTERNS = Object.freeze([
+  /historical state\b.*\bnot available/iu,
+  /required historical state unavailable/iu,
+  /missing trie node/iu,
+  /header not found/iu,
+  /state at block #?\d+ is pruned/iu,
+  /no state available/iu,
+  /state histor(?:y|ies)\b.*\bnot available/iu,
+]);
+
+/**
+ * True when an RPC failure is the endpoint saying it keeps no state for the
+ * requested block (MISSING_STATE_PATTERNS), as opposed to a transient or
+ * unrelated JSON-RPC error.
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isMissingStateError(error) {
+  if (!(error instanceof Error) || !("code" in error) || error.code !== "rpc") return false;
+  const details = "details" in error && isRecord(error.details) ? error.details : {};
+  const text = typeof details["rpcMessage"] === "string" ? details["rpcMessage"] : error.message;
+  return MISSING_STATE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * Run a read of historical state. An endpoint that keeps no state for the
+ * block (pruning nodes keep only recent state) gives "block-unavailable";
+ * any other JSON-RPC error gives "state-read-failed", so a rate limit or a
+ * revert is never mistaken for missing history.
  * @template T
  * @param {RpcClient} rpc
  * @param {number} blockNumber
@@ -444,11 +479,18 @@ async function stateRead(rpc, blockNumber, read) {
   try {
     return await read();
   } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "rpc") {
+    if (isMissingStateError(error)) {
       throw new SnapshotError(
-        `${rpc.origin} cannot serve registry state at block ${blockNumber} (${error.message}); ` +
+        `${rpc.origin} cannot serve registry state at block ${blockNumber} (${errorText(error)}); ` +
           "use an endpoint that keeps historical state for that block (an archive node)",
         "block-unavailable",
+      );
+    }
+    if (error instanceof Error && "code" in error && error.code === "rpc") {
+      throw new SnapshotError(
+        `reading registry state at block ${blockNumber} through ${rpc.origin} failed (${error.message}); ` +
+          "this is not a missing-state error, so retry or use another endpoint",
+        "state-read-failed",
       );
     }
     throw error;

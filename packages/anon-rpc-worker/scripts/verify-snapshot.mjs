@@ -13,9 +13,12 @@
  *                    at the recorded block with the same code path as
  *                    make-snapshot.mjs and require the regenerated document to
  *                    equal the committed bytes. Differences are printed per
- *                    member and field. When an endpoint cannot serve state at
- *                    that block, it checks instead that the state at its latest
- *                    block equals the snapshot and that the registry emitted no
+ *                    member and field. When an endpoint says it keeps no state
+ *                    for that block (a missing-state JSON-RPC error; any other
+ *                    error fails), it checks instead that the recorded block
+ *                    exists at or below the endpoint's safe block with the
+ *                    recorded blockHash, that the state at its latest block
+ *                    equals the snapshot, and that the registry emitted no
  *                    event after the snapshot block.
  *   --release        also apply the release gate: the snapshot is of the
  *                    configured release network, and every member publishes a
@@ -168,9 +171,21 @@ export async function verifyAgainstChain({ rpc, snapshot, text, network, capabil
     };
   } catch (error) {
     if (!(error instanceof SnapshotError) || error.code !== "block-unavailable") throw error;
-    // The endpoint keeps no state for that block: compare with its latest
+    // The endpoint keeps no state for that block. Headers outlive state on
+    // pruning nodes, so first require the recorded block to exist at or below
+    // the safe block with the recorded hash; then compare with the latest
     // state and require that the registry emitted nothing since.
-    const latest = await resolveBlock(rpc, "latest");
+    const header = await recordedBlockProblems(rpc, snapshot);
+    if (header.problems.length > 0) {
+      return {
+        ok: false,
+        lines: [
+          `${rpc.origin}: MISMATCH, the recorded block fails the header checks (no state at block ${snapshot.blockNumber} on this endpoint)`,
+          ...header.problems.map((line) => `  ${line}`),
+        ],
+      };
+    }
+    const latest = header.latest;
     /** @type {import("./lib/registry.mjs").RegistryState} */
     let state;
     try {
@@ -194,11 +209,49 @@ export async function verifyAgainstChain({ rpc, snapshot, text, network, capabil
       ok,
       lines: [
         `${rpc.origin}: ${ok ? "MATCH" : "MISMATCH"} (fallback: no state at block ${snapshot.blockNumber} on this endpoint; ` +
+          `its header there has the recorded hash and is at or below the safe block ${header.safe.number}; ` +
           `compared with block ${latest.number}, ${events} registry event(s) since the snapshot block)`,
         ...differences.map((line) => `  ${line}`),
       ],
     };
   }
+}
+
+/**
+ * Header checks for the fallback: the recorded block exists on the endpoint's
+ * chain, is at or below its latest and safe blocks, and has the recorded
+ * hash. Returns one line per problem, naming the field.
+ * @param {import("./lib/rpc.mjs").RpcClient} rpc
+ * @param {NoxAnonRpcSnapshot} snapshot
+ * @returns {Promise<{ problems: string[], latest: { number: number, hash: string }, safe: { number: number, hash: string } }>}
+ */
+export async function recordedBlockProblems(rpc, snapshot) {
+  const latest = await resolveBlock(rpc, "latest");
+  const safe = await resolveBlock(rpc, "safe");
+  /** @type {string[]} */
+  const problems = [];
+  if (snapshot.blockNumber > latest.number) {
+    problems.push(`blockNumber: snapshot ${snapshot.blockNumber} is above the chain's latest block ${latest.number}`);
+    return { problems, latest, safe };
+  }
+  if (snapshot.blockNumber > safe.number) {
+    problems.push(
+      `blockNumber: snapshot ${snapshot.blockNumber} is above the chain's safe block ${safe.number}, so a reorg can still replace it`,
+    );
+  }
+  /** @type {{ number: number, hash: string }} */
+  let recorded;
+  try {
+    recorded = await resolveBlock(rpc, snapshot.blockNumber);
+  } catch (error) {
+    if (!(error instanceof SnapshotError) || error.code !== "block-unavailable") throw error;
+    problems.push(`blockHash: the endpoint returns no usable header for block ${snapshot.blockNumber} (${error.message}), so the recorded hash cannot be confirmed`);
+    return { problems, latest, safe };
+  }
+  if (recorded.hash !== snapshot.blockHash) {
+    problems.push(`blockHash: snapshot ${JSON.stringify(snapshot.blockHash)}, chain ${JSON.stringify(recorded.hash)} at block ${snapshot.blockNumber}`);
+  }
+  return { problems, latest, safe };
 }
 
 /**
