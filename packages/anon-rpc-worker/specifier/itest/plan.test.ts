@@ -17,7 +17,7 @@ import {
   type DeploymentPlan,
   type PlanRequest,
 } from "../tools/plan.ts";
-import { castCreateArgs, formatEth, renderPlan } from "../tools/report.ts";
+import { castCreateArgs, formatEth, renderPlan, scenarioCost } from "../tools/report.ts";
 import { DEFAULT_RESOLVER_POLICY } from "../tools/resolvers.ts";
 import { harnessProvider, hexToBigInt } from "../tools/rpc.ts";
 import { SAMPLE_HASH, SAMPLE_RESOLVERS } from "./sample.ts";
@@ -124,10 +124,16 @@ describe("planDeployment (dry run)", () => {
     expect(text).toContain("WorkerSpecifier: deploy + renounceOwnership: ");
     expect(text).toContain("WorkerSpecifier: deploy + transferOwnership: ");
     expect(text).toContain(`${deployer} holds 0.00000000 ETH`);
-    const deployGas = plan.variants[0]?.deploy.gasUsedOnFork ?? 0n;
-    expect(text).toContain(
-      `ImmutableWorkerSpecifier: deploy: 1 gwei ${formatEth(deployGas * 10n ** 9n)} · 4 gwei ${formatEth(deployGas * 4n * 10n ** 9n)} · 20 gwei ${formatEth(deployGas * 20n * 10n ** 9n)}`,
-    );
+    const deploy = plan.variants[0]?.deploy;
+    if (deploy === undefined) throw new Error("no immutable variant in the plan");
+    const tip = plan.fees.priorityFeePerGas;
+    for (const gwei of [1n, 4n, 20n]) {
+      const base = gwei * 10n ** 9n;
+      const paid = formatEth(deploy.gasUsedOnFork * (base + tip));
+      const hold = formatEth(deploy.gasLimit * (2n * base + tip));
+      expect(text).toContain(`base ${gwei} gwei (cap `);
+      expect(text).toContain(`paid ${paid}, hold ${hold}`);
+    }
   });
 
   it("leaves the target chain untouched", async () => {
@@ -151,6 +157,34 @@ describe("planDeployment (dry run)", () => {
       const spec = await readSpecifier(harnessProvider(upstream.rpc), String(address));
       expect(spec).toEqual({ workerHash: SAMPLE_HASH, resolvers: SAMPLE_RESOLVERS });
     }
+  });
+});
+
+describe("funding the printed signer command", () => {
+  // The printed command leaves fees to cast, which signs a fee cap of 2 x base fee + tip. The node accepts the
+  // transaction only if the account holds gas limit x that cap, which is what the report's "hold" figure is.
+  async function fundedDeploy(balance: bigint): Promise<string> {
+    const v = plan.variants[0];
+    if (v === undefined) throw new Error("no immutable variant in the plan");
+    const sender = Wallet.createRandom().address;
+    await upstream.rpc.request("anvil_impersonateAccount", [sender]);
+    await upstream.rpc.request("anvil_setBalance", [sender, `0x${balance.toString(16)}`]);
+    const code = creationCode(await loadArtifact(v.variant), plan.workerHash, plan.resolvers);
+    return cast(castCreateArgs(upstream.url, ["--unlocked", "--from", sender], v.deploy, code));
+  }
+
+  it("needs the hold amount, not the paid amount, when the base fee rises before signing", async () => {
+    const base = 4n * 10n ** 9n;
+    await upstream.rpc.request("anvil_setNextBlockBaseFeePerGas", [`0x${base.toString(16)}`]);
+    await upstream.rpc.request("evm_mine");
+    const deploy = plan.variants[0]?.deploy;
+    if (deploy === undefined) throw new Error("no immutable variant in the plan");
+    // The local chain's blocks carry no tips, so cast signs its floor tip of 1 wei.
+    const costs = scenarioCost([deploy], base, { priorityFeePerGas: 1n, maxFeeBaseFeeMultiplier: 2n });
+    expect(costs.hold).toBeGreaterThan(costs.paid);
+    await expect(fundedDeploy(costs.paid)).rejects.toThrow(/insufficient funds/i);
+    await expect(fundedDeploy(costs.hold - 1n)).rejects.toThrow(/insufficient funds/i);
+    await expect(fundedDeploy(costs.hold)).resolves.toContain("transactionHash");
   });
 });
 

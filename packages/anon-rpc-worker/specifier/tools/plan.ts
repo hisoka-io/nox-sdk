@@ -33,8 +33,12 @@ export type PlanSettings = {
   rpcTimeoutMs: number;
   /** Body cap when fetching resolvers (the reference harness uses 64 MiB). */
   maxBundleBytes: number;
-  /** Gas prices (gwei) at which the report also prices each sequence, for budgeting beyond today's fees. */
-  scenarioGasPricesGwei: readonly bigint[];
+  /**
+   * Base fees (gwei) at signing time at which the report also prices each sequence, for funding ahead of the signing
+   * day: the cost paid (gas used x (base fee + tip)) and the balance the account must hold for the node to accept
+   * each transaction (gas limit x fee cap, the cap following the rule above).
+   */
+  scenarioBaseFeesGwei: readonly bigint[];
 };
 
 export const DEFAULT_PLAN_SETTINGS: PlanSettings = {
@@ -45,7 +49,7 @@ export const DEFAULT_PLAN_SETTINGS: PlanSettings = {
   anvilStartTimeoutMs: 90_000,
   rpcTimeoutMs: 60_000,
   maxBundleBytes: MAX_BUNDLE_BYTES,
-  scenarioGasPricesGwei: [1n, 4n, 20n],
+  scenarioBaseFeesGwei: [1n, 4n, 20n],
 };
 
 export type PlanRequest = {
@@ -73,6 +77,8 @@ export type FeeSnapshot = {
   gasPrice: bigint;
   /** Tip at the chosen percentile over the sampled blocks. */
   priorityFeePerGas: bigint;
+  /** The fee-cap rule: maxFeePerGas = baseFee x this + tip. */
+  maxFeeBaseFeeMultiplier: bigint;
   /** What a wallet would sign as the fee cap. */
   maxFeePerGas: bigint;
 };
@@ -93,7 +99,10 @@ export type TxPlan = {
   costAtBaseFee: bigint;
   /** gasUsed x (baseFee + tip). */
   costExpected: bigint;
-  /** gasLimit x maxFeePerGas: the most this transaction can cost under the signed caps. */
+  /**
+   * gasLimit x maxFeePerGas: the balance the sender must hold for the node to accept this transaction at today's fee
+   * cap, and the most it can cost under the signed caps.
+   */
   budget: bigint;
 };
 
@@ -122,8 +131,8 @@ export type DeploymentPlan = {
   deployer: { address: string; nonce: bigint; balance: bigint } | null;
   newOwner: string | null;
   variants: VariantPlan[];
-  /** Copied from the settings so the rendered report can price each sequence at these gas prices. */
-  scenarioGasPricesGwei: bigint[];
+  /** Copied from the settings so the rendered report can price each sequence at these base fees. */
+  scenarioBaseFeesGwei: bigint[];
 };
 
 export class PlanError extends Error {
@@ -135,6 +144,15 @@ export class PlanError extends Error {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+/**
+ * The fee cap a wallet signs when it does not pin one: base fee x multiplier + tip. With the default multiplier of 2
+ * this is the rule cast (alloy's default EIP-1559 estimator) and most wallets apply. A node accepts a transaction only
+ * if the sender holds gas limit x this cap (plus value) up front, whatever the transaction ends up paying.
+ */
+export function feeCap(baseFeePerGas: bigint, priorityFeePerGas: bigint, baseFeeMultiplier: bigint): bigint {
+  return baseFeePerGas * baseFeeMultiplier + priorityFeePerGas;
 }
 
 function median(values: readonly bigint[]): bigint {
@@ -165,8 +183,18 @@ async function readFees(rpc: RpcClient, settings: PlanSettings): Promise<FeeSnap
     if (Array.isArray(row) && row.length > 0) tips.push(hexToBigInt(row[0], "feeHistory.reward"));
   }
   const priorityFeePerGas = tips.length > 0 ? median(tips) : gasPrice > baseFeePerGas ? gasPrice - baseFeePerGas : 0n;
-  const maxFeePerGas = baseFeePerGas * settings.maxFeeBaseFeeMultiplier + priorityFeePerGas;
-  return { chainId, blockNumber, blockTimestamp, baseFeePerGas, gasPrice, priorityFeePerGas, maxFeePerGas };
+  const maxFeeBaseFeeMultiplier = settings.maxFeeBaseFeeMultiplier;
+  const maxFeePerGas = feeCap(baseFeePerGas, priorityFeePerGas, maxFeeBaseFeeMultiplier);
+  return {
+    chainId,
+    blockNumber,
+    blockTimestamp,
+    baseFeePerGas,
+    gasPrice,
+    priorityFeePerGas,
+    maxFeeBaseFeeMultiplier,
+    maxFeePerGas,
+  };
 }
 
 /** The resolver list for the next version: content-addressed paths retargeted from `from` to `to`. */
@@ -390,6 +418,6 @@ export async function planDeployment(request: PlanRequest): Promise<DeploymentPl
     deployer,
     newOwner: request.newOwner === undefined ? null : getAddress(request.newOwner),
     variants,
-    scenarioGasPricesGwei: [...request.settings.scenarioGasPricesGwei],
+    scenarioBaseFeesGwei: [...request.settings.scenarioBaseFeesGwei],
   };
 }

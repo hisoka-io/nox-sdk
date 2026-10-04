@@ -1,7 +1,7 @@
 // Human-readable rendering of plans and inspections, and the signer commands a plan hands over.
 
 import type { AvailabilityResult } from "./availability.ts";
-import type { DeploymentPlan, TxPlan, VariantPlan } from "./plan.ts";
+import { feeCap, type DeploymentPlan, type FeeSnapshot, type TxPlan, type VariantPlan } from "./plan.ts";
 import type { SpecifierInspection } from "./specifier.ts";
 
 const WEI_PER_GWEI = 10n ** 9n;
@@ -28,7 +28,9 @@ export type SignerArgs = readonly string[];
 
 /**
  * `cast send --create` arguments for a planned creation transaction. The signer flags come from the caller (e.g.
- * `--ledger`); the gas limit is the planned one; fees are left to cast at signing time, since they move.
+ * `--ledger`); the gas limit is the planned one; fees are left to cast at signing time, since they move. cast then
+ * signs a fee cap of twice the base fee plus the tip, so the account must hold gas limit x that cap (see
+ * `scenarioCost`).
  */
 export function castCreateArgs(rpcUrl: string, signer: SignerArgs, tx: TxPlan, creationCode: string): string[] {
   return ["send", "--rpc-url", rpcUrl, ...signer, "--gas-limit", tx.gasLimit.toString(), "--create", creationCode];
@@ -38,7 +40,7 @@ function txLine(tx: TxPlan): string {
   return [
     `    ${tx.label}`,
     `      data ${tx.dataBytes} bytes · estimateGas ${tx.estimateGas} · gasUsed on fork ${tx.gasUsedOnFork} · gas limit ${tx.gasLimit}`,
-    `      cost ${formatEth(tx.costExpected)} expected (base fee + tip) · ${formatEth(tx.costAtBaseFee)} at base fee · budget ${formatEth(tx.budget)} at the fee cap`,
+    `      cost ${formatEth(tx.costExpected)} expected (base fee + tip) · ${formatEth(tx.costAtBaseFee)} at base fee · hold ${formatEth(tx.budget)} (gas limit x fee cap)`,
   ].join("\n");
 }
 
@@ -78,6 +80,36 @@ export function sequencesOf(v: VariantPlan): Sequence[] {
 }
 
 const gasUsed = (txs: readonly TxPlan[]): bigint => txs.reduce((sum, t) => sum + t.gasUsedOnFork, 0n);
+const gasLimit = (txs: readonly TxPlan[]): bigint => txs.reduce((sum, t) => sum + t.gasLimit, 0n);
+
+export type ScenarioCost = {
+  baseFeePerGas: bigint;
+  /** The fee cap a wallet signs at this base fee: base fee x multiplier + tip. */
+  maxFeePerGas: bigint;
+  /** What the sequence costs: gas used x (base fee + tip), summed. */
+  paid: bigint;
+  /**
+   * The balance to hold before signing: gas limit x fee cap, summed over the sequence. A node rejects a transaction
+   * ("insufficient funds for gas * price + value") unless the sender holds its gas limit x fee cap up front, so this,
+   * not `paid`, is the amount to fund.
+   */
+  hold: bigint;
+};
+
+/** Cost paid and balance required for a transaction sequence signed when the base fee is `baseFeePerGas`. */
+export function scenarioCost(
+  txs: readonly TxPlan[],
+  baseFeePerGas: bigint,
+  fees: Pick<FeeSnapshot, "priorityFeePerGas" | "maxFeeBaseFeeMultiplier">,
+): ScenarioCost {
+  const maxFeePerGas = feeCap(baseFeePerGas, fees.priorityFeePerGas, fees.maxFeeBaseFeeMultiplier);
+  return {
+    baseFeePerGas,
+    maxFeePerGas,
+    paid: gasUsed(txs) * (baseFeePerGas + fees.priorityFeePerGas),
+    hold: gasLimit(txs) * maxFeePerGas,
+  };
+}
 
 export function renderPlan(plan: DeploymentPlan, files: Readonly<Record<string, string>>): string {
   const f = plan.fees;
@@ -97,27 +129,32 @@ export function renderPlan(plan: DeploymentPlan, files: Readonly<Record<string, 
     out.push(variantBlock(plan, v, files[v.variant] ?? "<not saved>"), "");
   }
   out.push(
-    "ETH to hold in the deploying account (budget = gas limit x fee cap; expected = gas used x (base fee + tip)):",
+    "ETH for the deploying account at today's fees (hold = gas limit x fee cap, the balance the node requires before it accepts each transaction; expected = gas used x (base fee + tip), the cost paid):",
   );
   const all = plan.variants.flatMap((v) => sequencesOf(v));
   for (const { contract, what, txs } of all) {
-    const budget = txs.reduce((sum, t) => sum + t.budget, 0n);
+    const hold = txs.reduce((sum, t) => sum + t.budget, 0n);
     const expected = txs.reduce((sum, t) => sum + t.costExpected, 0n);
     out.push(
-      `  ${contract}: ${what}: ${gasUsed(txs)} gas, expected ${formatEth(expected)}, budget ${formatEth(budget)}`,
+      `  ${contract}: ${what}: ${gasUsed(txs)} gas used, gas limit ${gasLimit(txs)}, expected ${formatEth(expected)}, hold ${formatEth(hold)}`,
     );
   }
   if (plan.variants.length > 1) {
-    const budget = plan.variants.reduce((s, v) => s + v.deploy.budget, 0n);
-    out.push(`  both deployments: budget ${formatEth(budget)}`);
+    const hold = plan.variants.reduce((s, v) => s + v.deploy.budget, 0n);
+    out.push(`  both deployments: hold ${formatEth(hold)}`);
   }
-  if (plan.scenarioGasPricesGwei.length > 0) {
-    out.push("", "The same sequences if gas used is paid at a flat gas price (base fee + tip):");
+  if (plan.scenarioBaseFeesGwei.length > 0) {
+    out.push(
+      "",
+      `The same sequences at other base fees on signing day (tip ${formatGwei(f.priorityFeePerGas)}; fee cap = ${f.maxFeeBaseFeeMultiplier} x base fee + tip, as cast signs it when the command leaves fees to cast).`,
+      "  paid = gas used x (base fee + tip); hold = gas limit x fee cap, summed: the balance to fund before signing.",
+    );
     for (const { contract, what, txs } of all) {
-      const prices = plan.scenarioGasPricesGwei.map(
-        (gwei) => `${gwei} gwei ${formatEth(gasUsed(txs) * gwei * WEI_PER_GWEI)}`,
-      );
-      out.push(`  ${contract}: ${what}: ${prices.join(" · ")}`);
+      const prices = plan.scenarioBaseFeesGwei.map((gwei) => {
+        const c = scenarioCost(txs, gwei * WEI_PER_GWEI, f);
+        return `base ${gwei} gwei (cap ${formatGwei(c.maxFeePerGas)}): paid ${formatEth(c.paid)}, hold ${formatEth(c.hold)}`;
+      });
+      out.push(`  ${contract}: ${what}:`, ...prices.map((p) => `    ${p}`));
     }
   }
   if (plan.deployer !== null) {

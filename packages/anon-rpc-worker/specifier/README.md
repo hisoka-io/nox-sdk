@@ -70,8 +70,8 @@ pnpm --filter @hisoka-io/anon-rpc-specifier plan -- \
 The planner checks every resolver entry, reads fees and the latest block from the RPC (default
 `https://ethereum-rpc.publicnode.com`, or `MAINNET_RPC_URL`), forks that block into a local anvil, deploys each
 variant there and reads it back through the harness. It prints the creation code, `eth_estimateGas`, the gas used,
-the expected cost (gas used x (base fee + tip)), a budget (gas limit x a fee cap of twice the base fee plus tip),
-and, with `--deployer`, that account's balance and the address the specifier will have if the deployment is its
+the expected cost (gas used x (base fee + tip)), the balance to hold (gas limit x a fee cap of twice the base fee
+plus tip), and, with `--deployer`, that account's balance and the address the specifier will have if the deployment is its
 next transaction. It writes `plan.json`, `plan.txt` and
 the creation code to `plans/<timestamp>/`. With `--check-resolvers` it first downloads every `https:` resolver
 through the harness's `fetchAndVerifyBundle` and reports whether each one serves the pinned bytes; `kps:` entries are
@@ -82,17 +82,27 @@ transaction signed by the deployer's own wallet, for example
 `cast send --rpc-url "$MAINNET_RPC_URL" --ledger --gas-limit <planned limit> --create "$(cat <file>)"`, as the plan
 prints it.
 
-The report also prices every sequence at fixed gas prices (1, 4 and 20 gwei by default) for budgeting ahead of the
-signing day.
+### Funding the deploying account
+
+A transaction costs its gas used x (base fee + tip), but a node accepts it only if the sender already holds its gas
+limit x fee cap. The printed command pins the gas limit (estimate + 20%) and leaves fees to cast, which signs a fee
+cap of twice the current base fee plus the tip. So fund the deploying account with the "hold" amount for the base
+fee you expect on signing day; the unspent part stays in the account. The report gives both figures at today's fees
+and at base fees of 1, 4 and 20 gwei (`scenarioBaseFeesGwei` in `DEFAULT_PLAN_SETTINGS`).
 
 Deployment gas grows with the resolver list, by about 930 gas per byte of resolver strings. Measured on a mainnet
-fork at block 26,115,996 (2026-10-04) with three `https:` and three `kps:` resolvers (722 bytes):
+fork at block 26,115,996 (2026-10-04, base fee 0.0715 gwei, tip 0.0219 gwei) with three `https:` and three `kps:`
+resolvers (722 bytes). "Paid" is the cost of the transactions; "hold" is the balance the account needs before
+signing, with cast's default fee cap (rounded up):
 
-| Sequence | Gas | At 0.093 gwei (that block) | At 4 gwei | At 20 gwei |
-|---|---|---|---|---|
-| `ImmutableWorkerSpecifier` deploy | 1,032,360 | 0.000096 ETH | 0.0041 ETH | 0.0206 ETH |
-| `WorkerSpecifier` deploy | 1,671,891 | 0.000156 ETH | 0.0067 ETH | 0.0334 ETH |
-| `WorkerSpecifier` deploy + `renounceOwnership` | 1,695,252 | 0.000158 ETH | 0.0068 ETH | 0.0339 ETH |
+| Sequence | Gas used | Gas limit | Paid at that block | Base fee 4 gwei: paid / hold | Base fee 20 gwei: paid / hold |
+|---|---|---|---|---|---|
+| `ImmutableWorkerSpecifier` deploy | 1,032,360 | 1,238,832 | 0.000096 ETH | 0.00415 / 0.00994 ETH | 0.0207 / 0.0496 ETH |
+| `WorkerSpecifier` deploy | 1,671,891 | 2,006,269 | 0.000156 ETH | 0.00672 / 0.0161 ETH | 0.0335 / 0.0803 ETH |
+| `WorkerSpecifier` deploy + `renounceOwnership` | 1,695,252 | 2,040,062 | 0.000158 ETH | 0.00682 / 0.0164 ETH | 0.0339 / 0.0817 ETH |
+
+For a sequence, "hold" adds up each transaction's gas limit x fee cap, which is enough to send them one after
+another.
 
 The same planner run with tor-js's first resolver list (two `https:` entries, 119 bytes) gives 1,113,503 gas for
 `WorkerSpecifier`, the gas of tor-js's own mainnet deployment.

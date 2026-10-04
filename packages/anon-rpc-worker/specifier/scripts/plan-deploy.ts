@@ -140,6 +140,9 @@ async function main(): Promise<void> {
     `\nTo deploy, the founder signs ONE creation transaction from the deploying account (swap --ledger for --trezor or --account <keystore> as needed). This tool never signs or sends:\n${commands.join("\n")}`,
   );
   console.log(
+    `\ncast picks the fee cap when it signs: ${plan.fees.maxFeeBaseFeeMultiplier} x the base fee at that moment + the tip. The node accepts the transaction only if the account already holds gas limit x that cap, so fund the "hold" amount for the expected base fee (scenarios above), not the "paid" amount.`,
+  );
+  console.log(
     `\nThen confirm what wallets will read:\n  pnpm inspect -- --rpc-url "$MAINNET_RPC_URL" <deployed address>`,
   );
 }
