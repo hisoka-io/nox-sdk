@@ -1,5 +1,5 @@
 import { keccak_256 } from "@noble/hashes/sha3";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import vm from "node:vm";
@@ -7,12 +7,15 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   buildWorker,
   BUNDLE_OPTIONS,
+  checkBundle,
+  embeddedSnapshotText,
   GLUE_URL_EXPRESSION,
   resolveNoxWasm,
   rewriteGlue,
+  snapshotModuleSource,
 } from "../scripts/build.mjs";
 import { PACKAGE_DIR, REPO_DIR, SNAPSHOT_PATH } from "../scripts/lib/paths.mjs";
-import { makeProvenance, parseToolchainEnv, PROVENANCE_NAME } from "../scripts/provenance.mjs";
+import { gitState, makeProvenance, parseToolchainEnv, PROVENANCE_NAME } from "../scripts/provenance.mjs";
 import { canonicalJson } from "../scripts/lib/snapshot-format.mjs";
 
 let dir: string;
@@ -25,6 +28,13 @@ afterAll(() => {
   vi.restoreAllMocks();
   rmSync(dir, { recursive: true, force: true });
 });
+
+/** A directory outside any git checkout. */
+function exportedRoot(): string {
+  const root = join(dir, "no-git");
+  mkdirSync(root, { recursive: true });
+  return root;
+}
 
 function outfile(name: string): string {
   return relative(PACKAGE_DIR, join(dir, name, "anon-rpc-worker.js"));
@@ -56,7 +66,40 @@ describe("buildWorker", () => {
     expect(text).toContain(snapshot.blockHash);
     expect(text.startsWith("/* @hisoka-io/anon-rpc-worker ")).toBe(true);
     expect(record.esbuild.options).toMatchObject({ format: "iife", minify: false, target: BUNDLE_OPTIONS.target });
-    expect(record.modules.map((module) => module.path)).toContain("snapshot/nox-snapshot.json");
+    const snapshotBytes = readFileSync(SNAPSHOT_PATH);
+    expect(record.snapshot).toEqual({
+      path: "snapshot/nox-snapshot.json",
+      bytes: snapshotBytes.byteLength,
+      sha256: record.snapshot.sha256,
+      keccak256: `0x${Buffer.from(keccak_256(snapshotBytes)).toString("hex")}`,
+    });
+    expect(embeddedSnapshotText(text)).toBe(snapshotBytes.toString("utf8"));
+    expect(record.entry).toBe("src/worker.ts");
+  });
+
+  it("holds no live path to the ambient fetch or WebSocket", async () => {
+    const { bundle } = await buildWorker({ outfile: outfile("policy"), write: false });
+    const text = Buffer.from(bundle).toString("utf8");
+    expect(text).not.toMatch(/\bglobalThis\.(?:fetch|WebSocket)\b/u);
+    expect(text).not.toMatch(/\bnew\s+WebSocket\b/u);
+    expect(text).not.toContain("@kpstreams/");
+    expect(text).not.toContain("createDataChannel");
+    expect(text).toContain("noxAmbientFetchDisabled(");
+  });
+
+  it("embeds a test-bed snapshot given with --snapshot and records it", async () => {
+    const snapshot = JSON.parse(readFileSync(SNAPSHOT_PATH, "utf8")) as { blockNumber: number };
+    const path = join(dir, "bed-snapshot.json");
+    writeFileSync(path, canonicalJson({ ...snapshot, blockNumber: snapshot.blockNumber + 1 }));
+    const { bundle, record } = await buildWorker({ outfile: outfile("bed"), snapshot: path, write: false });
+    expect(embeddedSnapshotText(Buffer.from(bundle).toString("utf8"))).toBe(readFileSync(path, "utf8"));
+    expect(record.snapshot.keccak256).toBe(`0x${Buffer.from(keccak_256(readFileSync(path))).toString("hex")}`);
+  });
+
+  it("refuses a snapshot that is not canonical JSON", async () => {
+    const path = join(dir, "pretty.json");
+    writeFileSync(path, JSON.stringify({ b: 1, a: 2 }, null, 4));
+    await expect(buildWorker({ outfile: outfile("pretty"), snapshot: path, write: false })).rejects.toMatchObject({ code: "invalid-snapshot" });
   });
 
   it("bundles an entry that uses the SDK sources and the embedded WASM", async () => {
@@ -92,43 +135,80 @@ describe("rewriteGlue", () => {
   });
 });
 
-describe("the placeholder worker bundle", () => {
-  it("boots in a bare script context, initialises the embedded WASM and answers fetch calls", async () => {
-    const { bundle } = await buildWorker({ outfile: outfile("smoke"), write: false });
+describe("checkBundle", () => {
+  const snapshot = '{\n  "a": 1\n}\n';
+  const wasm = "AGFzbQ==";
+  const module = (text: string) => `// nox-embed:snapshot\n  var snapshot_default = ${snapshotModuleSource(text).slice("export default ".length)}`;
+
+  it("accepts the snapshot module and the embedded WASM", () => {
+    expect(() => checkBundle(`${module(snapshot)}\n"${wasm}"`, wasm, snapshot)).not.toThrow();
+  });
+
+  it("refuses a bundle without the snapshot, with another snapshot, or with ambient network code", () => {
+    expect(() => checkBundle(`"${wasm}"`, wasm, snapshot)).toThrow(/does not embed the pinned snapshot/u);
+    expect(() => checkBundle(`${module('{"b":2}')}\n"${wasm}"`, wasm, snapshot)).toThrow(/differs from the snapshot file/u);
+    for (const bad of ["new WebSocket(u)", "globalThis.fetch(u)", "self.fetch(u)", "createDataChannel()", "new XMLHttpRequest()", "@kpstreams/core"]) {
+      expect(() => checkBundle(`${module(snapshot)}\n"${wasm}"\n${bad}`, wasm, snapshot)).toThrow(/bundle contains/u);
+    }
+  });
+});
+
+describe("the release worker bundle", () => {
+  it("boots in a bare script context, verifies its snapshot and retries without an anchor, never touching fetch", async () => {
+    const { bundle } = await buildWorker({ outfile: outfile("release"), write: false });
     const events: string[] = [];
-    const responses: unknown[] = [];
-    let served = false;
-    const requests: Array<{ url: string; method: string | undefined }> = [];
+    const logs: unknown[][] = [];
+    const dials: string[] = [];
+    const fetchStub = vi.fn(() => Promise.reject(new Error("ambient fetch")));
     const anonRpcWorker = {
       config: undefined,
       signalReady: () => events.push("ready"),
       signalFailed: (reason: unknown) => events.push(`failed ${JSON.stringify(reason)}`),
-      log: { debug() {}, info() {}, warn() {}, error: (...args: unknown[]) => events.push(`error ${args.join(" ")}`) },
-      acceptCall: () => {
-        if (served) return new Promise(() => {});
-        served = true;
-        return Promise.resolve({
-          kind: "fetch",
-          url: "https://rpc.example/",
-          requestInit: { method: "POST", headers: [["content-type", "application/json"]], body: new TextEncoder().encode("{}") },
-          respond: (value: unknown) => {
-            void Promise.resolve(value).then((resolved) => responses.push(resolved));
-          },
-        });
+      log: {
+        debug: (...args: unknown[]) => logs.push(args),
+        info: (...args: unknown[]) => logs.push(args),
+        warn: (...args: unknown[]) => logs.push(args),
+        error: (...args: unknown[]) => logs.push(args),
       },
+      acceptCall: () => new Promise(() => {}),
+      kps: {
+        dial: (address: string) => {
+          dials.push(address);
+          return Promise.reject(Object.assign(new Error("no network in this test"), { code: "network-error" }));
+        },
+        openStream: () => Promise.reject(new Error("unused")),
+      },
+      storage: undefined,
     };
-    const fetchStub = async (url: string, init?: { method?: string }) => {
-      requests.push({ url, method: init?.method });
-      return new Response('{"jsonrpc":"2.0","id":1,"result":"0x1"}', { status: 200, headers: { "content-type": "application/json" } });
-    };
-    const context = vm.createContext({ anonRpcWorker, fetch: fetchStub, TextEncoder, TextDecoder, console });
+    const context = vm.createContext({
+      anonRpcWorker,
+      fetch: fetchStub,
+      crypto: globalThis.crypto,
+      WebAssembly: (globalThis as { WebAssembly?: unknown }).WebAssembly,
+      AbortController,
+      ReadableStream,
+      WritableStream,
+      TextEncoder,
+      TextDecoder,
+      setTimeout,
+      clearTimeout,
+      setInterval,
+      clearInterval,
+      DOMException,
+      console,
+    });
+    // A Web Worker's global is reachable as `self` (ethers looks it up).
+    context["self"] = context;
     vm.runInContext(Buffer.from(bundle).toString("utf8"), context);
-    await vi.waitFor(() => expect(responses).toHaveLength(1));
-    expect(events).toEqual(["ready"]);
-    expect(requests).toEqual([{ url: "https://rpc.example/", method: "POST" }]);
-    const response = responses[0] as { status: number; body: Uint8Array };
-    expect(response.status).toBe(200);
-    expect(new TextDecoder().decode(response.body)).toContain('"result":"0x1"');
+    await vi.waitFor(() => expect(logs.some((entry) => entry[1] === "boot.retry")).toBe(true), { timeout: 5_000 });
+    expect(logs.some((entry) => entry[1] === "boot.wasm")).toBe(true);
+    expect(events).toEqual([]);
+    expect(fetchStub).not.toHaveBeenCalled();
+    // The committed snapshot predates the fleet's KPS addresses: no member is
+    // an anchor yet, so the worker keeps retrying and never dials or fails.
+    expect(dials).toEqual([]);
+    const retry = logs.find((entry) => entry[1] === "boot.retry") as [string, string, { code: string }];
+    expect(retry[2].code).toBe("no-anchor-reachable");
   });
 });
 
@@ -136,7 +216,16 @@ describe("provenance", () => {
   it("is identical for identical builds and agrees with the bundle bytes", async () => {
     await buildWorker({ outfile: outfile("p1") });
     await buildWorker({ outfile: outfile("p2") });
-    const options = (name: string) => ({ distDir: join(dir, name), wasmRecordPath: join(dir, "absent.json"), sourceCommit: "a".repeat(40) });
+    // --source-commit is for exported trees: give provenance a repository root without .git.
+    const exported = join(dir, "exported-repo");
+    mkdirSync(exported, { recursive: true });
+    for (const file of ["package.json", "pnpm-lock.yaml"]) writeFileSync(join(exported, file), readFileSync(join(REPO_DIR, file)));
+    const options = (name: string) => ({
+      distDir: join(dir, name),
+      wasmRecordPath: join(dir, "absent.json"),
+      sourceCommit: "a".repeat(40),
+      repoDir: exported,
+    });
     const first = makeProvenance(options("p1"));
     const second = makeProvenance(options("p2"));
     expect(canonicalJson(second)).toBe(canonicalJson(first));
@@ -147,6 +236,21 @@ describe("provenance", () => {
       readFileSync(`${SNAPSHOT_PATH}.keccak256`, "utf8").split(" ")[0],
     );
     expect(PROVENANCE_NAME).toBe("anon-rpc-worker.provenance.json");
+  });
+
+  it("accepts --source-commit inside a checkout only when it is the clean HEAD", () => {
+    expect(gitState(exportedRoot(), "b".repeat(40))).toEqual({ gitCommit: "b".repeat(40), gitTreeClean: true });
+    expect(() => gitState(REPO_DIR, "c".repeat(40))).toThrow(/is for exported trees/u);
+    expect(() => gitState(REPO_DIR, "not-a-commit")).toThrow(/full 40-character/u);
+  });
+
+  it("refuses a snapshot file that differs from the one the bundle embeds", async () => {
+    await buildWorker({ outfile: outfile("p5") });
+    const other = join(dir, "other-snapshot.json");
+    writeFileSync(other, "{}\n");
+    expect(() => makeProvenance({ distDir: join(dir, "p5"), wasmRecordPath: join(dir, "absent.json"), snapshotPath: other })).toThrow(
+      /is not the snapshot the bundle embeds/u,
+    );
   });
 
   it("records the WASM toolchain and refuses a record of another module", async () => {

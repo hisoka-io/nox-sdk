@@ -25,13 +25,13 @@
  * (the container builds of scripts/verify-reproducible.sh).
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { BUILD_RECORD_NAME } from "./build.mjs";
 import { keccak256Hex, sha256Hex } from "./hash.mjs";
 import { errorMessage, isMain, runMain } from "./lib/cli.mjs";
-import { PACKAGE_DIR, REPO_DIR, SNAPSHOT_PATH, TOOLCHAIN_PATH } from "./lib/paths.mjs";
+import { PACKAGE_DIR, REPO_DIR, TOOLCHAIN_PATH } from "./lib/paths.mjs";
 import { canonicalJson, isRecord } from "./lib/snapshot-format.mjs";
 
 export const PROVENANCE_NAME = "anon-rpc-worker.provenance.json";
@@ -102,19 +102,43 @@ function objectField(object, key, what) {
  * @returns {{ gitCommit: string | null, gitTreeClean: boolean | null }}
  */
 export function gitState(repoDir, sourceCommit) {
+  const checkout = gitCheckoutState(repoDir);
   if (sourceCommit !== undefined) {
     if (!/^[0-9a-f]{40}$/u.test(sourceCommit)) {
       throw new ProvenanceError(`--source-commit must be a full 40-character lowercase commit id, got ${sourceCommit}`, "usage");
     }
-    // An export of one commit (git archive) is clean by construction.
+    // --source-commit names the commit of a tree without .git (a git archive
+    // export, clean by construction). Inside a checkout git itself is the
+    // record, so the flag must agree with it.
+    if (checkout !== null) {
+      if (checkout.gitCommit !== sourceCommit || !checkout.gitTreeClean) {
+        throw new ProvenanceError(
+          `--source-commit ${sourceCommit} is for exported trees; this is a git checkout at ${checkout.gitCommit}` +
+            `${checkout.gitTreeClean ? "" : " with uncommitted changes"}. Drop the flag, or commit and pass HEAD`,
+          "inconsistent",
+        );
+      }
+      return checkout;
+    }
     return { gitCommit: sourceCommit, gitTreeClean: true };
   }
+  return checkout ?? { gitCommit: null, gitTreeClean: null };
+}
+
+/**
+ * HEAD and cleanliness when `repoDir` is the top level of a git checkout,
+ * else `null` (an export, or a directory inside some other repository).
+ * @param {string} repoDir
+ * @returns {{ gitCommit: string, gitTreeClean: boolean } | null}
+ */
+function gitCheckoutState(repoDir) {
+  /** @param {string[]} args */
+  const git = (args) => execFileSync("git", ["-C", repoDir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   try {
-    const gitCommit = execFileSync("git", ["-C", repoDir, "rev-parse", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
-    const status = execFileSync("git", ["-C", repoDir, "status", "--porcelain"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    return { gitCommit, gitTreeClean: status.trim() === "" };
+    if (realpathSync(git(["rev-parse", "--show-toplevel"]).trim()) !== realpathSync(repoDir)) return null;
+    return { gitCommit: git(["rev-parse", "HEAD"]).trim(), gitTreeClean: git(["status", "--porcelain"]).trim() === "" };
   } catch {
-    return { gitCommit: null, gitTreeClean: null };
+    return null;
   }
 }
 
@@ -166,8 +190,16 @@ export function makeProvenance(options) {
   const pnpm = /^pnpm@(.+)$/u.exec(packageManager)?.[1] ?? null;
   const manifest = readJsonObject(join(packageDir, "package.json"), "package.json");
 
-  const snapshotPath = options.snapshotPath ?? SNAPSHOT_PATH;
+  // The snapshot the build embedded (build record), checked against the file.
+  const recordedSnapshot = objectField(record, "snapshot", "build record");
+  const snapshotPath = options.snapshotPath ?? join(packageDir, String(recordedSnapshot["path"]));
   const snapshotBytes = readFileSync(snapshotPath);
+  if (keccak256Hex(snapshotBytes) !== recordedSnapshot["keccak256"]) {
+    throw new ProvenanceError(
+      `${snapshotPath} (keccak256 ${keccak256Hex(snapshotBytes)}) is not the snapshot the bundle embeds (${String(recordedSnapshot["keccak256"])}); rebuild`,
+      "inconsistent",
+    );
+  }
   /** @type {unknown} */
   const snapshot = JSON.parse(snapshotBytes.toString("utf8"));
   const snapshotBlock = isRecord(snapshot) && typeof snapshot["blockNumber"] === "number" ? snapshot["blockNumber"] : null;

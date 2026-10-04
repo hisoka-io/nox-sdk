@@ -1,51 +1,35 @@
 /**
- * Bundle smoke for the worker source: esbuild packs src/worker.ts into one
- * classic-script IIFE (the shape the harness loads with importScripts), with
- * the real nox-wasm web build embedded as bytes and a pinned test snapshot.
- * The script then runs with `anonRpcWorker` installed, `fetch` and
- * `WebSocket` throwing, and must boot over KPS and send real 32,768-byte
- * Sphinx packets.
+ * Bundle smoke for the worker source: scripts/build.mjs (the release build,
+ * with its embed plugin, ambient-network stand-ins and bundle checks) packs
+ * src/worker.ts into one classic-script IIFE with the real nox-wasm web build
+ * embedded and a pinned test snapshot. The script then runs with
+ * `anonRpcWorker` installed, `fetch` and `WebSocket` throwing, and must boot
+ * over KPS and send real 32,768-byte Sphinx packets.
  *
- * The release bundle is built by scripts/build.mjs (reproducible, keccak
- * pinned); this test only proves the source bundles and boots. It is skipped
- * when packages/nox-wasm/pkg-web has not been built.
+ * It is skipped when packages/nox-wasm/pkg-web has not been built.
  */
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { build, type Plugin } from "esbuild";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { buildWorker } from "../scripts/build.mjs";
+import { canonicalJson } from "../scripts/lib/snapshot-format.mjs";
 import { FakeHarness } from "./helpers/fake-harness.js";
 import { FakeNoxNetwork } from "./helpers/fake-nox-network.js";
 import { exitReply, makePinned } from "./helpers/fixtures.js";
 
-const PACKAGE_DIR = fileURLToPath(new URL("../", import.meta.url));
 const PKG_WEB = fileURLToPath(new URL("../../nox-wasm/pkg-web/", import.meta.url));
-const GLUE = `${PKG_WEB}nox_wasm.js`;
-const WASM = `${PKG_WEB}nox_wasm_bg.wasm`;
-const built = existsSync(GLUE) && existsSync(WASM);
+const built = existsSync(`${PKG_WEB}nox_wasm.js`) && existsSync(`${PKG_WEB}nox_wasm_bg.wasm`);
 
-function embedPlugin(snapshotJson: string): Plugin {
-  return {
-    name: "smoke-embed",
-    setup(context) {
-      context.onResolve({ filter: /^@hisoka-io\/nox-wasm$/ }, () => ({ path: "nox-wasm", namespace: "smoke" }));
-      context.onResolve({ filter: /^nox-embed:snapshot$/ }, () => ({ path: "snapshot", namespace: "smoke" }));
-      context.onLoad({ filter: /^nox-wasm$/, namespace: "smoke" }, () => ({
-        resolveDir: PKG_WEB,
-        loader: "js",
-        contents: [
-          `import { initSync } from ${JSON.stringify(GLUE)};`,
-          `export * from ${JSON.stringify(GLUE)};`,
-          `const B64 = ${JSON.stringify(readFileSync(WASM).toString("base64"))};`,
-          "export default async function init() {",
-          "  initSync({ module: Uint8Array.from(atob(B64), (c) => c.charCodeAt(0)) });",
-          "}",
-        ].join("\n"),
-      }));
-      context.onLoad({ filter: /^snapshot$/, namespace: "smoke" }, () => ({ contents: snapshotJson, loader: "json" }));
-    },
-  };
-}
+let dir: string;
+
+beforeAll(() => {
+  dir = mkdtempSync(join(tmpdir(), "nox-bundle-smoke-"));
+});
+afterAll(() => {
+  rmSync(dir, { recursive: true, force: true });
+});
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -55,18 +39,10 @@ afterEach(() => {
 describe.skipIf(!built)("worker bundle smoke", () => {
   it("bundles into one classic script that boots over KPS without fetch or WebSocket", async () => {
     const pinned = makePinned();
-    const result = await build({
-      entryPoints: [`${PACKAGE_DIR}src/worker.ts`],
-      tsconfig: `${PACKAGE_DIR}tsconfig.json`,
-      bundle: true,
-      format: "iife",
-      platform: "browser",
-      target: "es2022",
-      write: false,
-      logLevel: "silent",
-      plugins: [embedPlugin(JSON.stringify(pinned))],
-    });
-    const code = result.outputFiles[0]?.text ?? "";
+    const snapshotPath = join(dir, "test-snapshot.json");
+    writeFileSync(snapshotPath, canonicalJson(pinned));
+    const { bundle } = await buildWorker({ snapshot: snapshotPath, outfile: join(dir, "worker.js"), write: false });
+    const code = Buffer.from(bundle).toString("utf8");
     expect(code.length).toBeGreaterThan(100_000);
     expect(code).not.toMatch(/^\s*(?:import|export)\s/mu);
     expect(code).not.toMatch(/\bimport\s*\(/u);

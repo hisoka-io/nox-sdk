@@ -12,6 +12,11 @@
  *                                 workerHash() a specifier pins (SPEC §4).
  *   build-record.json             what went in, for scripts/provenance.mjs.
  *
+ * The build itself never reads the chain. The release gate for the pinned
+ * snapshot (every member publishes a KPS address, chain re-read through two
+ * providers) is `scripts/verify-snapshot.mjs --rpc <a> --rpc <b> --release`,
+ * a separate step before publication.
+ *
  * Determinism. The bytes depend only on: the source tree, the pnpm lockfile
  * (esbuild version and the node_modules layout that appears in module path
  * comments), the nox-wasm bytes, the fixed esbuild flags in BUNDLE_OPTIONS and
@@ -22,7 +27,7 @@
  * host and in any checkout location.
  *
  * Contract with the worker source (src/):
- *   - the entry point is src/index.ts (override with --entry);
+ *   - the entry point is src/worker.ts (override with --entry);
  *   - "@hisoka-io/nox-wasm" and "@hisoka-io/nox-wasm/web" resolve to
  *     scripts/embed/nox-wasm-shim.js: the wasm-bindgen web glue with an init
  *     that reads the embedded bytes instead of fetching a .wasm file. The
@@ -32,12 +37,16 @@
  *     repository (packages/nox-client/src), so the bundle is built from
  *     reviewed sources and not from a separately built dist/;
  *   - "nox-embed:wasm-bytes" exports noxWasmBytes(), the raw module bytes;
- *   - JSON imports are inlined (the pinned snapshot is
- *     snapshot/nox-snapshot.json); nothing is external, so an import that
+ *   - "nox-embed:snapshot" default-exports the pinned registry snapshot
+ *     (snapshot/nox-snapshot.json, or --snapshot for a test bed). The file
+ *     must already be canonical JSON; its exact bytes are embedded as one
+ *     string literal and parsed at boot, so the bundle carries the snapshot
+ *     byte for byte and tree shaking can never drop a field;
+ *   - JSON imports are inlined; nothing is external, so an import that
  *     cannot be bundled (a Node built-in, a missing file) fails the build.
  *
  * Usage:
- *   node scripts/build.mjs [--entry <file>] [--outfile <file>]
+ *   node scripts/build.mjs [--entry <file>] [--outfile <file>] [--snapshot <file>]
  *                          [--wasm <nox_wasm_bg.wasm>] [--wasm-glue <nox_wasm.js>]
  */
 import { build as esbuild, version as esbuildVersion } from "esbuild";
@@ -51,12 +60,14 @@ import {
 } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
+import { runInNewContext } from "node:vm";
 import { errorMessage, isMain, runMain } from "./lib/cli.mjs";
-import { EMBED_DIR, PACKAGE_DIR, REPO_DIR } from "./lib/paths.mjs";
+import { EMBED_DIR, PACKAGE_DIR, REPO_DIR, SNAPSHOT_PATH } from "./lib/paths.mjs";
+import { canonicalJson } from "./lib/snapshot-format.mjs";
 import { formatHashLine, KECCAK_FILE_SUFFIX, keccak256Hex, sha256Hex } from "./hash.mjs";
 
 export { PACKAGE_DIR };
-export const DEFAULT_ENTRY = "src/index.ts";
+export const DEFAULT_ENTRY = "src/worker.ts";
 export const DEFAULT_OUTFILE = "dist/anon-rpc-worker.js";
 export const BUILD_RECORD_NAME = "build-record.json";
 export const BUILD_RECORD_SCHEMA = "nox-anon-rpc-worker-build/1";
@@ -76,7 +87,15 @@ export const BUNDLE_OPTIONS = Object.freeze({
   sourcemap: false,
   treeShaking: true,
   splitting: false,
-  define: Object.freeze({ "process.env.NODE_ENV": '"production"' }),
+  define: Object.freeze({
+    "process.env.NODE_ENV": '"production"',
+    // No live path to the ambient network in the shipped bytes (§3.5): the
+    // SDK's classic defaults resolve to a stand-in that fails closed, and to
+    // no WebSocket constructor at all.
+    "globalThis.fetch": "noxAmbientFetchDisabled",
+    "globalThis.WebSocket": "undefined",
+  }),
+  inject: Object.freeze(["scripts/embed/no-ambient-network.js"]),
 });
 
 const WASM_MAGIC = Uint8Array.of(0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00);
@@ -98,7 +117,7 @@ export const GLUE_URL_REPLACEMENT =
 export class BuildError extends Error {
   /**
    * @param {string} message
-   * @param {"missing-input" | "invalid-wasm" | "bundle-failed" | "bundle-check-failed" | "usage"} code
+   * @param {"missing-input" | "invalid-wasm" | "invalid-snapshot" | "bundle-failed" | "bundle-check-failed" | "usage"} code
    */
   constructor(message, code) {
     super(message);
@@ -149,6 +168,7 @@ export function resolveNoxWasm(packageDir) {
  * @property {string} [tsconfig]   tsconfig passed to esbuild, relative to packageDir
  * @property {string} [wasm]       nox_wasm_bg.wasm to embed (default: the nox-wasm web build)
  * @property {string} [wasmGlue]   wasm-bindgen web glue matching `wasm`
+ * @property {string} [snapshot]   pinned snapshot to embed (default snapshot/nox-snapshot.json)
  * @property {boolean} [write]     write the outputs (default true)
  */
 
@@ -167,6 +187,7 @@ export function resolveNoxWasm(packageDir) {
  * @property {{ path: string, sha256: string }} tsconfig
  * @property {{ version: string, options: Record<string, unknown> }} esbuild
  * @property {{ path: string, bytes: number, sha256: string, keccak256: string }} wasm
+ * @property {{ path: string, bytes: number, sha256: string, keccak256: string }} snapshot
  * @property {ModuleInput[]} modules
  */
 
@@ -216,6 +237,8 @@ export async function buildWorker(options = {}) {
     );
   }
   const wasmBase64 = wasmBytes.toString("base64");
+  const snapshotPath = resolve(options.snapshot ?? SNAPSHOT_PATH);
+  const snapshotText = readCanonicalSnapshot(snapshotPath);
 
   const manifest = readPackageManifest(packageDir);
   const banner = `/* ${manifest.name} ${manifest.version} | ${manifest.license} | https://github.com/hisoka-io/nox-sdk */`;
@@ -226,6 +249,7 @@ export async function buildWorker(options = {}) {
     result = await esbuild({
       ...BUNDLE_OPTIONS,
       define: { ...BUNDLE_OPTIONS.define },
+      inject: BUNDLE_OPTIONS.inject.map((file) => join(PACKAGE_DIR, file)),
       absWorkingDir: packageDir,
       entryPoints: [entry],
       outfile,
@@ -235,7 +259,7 @@ export async function buildWorker(options = {}) {
       write: false,
       logLevel: "silent",
       logOverride: { "empty-import-meta": "error" },
-      plugins: [noxEmbedPlugin({ wasmBase64, gluePath })],
+      plugins: [noxEmbedPlugin({ wasmBase64, gluePath, snapshotText })],
     });
   } catch (error) {
     throw new BuildError(`esbuild failed for ${entry}: ${errorMessage(error)}`, "bundle-failed");
@@ -253,7 +277,7 @@ export async function buildWorker(options = {}) {
   }
   const output = /** @type {import("esbuild").OutputFile} */ (result.outputFiles[0]);
   const bundle = output.contents;
-  checkBundle(output.text, wasmBase64);
+  checkBundle(output.text, wasmBase64, snapshotText);
 
   const record = makeRecord({
     packageDir,
@@ -263,6 +287,8 @@ export async function buildWorker(options = {}) {
     banner,
     wasmPath,
     wasmBytes,
+    snapshotPath,
+    snapshotText,
     bundle,
     metafile: result.metafile,
   });
@@ -272,11 +298,46 @@ export async function buildWorker(options = {}) {
 }
 
 /**
- * esbuild plugin that provides the embedded-WASM modules.
- * @param {{ wasmBase64: string, gluePath: string }} inputs
+ * Read the snapshot to embed and require canonical bytes (keys sorted, 2-space
+ * indent, LF, trailing newline), so the embedded text is exactly the text
+ * whose keccak-256 the snapshot record and the provenance name.
+ * @param {string} path
+ * @returns {string}
+ */
+export function readCanonicalSnapshot(path) {
+  requireFile(path, `pinned snapshot ${path} not found; run scripts/make-snapshot.mjs or pass --snapshot`);
+  const text = readFileSync(path, "utf8");
+  /** @type {unknown} */
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (error) {
+    throw new BuildError(`${path} is not JSON: ${errorMessage(error)}`, "invalid-snapshot");
+  }
+  if (canonicalJson(parsed) !== text) {
+    throw new BuildError(
+      `${path} is not canonical JSON (keys sorted, 2-space indent, LF, trailing newline); regenerate it with scripts/make-snapshot.mjs`,
+      "invalid-snapshot",
+    );
+  }
+  return text;
+}
+
+/**
+ * The module source that embeds the snapshot text verbatim.
+ * @param {string} snapshotText
+ * @returns {string}
+ */
+export function snapshotModuleSource(snapshotText) {
+  return `export default JSON.parse(${JSON.stringify(snapshotText)});\n`;
+}
+
+/**
+ * esbuild plugin that provides the embedded-WASM and snapshot modules.
+ * @param {{ wasmBase64: string, gluePath: string, snapshotText: string }} inputs
  * @returns {import("esbuild").Plugin}
  */
-function noxEmbedPlugin({ wasmBase64, gluePath }) {
+function noxEmbedPlugin({ wasmBase64, gluePath, snapshotText }) {
   // esbuild evaluates these filters as Go regular expressions: no JS flags.
   return {
     name: "nox-embed",
@@ -299,6 +360,14 @@ function noxEmbedPlugin({ wasmBase64, gluePath }) {
       }));
       build.onLoad({ filter: /^wasm-base64$/, namespace: "nox-embed" }, () => ({
         contents: `export default ${JSON.stringify(wasmBase64)};\n`,
+        loader: "js",
+      }));
+      build.onResolve({ filter: /^nox-embed:snapshot$/ }, () => ({
+        path: "snapshot",
+        namespace: "nox-embed",
+      }));
+      build.onLoad({ filter: /^snapshot$/, namespace: "nox-embed" }, () => ({
+        contents: snapshotModuleSource(snapshotText),
         loader: "js",
       }));
     },
@@ -330,11 +399,68 @@ export function rewriteGlue(source, gluePath) {
 }
 
 /**
+ * The one string literal the snapshot module emits, after esbuild re-quoted
+ * it: `// nox-embed:snapshot`, esbuild's calls into injected modules, then
+ * `var <name> = JSON.parse(<literal>);`.
+ */
+const EMBEDDED_SNAPSHOT_RE = /\/\/ nox-embed:snapshot\n(?:\s*init_[\w$]+\(\);\n)*\s*var [A-Za-z_$][\w$]* = JSON\.parse\(('(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")\);/gu;
+
+/**
+ * The snapshot text a bundle embeds, decoded from its string literal, or
+ * `null` when the bundle has no snapshot module. Throws when it has several.
+ * @param {string} bundleText
+ * @returns {string | null}
+ */
+export function embeddedSnapshotText(bundleText) {
+  const matches = [...bundleText.matchAll(EMBEDDED_SNAPSHOT_RE)];
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    throw new BuildError(`the bundle embeds ${matches.length} snapshot modules; expected one`, "bundle-check-failed");
+  }
+  const literal = /** @type {string} */ (/** @type {RegExpExecArray} */ (matches[0])[1]);
+  // The regular expression admits only a single string literal, so evaluating
+  // it runs no code; vm keeps it out of this module's scope anyway.
+  const value = runInNewContext(literal, Object.create(null), { timeout: 1_000 });
+  if (typeof value !== "string") throw new BuildError("the embedded snapshot literal is not a string", "bundle-check-failed");
+  return value;
+}
+
+/**
+ * Patterns the shipped bytes must not contain (ARCHITECTURE §7.4): the host
+ * provides KPS, so no KPS client or WebRTC code; and no API that reaches the
+ * network outside the host's KPS dialer.
+ */
+export const FORBIDDEN_BUNDLE_PATTERNS = Object.freeze([
+  { pattern: /@kpstreams\//u, what: "a bundled @kpstreams client (the harness provides KPS)" },
+  { pattern: /\bcreateDataChannel\b/u, what: "WebRTC data channel code (the harness provides KPS)" },
+  { pattern: /\bnew\s+WebSocket\b/u, what: "a WebSocket constructor call" },
+  { pattern: /\b(?:globalThis|self|window)\s*\.\s*(?:fetch|WebSocket)\b/u, what: "a reference to the ambient fetch or WebSocket" },
+  { pattern: /\bXMLHttpRequest\b/u, what: "XMLHttpRequest" },
+  { pattern: /\bEventSource\b/u, what: "EventSource" },
+]);
+
+/**
  * Structural checks on the emitted bundle.
  * @param {string} text
  * @param {string} wasmBase64
+ * @param {string} snapshotText
  */
-function checkBundle(text, wasmBase64) {
+export function checkBundle(text, wasmBase64, snapshotText) {
+  const embedded = embeddedSnapshotText(text);
+  if (embedded === null) {
+    throw new BuildError(
+      "the bundle does not embed the pinned snapshot: the worker source must import \"nox-embed:snapshot\" and use it",
+      "bundle-check-failed",
+    );
+  }
+  if (embedded !== snapshotText) {
+    throw new BuildError("the snapshot embedded in the bundle differs from the snapshot file", "bundle-check-failed");
+  }
+  for (const { pattern, what } of FORBIDDEN_BUNDLE_PATTERNS) {
+    if (pattern.test(text)) {
+      throw new BuildError(`the bundle contains ${what}; the worker reaches the network only through anonRpcWorker.kps`, "bundle-check-failed");
+    }
+  }
   if (!text.includes(JSON.stringify(wasmBase64))) {
     throw new BuildError(
       "the bundle does not embed the nox-wasm module: the worker source must import \"@hisoka-io/nox-wasm\" or \"nox-embed:wasm-bytes\" and use it, or tree shaking drops the bytes",
@@ -351,11 +477,13 @@ function checkBundle(text, wasmBase64) {
 
 /**
  * @param {{ packageDir: string, entry: string, outfile: string, tsconfigPath: string, banner: string,
- *           wasmPath: string, wasmBytes: Buffer, bundle: Uint8Array, metafile: import("esbuild").Metafile }} parts
+ *           wasmPath: string, wasmBytes: Buffer, snapshotPath: string, snapshotText: string,
+ *           bundle: Uint8Array, metafile: import("esbuild").Metafile }} parts
  * @returns {BuildRecord}
  */
 function makeRecord(parts) {
-  const { packageDir, entry, outfile, tsconfigPath, banner, wasmPath, wasmBytes, bundle, metafile } = parts;
+  const { packageDir, entry, outfile, tsconfigPath, banner, wasmPath, wasmBytes, snapshotPath, snapshotText, bundle, metafile } = parts;
+  const snapshotBytes = Buffer.from(snapshotText, "utf8");
   /** @type {ModuleInput[]} */
   const modules = Object.keys(metafile.inputs)
     .sort()
@@ -383,13 +511,19 @@ function makeRecord(parts) {
     },
     esbuild: {
       version: esbuildVersion,
-      options: { ...BUNDLE_OPTIONS, define: { ...BUNDLE_OPTIONS.define }, banner },
+      options: { ...BUNDLE_OPTIONS, define: { ...BUNDLE_OPTIONS.define }, inject: [...BUNDLE_OPTIONS.inject], banner },
     },
     wasm: {
       path: toPosix(relative(packageDir, wasmPath)),
       bytes: wasmBytes.byteLength,
       sha256: sha256Hex(wasmBytes),
       keccak256: keccak256Hex(wasmBytes),
+    },
+    snapshot: {
+      path: toPosix(relative(packageDir, snapshotPath)),
+      bytes: snapshotBytes.byteLength,
+      sha256: sha256Hex(snapshotBytes),
+      keccak256: keccak256Hex(snapshotBytes),
     },
     modules,
   };
@@ -471,12 +605,13 @@ export async function main(argv) {
       outfile: { type: "string" },
       wasm: { type: "string" },
       "wasm-glue": { type: "string" },
+      snapshot: { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
     process.stdout.write(
-      "usage: build.mjs [--entry src/index.ts] [--outfile dist/anon-rpc-worker.js] [--wasm <file>] [--wasm-glue <file>]\n",
+      "usage: build.mjs [--entry src/worker.ts] [--outfile dist/anon-rpc-worker.js] [--snapshot <file>] [--wasm <file>] [--wasm-glue <file>]\n",
     );
     return 0;
   }
@@ -486,14 +621,16 @@ export async function main(argv) {
   if (values.outfile !== undefined) options.outfile = values.outfile;
   if (values.wasm !== undefined) options.wasm = values.wasm;
   if (values["wasm-glue"] !== undefined) options.wasmGlue = values["wasm-glue"];
+  if (values.snapshot !== undefined) options.snapshot = values.snapshot;
   const { record } = await buildWorker(options);
-  const { artifact, wasm } = record;
+  const { artifact, wasm, snapshot } = record;
   process.stdout.write(
     [
       `anon-rpc worker: ${artifact.path} (${artifact.bytes} bytes)`,
       `  keccak256 ${artifact.keccak256}  (the workerHash a specifier pins)`,
       `  sha256    ${artifact.sha256}`,
       `  nox-wasm  ${wasm.path} (${wasm.bytes} bytes, sha256 ${wasm.sha256})`,
+      `  snapshot  ${snapshot.path} (keccak256 ${snapshot.keccak256})`,
       `  esbuild   ${record.esbuild.version}, ${record.modules.length} modules`,
       "",
     ].join("\n"),
