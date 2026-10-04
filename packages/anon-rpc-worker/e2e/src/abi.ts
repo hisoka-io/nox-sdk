@@ -136,3 +136,92 @@ export function decodeStringArray(returnData: string): string[] {
   }
   return out;
 }
+
+/** One argument for `encodeArgs`: static words (address, bytes32, uint) or dynamic bytes/string. */
+export type AbiArg =
+  | { readonly type: "address"; readonly value: string }
+  | { readonly type: "bytes32"; readonly value: string }
+  | { readonly type: "uint"; readonly value: bigint | number }
+  | { readonly type: "string"; readonly value: string }
+  | { readonly type: "bytes"; readonly value: string };
+
+const UINT256_MAX = (1n << 256n) - 1n;
+
+function bigUintWord(value: bigint | number): Uint8Array {
+  const big = typeof value === "bigint" ? value : BigInt(value);
+  if (typeof value === "number" && !Number.isSafeInteger(value)) {
+    throw new TestbedError("abi", `cannot encode ${value} as uint256: not a safe integer`);
+  }
+  if (big < 0n || big > UINT256_MAX) throw new TestbedError("abi", `cannot encode ${big} as uint256`);
+  const out = new Uint8Array(WORD);
+  let rest = big;
+  for (let i = WORD - 1; i >= 0 && rest > 0n; i--) {
+    out[i] = Number(rest & 0xffn);
+    rest >>= 8n;
+  }
+  return out;
+}
+
+function addressWord(address: string): Uint8Array {
+  if (!/^0x[0-9a-fA-F]{40}$/u.test(address)) {
+    throw new TestbedError("abi", `not a 20-byte 0x address: ${address}`);
+  }
+  const out = new Uint8Array(WORD);
+  out.set(hexToBytes(address), WORD - 20);
+  return out;
+}
+
+function dynamicTail(bytes: Uint8Array): Uint8Array {
+  return bytes.length === 0 ? uintWord(0) : concat([uintWord(bytes.length), padRight(bytes)]);
+}
+
+/**
+ * abi.encode of a flat argument list (head words, then the tails of the
+ * dynamic `string`/`bytes` arguments) as 0x hex. A static tuple argument is
+ * encoded in place, so passing its fields in order covers struct parameters
+ * whose fields are all static.
+ */
+export function encodeArgs(args: readonly AbiArg[]): string {
+  const heads: Uint8Array[] = [];
+  const tails: Uint8Array[] = [];
+  let tailOffset = args.length * WORD;
+  for (const arg of args) {
+    switch (arg.type) {
+      case "address":
+        heads.push(addressWord(arg.value));
+        break;
+      case "bytes32":
+        heads.push(bytes32(arg.value));
+        break;
+      case "uint":
+        heads.push(bigUintWord(arg.value));
+        break;
+      case "string":
+      case "bytes": {
+        const tail = dynamicTail(arg.type === "string" ? encoder.encode(arg.value) : hexToBytes(arg.value));
+        heads.push(uintWord(tailOffset));
+        tails.push(tail);
+        tailOffset += tail.length;
+        break;
+      }
+    }
+  }
+  return `0x${bytesToHex(concat([...heads, ...tails]))}`;
+}
+
+/** Calldata: the selector of `signature` followed by `encodeArgs(args)`. */
+export function encodeCall(signature: string, args: readonly AbiArg[]): string {
+  return selector(signature) + encodeArgs(args).slice(2);
+}
+
+/** Decode the uint256 word at `index` of return data (or log data) to a bigint. */
+export function decodeUintWord(data: string, index = 0): bigint {
+  const bytes = hexToBytes(data);
+  const at = index * WORD;
+  if (at + WORD > bytes.length) {
+    throw new TestbedError("abi", `word ${index} is out of bounds (${bytes.length} bytes)`);
+  }
+  let value = 0n;
+  for (const byte of bytes.slice(at, at + WORD)) value = (value << 8n) | BigInt(byte);
+  return value;
+}

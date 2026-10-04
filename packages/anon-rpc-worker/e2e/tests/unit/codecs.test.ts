@@ -6,7 +6,14 @@ import { decodeExitHttpResponse, encodeExitHttpResponse } from "../../src/bincod
 import { E2E_ROOT } from "../../src/config.js";
 import { ContentStore, keccakName, keccakPath, normalizeHash, parseKeccakPath } from "../../src/content-store.js";
 import { TestbedError } from "../../src/errors.js";
-import { formatKpsAddress, parseKpsAddress, renderTemplate, splitCommand, type SidecarVars } from "../../src/kps-server.js";
+import {
+  formatKpsAddress,
+  INIT_CERTHASH_PATTERN,
+  parseKpsAddress,
+  renderTemplate,
+  splitCommand,
+  type SidecarVars,
+} from "../../src/kps-server.js";
 import { meshNodeAddress, parseMeshInfo } from "../../src/mesh.js";
 import { assertTcpPortsFree, freeTcpPort, meshPorts } from "../../src/ports.js";
 import { percentile } from "../../src/report.js";
@@ -116,6 +123,7 @@ describe("nox-kps sidecar templates", () => {
     key_file: "/run/kps/node-3.key",
     config_file: "/run/kps/node-3.conf",
     bundle_dir: "/run/keccak",
+    expected_certhash: "uEiA",
   };
 
   it("substitutes placeholders and splits without a shell", () => {
@@ -129,6 +137,18 @@ describe("nox-kps sidecar templates", () => {
   it("fails loudly on unknown placeholders and empty commands", () => {
     expect(() => renderTemplate("x {nodes}", vars)).toThrow(/unknown placeholder \{nodes\}/u);
     expect(() => splitCommand("   ")).toThrow(/empty command/u);
+  });
+
+  it("renders the fixture config with the certhash `nox-kps init` printed", () => {
+    const certhashLine = `certhash: uEi${"A".repeat(44)}`;
+    const initOutput = `created KPS identity /run/kps/node-3.key\n${certhashLine}\nconfig line: expected_certhash = "x"\n`;
+    const printed = INIT_CERTHASH_PATTERN.exec(initOutput)?.[1];
+    expect(printed).toBe(`uEi${"A".repeat(44)}`);
+    const template = readFileSync(join(E2E_ROOT, "fixtures", "nox-kps.toml.tmpl"), "utf8");
+    const rendered = renderTemplate(template, { ...vars, expected_certhash: printed ?? "" });
+    expect(rendered).toContain(`expected_certhash = "uEi${"A".repeat(44)}"`);
+    expect(rendered).toContain('upstream_ingress = "127.0.0.1:27032"');
+    expect(rendered).not.toMatch(/\{[a-z_]+\}/u);
   });
 });
 

@@ -1,15 +1,23 @@
 // Composition of the test-bed pieces, shared by the Playwright fixtures and the
 // long-running `pnpm testbed` CLI.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { startAnvil, type AnvilChain } from "./anvil.js";
 import { sidecarAdminPort, sidecarUdpPort, type TestbedConfig } from "./config.js";
-import { ContentStore } from "./content-store.js";
+import { ContentStore, keccakPath } from "./content-store.js";
 import { TestbedError } from "./errors.js";
-import { startSidecar, type RunningKpsServer } from "./kps-server.js";
+import { parseKpsAddress, startSidecar, type RunningKpsServer, type SidecarVars } from "./kps-server.js";
 import { startMesh, type MeshNodeInfo, type RunningMesh } from "./mesh.js";
+import { delay } from "./process.js";
+import {
+  deployLocalRegistry,
+  registerMembers,
+  waitForServedRegistry,
+  type LocalRegistry,
+  type RegistryMember,
+} from "./registry.js";
 import { startResolverServer, type ResolverServer } from "./resolver-server.js";
 import { deploySpecifier } from "./specifier.js";
 
@@ -108,11 +116,66 @@ export async function publishWorker(
   return { address, workerHash, resolvers, bytes: bundle.length };
 }
 
+/** Which identity a restarted sidecar serves. */
+export type SidecarIdentity = "original" | "rotated";
+
+/**
+ * Put `bundle` where every nox-kps sidecar serves it (`keccak_dir/<hh>/<62>`,
+ * read-only, the layout `nox-kps bundle add` writes) and deploy a
+ * WorkerSpecifier whose only resolver is `kps:<entry>/keccak/<hh>/<62>` (the
+ * anon-rpc `kps:` resolver profile). The sidecars rescan the directory every
+ * `limits.bundle_rescan_secs`; `settleMs` waits that out before returning.
+ */
+export async function publishWorkerViaKps(
+  chains: Chains,
+  resolver: Resolver,
+  bundle: Uint8Array,
+  keccakDir: string,
+  kpsAddress: string,
+  settleMs: number,
+): Promise<PublishedWorker> {
+  const workerHash = resolver.store.put(bundle);
+  const relative = keccakPath(workerHash);
+  const file = join(keccakDir, ...relative.split("/").slice(2));
+  mkdirSync(dirname(file), { recursive: true });
+  if (!existsSync(file)) {
+    writeFileSync(file, bundle);
+    chmodSync(file, 0o444);
+  }
+  const resolvers = [`kps:${kpsAddress}${relative}`];
+  const address = await deploySpecifier(chains.specifier.url, chains.specifier.account, { workerHash, resolvers });
+  await delay(settleMs);
+  return { address, workerHash, resolvers, bytes: bundle.length };
+}
+
 export interface MeshWithSidecars {
   readonly mesh: RunningMesh;
-  /** nox-kps sidecar per node id; empty when NOX_KPS_CMD is unset. */
+  /** nox-kps sidecar per node id; empty when NOX_KPS_CMD is unset. Entries change with stop/start below. */
   readonly sidecars: ReadonlyMap<number, RunningKpsServer>;
+  /** The NoxRegistry the nodes observe, with the members registered in it (absent with E2E_LOCAL_REGISTRY=0). */
+  readonly registry: RegisteredRegistry | undefined;
+  /** KPS address each node published on chain (the one the snapshot pins). */
+  readonly publishedKps: ReadonlyMap<number, string>;
+  /** Stop node `id`'s sidecar (failure drills). */
+  stopSidecar(id: number): Promise<void>;
+  /**
+   * Start node `id`'s sidecar again on the same UDP port: with its original
+   * identity, or with a fresh one, which changes the certhash under the
+   * published (pinned) address (TC-570 key rotation).
+   */
+  startSidecar(id: number, identity: SidecarIdentity): Promise<RunningKpsServer>;
   stop(): Promise<void>;
+}
+
+export interface RegisteredRegistry extends LocalRegistry {
+  /** Block of the last registration; the snapshot is taken here. */
+  readonly registeredBlock: number;
+  readonly members: readonly RegistryMember[];
+}
+
+/** The registry metadataUrl of a KPS address (ARCHITECTURE §6). */
+export function kpsMetadataUrl(address: string): string {
+  return `kps:${address}/metadata.json`;
 }
 
 export async function startMeshWithSidecars(
@@ -120,54 +183,127 @@ export async function startMeshWithSidecars(
   paths: RunPaths,
   upstream: AnvilChain,
 ): Promise<MeshWithSidecars> {
+  // The registry exists before the nodes start, so every chain observer
+  // follows it from its first block.
+  const local = config.mesh.localRegistry
+    ? await deployLocalRegistry(upstream.url, upstream.account, upstream.chainId)
+    : undefined;
   const mesh = await startMesh({
     binaries: config.nox,
     config: config.mesh,
     upstreamAnvilPort: upstream.port,
     dataDir: paths.mesh,
     logDir: paths.logs,
+    ...(local === undefined ? {} : { registry: { address: local.address, chainId: local.chainId } }),
   });
   const sidecars = new Map<number, RunningKpsServer>();
+  const published = new Map<number, string>();
+  let rotations = 0;
   const stopAll = async (): Promise<void> => {
     await Promise.all([...sidecars.values()].map((sidecar) => sidecar.stop()));
+    sidecars.clear();
     await mesh.stop();
   };
-  if (config.kps.sidecarCommand !== undefined) {
-    try {
+  const varsFor = (node: MeshNodeInfo, keyName: string, certhash: string): SidecarVars => {
+    const udpPort = sidecarUdpPort(config.mesh.basePort, node.id);
+    return {
+      node: node.id,
+      node_address: node.address,
+      udp_port: udpPort,
+      advertise_ip: config.kps.advertiseIp,
+      listen: `${config.kps.advertiseIp}:${udpPort}`,
+      ingress_port: node.ingressPort,
+      ingress_url: node.ingressUrl,
+      topology_port: node.metricsPort,
+      topology_url: node.topologyUrl,
+      admin_port: sidecarAdminPort(config.mesh.basePort, node.id),
+      key_file: join(paths.kps, `${keyName}.key`),
+      config_file: join(paths.kps, `${keyName}.conf`),
+      bundle_dir: paths.keccak,
+      expected_certhash: certhash,
+    };
+  };
+  const launch = async (node: MeshNodeInfo, keyName: string, certhash: string): Promise<RunningKpsServer> => {
+    const command = config.kps.sidecarCommand;
+    if (command === undefined) throw new TestbedError("config", "NOX_KPS_CMD is unset; there are no sidecars to start");
+    const sidecar = await startSidecar({
+      commandTemplate: command,
+      initCommandTemplate: config.kps.sidecarInitCommand,
+      configTemplate: config.kps.sidecarConfigTemplate,
+      logDir: paths.logs,
+      addressTimeoutMs: config.kps.addressTimeoutMs,
+      vars: varsFor(node, keyName, certhash),
+    });
+    sidecars.set(node.id, sidecar);
+    return sidecar;
+  };
+  const nodeById = (id: number): MeshNodeInfo => {
+    const node = mesh.info.nodes[id];
+    if (node === undefined) throw new TestbedError("config", `the mesh has no node ${id}`);
+    return node;
+  };
+
+  let registry: RegisteredRegistry | undefined;
+  try {
+    if (config.kps.sidecarCommand !== undefined) {
       for (const node of mesh.info.nodes) {
-        const udpPort = sidecarUdpPort(config.mesh.basePort, node.id);
-        sidecars.set(
-          node.id,
-          await startSidecar({
-            commandTemplate: config.kps.sidecarCommand,
-            initCommandTemplate: config.kps.sidecarInitCommand,
-            configTemplate: config.kps.sidecarConfigTemplate,
-            logDir: paths.logs,
-            addressTimeoutMs: config.kps.addressTimeoutMs,
-            vars: {
-              node: node.id,
-              node_address: node.address,
-              udp_port: udpPort,
-              advertise_ip: config.kps.advertiseIp,
-              listen: `${config.kps.advertiseIp}:${udpPort}`,
-              ingress_port: node.ingressPort,
-              ingress_url: node.ingressUrl,
-              topology_port: node.metricsPort,
-              topology_url: node.topologyUrl,
-              admin_port: sidecarAdminPort(config.mesh.basePort, node.id),
-              key_file: join(paths.kps, `node-${node.id}.key`),
-              config_file: join(paths.kps, `node-${node.id}.conf`),
-              bundle_dir: paths.keccak,
-            },
-          }),
-        );
+        const sidecar = await launch(node, `node-${node.id}`, "");
+        published.set(node.id, sidecar.address);
       }
-    } catch (error) {
-      await stopAll();
-      throw error;
     }
+    const members: RegistryMember[] = mesh.info.nodes.map((node) => {
+      const kps = published.get(node.id);
+      return {
+        address: node.address,
+        sphinxKey: node.sphinxPublicKey,
+        url: node.p2pMultiaddr,
+        ingressUrl: node.ingressUrl,
+        metadataUrl: kps === undefined ? "" : kpsMetadataUrl(kps),
+        role: node.role,
+      };
+    });
+    if (local !== undefined) {
+      const registeredBlock = await registerMembers(upstream.url, local, members);
+      await waitForServedRegistry(
+        mesh.info.nodes.map((node) => node.topologyUrl),
+        members,
+        registeredBlock,
+        config.mesh.registrySyncTimeoutMs,
+      );
+      registry = { ...local, registeredBlock, members };
+    }
+  } catch (error) {
+    await stopAll();
+    throw error;
   }
-  return { mesh, sidecars, stop: stopAll };
+
+  return {
+    mesh,
+    sidecars,
+    registry,
+    publishedKps: published,
+    stopSidecar: async (id) => {
+      const running = sidecars.get(id);
+      sidecars.delete(id);
+      if (running !== undefined) await running.stop();
+    },
+    startSidecar: async (id, identity) => {
+      const node = nodeById(id);
+      const current = sidecars.get(id);
+      if (current !== undefined) {
+        sidecars.delete(id);
+        await current.stop();
+      }
+      if (identity === "rotated") {
+        rotations += 1;
+        return launch(node, `node-${id}-rotated-${rotations}`, "");
+      }
+      const original = published.get(id);
+      if (original === undefined) throw new TestbedError("config", `node ${id} never had a sidecar`);
+      return launch(node, `node-${id}`, parseKpsAddress(original).certhash);
+    },
+    stop: stopAll,
+  };
 }
 
 /** Machine-readable description of a running test bed (written to testbed.json). */
@@ -181,7 +317,16 @@ export interface TestbedInfo {
   readonly mesh?: {
     readonly mixDelayMs: number;
     readonly seedUrl: string;
+    /** `kpsAddress`: the KPS address the node published on chain (pinned by snapshots). */
     readonly nodes: readonly (MeshNodeInfo & { readonly kpsAddress?: string })[];
+    /** The NoxRegistry on the upstream chain the nodes observe; snapshots come from it. */
+    readonly registry?: {
+      readonly address: string;
+      readonly chainId: number;
+      readonly rpcUrl: string;
+      readonly deployBlock: number;
+      readonly registeredBlock: number;
+    };
   };
   readonly workers?: Readonly<Record<string, PublishedWorker>>;
 }
@@ -212,9 +357,20 @@ export function describeTestbed(input: TestbedInfoInput): TestbedInfo {
           mixDelayMs: input.config.mesh.mixDelayMs,
           seedUrl: mesh.mesh.seedUrl,
           nodes: mesh.mesh.info.nodes.map((node) => {
-            const sidecar = mesh.sidecars.get(node.id);
-            return sidecar === undefined ? node : { ...node, kpsAddress: sidecar.address };
+            const kpsAddress = mesh.publishedKps.get(node.id);
+            return kpsAddress === undefined ? node : { ...node, kpsAddress };
           }),
+          ...(mesh.registry === undefined
+            ? {}
+            : {
+              registry: {
+                address: mesh.registry.address,
+                chainId: mesh.registry.chainId,
+                rpcUrl: input.chains.upstream.url,
+                deployBlock: mesh.registry.deployBlock,
+                registeredBlock: mesh.registry.registeredBlock,
+              },
+            }),
         },
       }),
     ...(input.workers === undefined ? {} : { workers: input.workers }),

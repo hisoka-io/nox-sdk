@@ -5,11 +5,16 @@ This package runs the Nox anon-rpc worker the way a wallet runs it, entirely on 
 ```
 headless Chromium (Playwright)
   host page: published @anon-rpc/browser-harness 0.3.2 and 0.3.0
-    reads a WorkerSpecifier on a local anvil chain, fetches the bundle from a local keccak resolver,
-    verifies keccak256, boots the worker in the harness sandbox
+    reads a WorkerSpecifier on a local anvil chain, fetches the bundle from a local keccak resolver
+    (or over KPS from a nox-kps sidecar, `kps:` resolver), verifies keccak256, boots the worker in
+    the harness sandbox
       worker -> anonRpcWorker.kps (WebRTC) -> nox-kps sidecar (one per node, UDP base+10N+5)
         -> 10-node local Nox mesh (nox_mesh_server, real nox processes)
           -> exit HttpRequest -> upstream anvil (the wallet's RPC URL)
+
+upstream anvil also holds a NoxRegistry (behind an ERC1967 proxy) that every node observes; each node
+is registered there with its sphinx key, multiaddr, ingress URL and `kps:` metadataUrl, and the worker's
+pinned snapshot is generated from it with the release tooling (scripts/make-snapshot.mjs)
 ```
 
 It also proves each layer on its own first: the harness with the upstream passthrough worker, browser
@@ -40,7 +45,7 @@ servers), solc 0.8.28 only to regenerate the vendored specifier artifact.
 | `kps-webrtc.spec.ts` | Browser WebRTC-KPS in this environment: the page dials with `@kpstreams/webrtc-client` and a hash-pinned probe worker dials through `anonRpcWorker.kps` (`dial` and `openStream`). Echo (32 B, 32 KiB, 512 KiB, 10 sequential and 4 parallel streams) against the Go and Rust reference servers; small-request/large-response (32 KiB to 16 MiB) against `tools/kps-bulk-server`. Loopback and the host's external IPv4, with Chromium's default WebRTC settings and with the flags the upstream anon-rpc e2e uses. | KPS servers |
 | `classic-sdk.spec.ts` | The existing SDK transport (HTTP ingress, seed topology, SURB replies) through the 10-node mesh: echo, then `eth_chainId`, `eth_getBalance`, a 3-call batch and a JSON-RPC error through an exit to the upstream anvil, compared with direct calls. | nox binaries, SDK dist |
 | `nox-kps-sidecar.spec.ts` | One nox-kps per mesh node, reached from a hash-pinned probe worker through `anonRpcWorker.kps` with KPS-HTTP/1: `/topology` matches the node's own topology, `/health` and `/metadata.json` answer, `/api/v1/ws` stays unexposed. Runs once `NOX_KPS_CMD` is set. | nox binaries, nox-kps |
-| `nox-worker.spec.ts` | The Nox worker through harness → KPS → nox-kps → mesh → exit → anvil: boot (`.ready`, sandbox), JSON-RPC parity with direct calls, a signed transaction landing on the upstream chain, calls issued before `ready`, host abort, `bad-config`, a latency sample. Every test runs under the egress check below, from page load on. Harness 0.3.2 and 0.3.0. Runs once `NOX_KPS_CMD` and a worker bundle are present. | everything above, nox-kps, worker bundle |
+| `nox-worker.spec.ts` | The Nox worker through harness → KPS → nox-kps → mesh → exit → anvil, with a bundle built for this run (snapshot of the local NoxRegistry): boot by specifier (`.ready`, sandbox) on harness 0.3.2 and 0.3.0; the JSON-RPC matrix compared with direct calls (`eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_call`, `eth_getLogs` small and about 1 MB, a 4-call batch, an invalid and a valid `eth_sendRawTransaction`, an unknown method); the bundle served by a sidecar through a `kps:` resolver only; calls issued before `ready`; host abort (queued and in flight); `worker.close()` with calls in flight, then a fresh worker; `bad-config`; boot time and per-call p50/p95; drills TC-571 (an entry goes down, calls move to the other) and TC-570 (a rotated certhash under the pinned address: no fallback, `timeout`, other entries keep serving). Every test runs under the egress check below, from page load on. | everything above, nox-kps, worker bundle |
 
 Reports land in `.run/reports/*.json` (latest) and in each run directory `.run/<timestamp>-<label>-<pid>/`
 (`logs/` for anvil, mesh, node, KPS server, page console; `testbed.json`; `reports/`).
@@ -71,9 +76,12 @@ It prints every endpoint, writes `testbed.json` in the run directory and stops e
 
 ## nox-kps sidecars
 
-`run-all.sh` sets this up from `NOX_KPS_REPO`. By hand: build with `scripts/build-nox-kps-testbed.sh` (add
-`--ipfilter` on hosts whose `lo` carries more than one IPv4 address, see below), then set a command template; the bed
-renders it once per mesh node and reads the KPS address the process prints:
+`run-all.sh` sets this up from `NOX_KPS_REPO`, which defaults to `NOX_REPO` (nox-kps is `crates/nox-kps` in the nox
+repository). By hand: build with `scripts/build-nox-kps-testbed.sh` (add `--ipfilter` on hosts whose `lo` carries
+more than one IPv4 address, see below; that build patches the exact kps revision the checkout's `Cargo.lock` pins),
+then set a command template; the bed renders it once per mesh node, runs `init` once per identity, writes the
+certhash `init` printed into the config as `expected_certhash` (`run` serves no other identity), and reads the KPS
+address the process prints:
 
 ```sh
 export NOX_KPS_BIN=$PWD/.cache/bin/nox-kps            # or .cache/bin/nox-kps-ipfilter
@@ -83,19 +91,41 @@ export NOX_KPS_CMD="$NOX_KPS_BIN --config {config_file} run"
 ```
 
 Placeholders: `{node}`, `{node_address}`, `{udp_port}`, `{advertise_ip}`, `{listen}`, `{ingress_port}`, `{ingress_url}`,
-`{topology_port}`, `{topology_url}`, `{admin_port}`, `{key_file}`, `{config_file}`, `{bundle_dir}`. Values never contain
+`{topology_port}`, `{topology_url}`, `{admin_port}`, `{key_file}`, `{config_file}`, `{bundle_dir}`, `{expected_certhash}`. Values never contain
 whitespace and commands run without a shell. Port layout per node N: p2p `base+10N`, metrics and topology `+1`,
 ingress `+2`, nox-kps UDP `+5`, nox-kps admin `+6` (base 27000 by default, `E2E_BASE_PORT`; the plan's bed L uses
 14000).
 
+## Local NoxRegistry
+
+Before the mesh starts, the bed deploys `NoxRegistry` behind an `ERC1967Proxy` on the upstream anvil
+(`src/registry.ts`, artifacts in `contracts/`) and starts `nox_mesh_server --registry-address <proxy>
+--chain-id <id>`, so every node's chain observer follows it. Once each node's nox-kps sidecar has its identity,
+the bed registers every node with `registerPrivileged` (sphinx key, multiaddr, ingress URL,
+`kps:<ip>:<port>:<certhash>/metadata.json`, role) and waits until every node serves that registry topology at
+the registration block or later. That gives the worker what the fleet gives it: `/topology` documents whose
+block and member profiles match the pinned snapshot. `E2E_LOCAL_REGISTRY=0` starts the mesh without it (the
+classic path works either way; the Nox worker spec then skips).
+
+`contracts/NoxRegistry.json` and `contracts/ERC1967Proxy.json` are compiled from a hisoka-io/darkpool checkout,
+`contracts/E2eLogEmitter.json` from `contracts/E2eLogEmitter.sol` (the `eth_call` and `eth_getLogs` fixture):
+
+```sh
+DARKPOOL_REPO=/path/to/darkpool bash scripts/compile-local-contracts.sh
+```
+
 ## Nox worker bundle
 
 The worker pins its topology snapshot inside the bundle, and the mesh generates fresh node keys on every run, so the
-bundle is built for the running mesh:
+bundle is built for the running mesh. `run-all.sh` sets this when the sidecars run:
 
 ```sh
 export NOX_WORKER_BUILD_CMD="node ../scripts/build-test-worker.mjs --testbed {testbed_json} --out {out}"
 ```
+
+`build-test-worker.mjs` runs `make-snapshot.mjs` against the local registry at the registration block, with
+capability hints from a node's served liveness section, then `build.mjs --snapshot`; the snapshot, networks and
+capability files are written next to the bundle in the run directory.
 
 `{testbed_json}` is the run's `testbed.json` (`src/testbed.ts` `TestbedInfo`): `mesh.nodes[]` with `id`, `role`
 (1 relay, 2 exit, 3 full), `address`, `sphinxPublicKey`, `peerId`, `p2pMultiaddr`, `ingressUrl`, `topologyUrl` and
@@ -112,7 +142,8 @@ Every port, path, timeout and size comes from `src/config.ts`; each default can 
 |---|---|---|
 | `NOX_REPO`, `NOX_BIN`, `NOX_MESH_BIN` | `../nox-e2e`, `../nox`, `../nox-clean` next to nox-sdk | nox checkout and binaries |
 | `E2E_MESH_NODES`, `E2E_MESH_ROLES` | 10, fleet layout `1,1,1,1,1,2,2,1,1,2` | mesh size and registry roles |
-| `E2E_BASE_PORT`, `E2E_MIX_DELAY_MS` | 27000, 0 | mesh ports, Poisson mix delay per hop |
+| `E2E_BASE_PORT`, `E2E_MIX_DELAY_MS` | 27000, 0 | mesh ports (keep the range below the kernel's ephemeral ports, 32768 on Linux), Poisson mix delay per hop |
+| `E2E_LOCAL_REGISTRY`, `E2E_BLOCK_POLL_SECS`, `E2E_REGISTRY_SYNC_TIMEOUT_MS` | 1, 1, 60000 | local NoxRegistry on/off, node chain-observer poll, wait for nodes to serve it |
 | `E2E_SPECIFIER_CHAIN_ID`, `E2E_UPSTREAM_CHAIN_ID` | 1, 31337 | anvil chain ids |
 | `KPS_BIN_DIR`, `E2E_KPS_IP`, `E2E_KPS_DEBUG` | `.cache/bin`, 127.0.0.1, off | KPS servers |
 | `E2E_KPS_ECHO_SIZES`, `E2E_KPS_DOWNLOAD_SIZES` | `32,32768,524288`, `32768,1048576,4194304,16777216` | KPS probe sizes |
@@ -159,8 +190,9 @@ page/          host page script (window.e2e), bundled per harness version
 workers/       hash-pinned test workers: KPS probe, leaky worker (egress negative control)
 shared/        echo, bulk and KPS-HTTP/1 helpers used by the page and the probe worker
 tools/         kps-bulk-server (Go, built against ethereum/kps libs/go)
-contracts/     vendored reference WorkerSpecifier (MIT) and its compiled artifact
+contracts/     vendored reference WorkerSpecifier (MIT) and its compiled artifact; NoxRegistry, ERC1967Proxy and
+               E2eLogEmitter artifacts (scripts/compile-local-contracts.sh)
 fixtures/      upstream passthrough worker bundle, nox-kps config template
 tests/unit     vitest; tests/e2e Playwright specs
-scripts/       run-all, KPS server builds, specifier compile
+scripts/       run-all, KPS server and nox-kps builds, specifier and local contract compiles
 ```

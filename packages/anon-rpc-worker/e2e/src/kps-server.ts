@@ -67,6 +67,9 @@ export interface RunningKpsServer {
   stop(): Promise<void>;
 }
 
+/** The certhash `nox-kps init` prints for a new identity. */
+export const INIT_CERTHASH_PATTERN = /^certhash: (uEi[A-Za-z0-9_-]{44})$/mu;
+
 /** Reference echo servers, plus "go-bulk" (tools/kps-bulk-server: small request, large response). */
 export type EchoServerKind = "rust" | "rust-ipfilter" | "go" | "go-bulk";
 
@@ -152,6 +155,12 @@ export interface SidecarVars {
   readonly key_file: string;
   readonly config_file: string;
   readonly bundle_dir: string;
+  /**
+   * Certhash of the identity at {key_file}: `nox-kps run` serves only the
+   * identity named here. Empty until `init` has printed it (startSidecar fills
+   * it in), or the known certhash when the key file already exists.
+   */
+  readonly expected_certhash: string;
 }
 
 const PLACEHOLDER = /\{([a-z_]+)\}/gu;
@@ -188,21 +197,31 @@ export interface StartSidecarOptions {
   readonly addressTimeoutMs: number;
 }
 
-/** Start one nox-kps sidecar for a mesh node and read the address it prints. */
+function writeSidecarConfig(options: StartSidecarOptions, vars: SidecarVars): void {
+  if (options.configTemplate === undefined) return;
+  const template = readFileSync(options.configTemplate, "utf8");
+  writeFileSync(vars.config_file, renderTemplate(template, vars));
+}
+
+/**
+ * Start one nox-kps sidecar for a mesh node and read the address it prints.
+ * With an init command and no key file yet, the identity is created first and
+ * the certhash `init` prints becomes {expected_certhash} (the operator's
+ * confirmation step: `run` refuses any other identity). With an existing key
+ * file, init is skipped and `vars.expected_certhash` must name its certhash.
+ */
 export async function startSidecar(options: StartSidecarOptions): Promise<RunningKpsServer> {
   for (const [name, value] of Object.entries(options.vars)) {
     if (/\s/u.test(String(value))) {
       throw new TestbedError("config", `nox-kps placeholder {${name}} contains whitespace: ${String(value)}`);
     }
   }
-  if (options.configTemplate !== undefined) {
-    const template = readFileSync(options.configTemplate, "utf8");
-    writeFileSync(options.vars.config_file, renderTemplate(template, options.vars));
-  }
-  const label = `nox-kps(node ${options.vars.node})`;
-  const logFile = join(options.logDir, `nox-kps-node-${options.vars.node}.log`);
-  if (options.initCommandTemplate !== undefined) {
-    const init = splitCommand(renderTemplate(options.initCommandTemplate, options.vars));
+  let vars = options.vars;
+  writeSidecarConfig(options, vars);
+  const label = `nox-kps(node ${vars.node})`;
+  const logFile = join(options.logDir, `nox-kps-node-${vars.node}.log`);
+  if (options.initCommandTemplate !== undefined && !existsSync(vars.key_file)) {
+    const init = splitCommand(renderTemplate(options.initCommandTemplate, vars));
     const initProc = ManagedProcess.start({ label: `${label} init`, command: init.command, args: init.args, logFile });
     const timer = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), options.addressTimeoutMs));
     const outcome = await Promise.race([initProc.exited, timer]);
@@ -213,10 +232,20 @@ export async function startSidecar(options: StartSidecarOptions): Promise<Runnin
         `${label}: NOX_KPS_INIT_CMD ${outcome === "timeout" ? `did not finish within ${options.addressTimeoutMs} ms` : `exited with code ${String(outcome.code)}`} (log: ${logFile})\n${initProc.tail()}`,
       );
     }
+    const certhash = INIT_CERTHASH_PATTERN.exec(initProc.output)?.[1];
+    if (certhash !== undefined) {
+      vars = { ...vars, expected_certhash: certhash };
+      writeSidecarConfig(options, vars);
+    }
+  } else if (options.initCommandTemplate !== undefined && vars.expected_certhash.length === 0) {
+    throw new TestbedError(
+      "config",
+      `${label}: key file ${vars.key_file} exists but no expected certhash was given; pass the identity's certhash to restart it`,
+    );
   }
   await assertUdpPortsFree([options.vars.udp_port], `${label} KPS listener`);
   await assertTcpPortsFree([options.vars.admin_port], `${label} admin endpoint`, "127.0.0.1");
-  const { command, args } = splitCommand(renderTemplate(options.commandTemplate, options.vars));
+  const { command, args } = splitCommand(renderTemplate(options.commandTemplate, vars));
   const proc = ManagedProcess.start({ label, command, args, logFile });
   const address = await readAddressOrStop(proc, options.addressTimeoutMs);
   return { label, address, logFile, stop: () => proc.stop("SIGTERM") };

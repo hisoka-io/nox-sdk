@@ -111,6 +111,12 @@ export interface StartMeshOptions {
   readonly upstreamAnvilPort: number;
   readonly dataDir: string;
   readonly logDir: string;
+  /**
+   * NoxRegistry on the upstream chain for every node's chain observer
+   * (`nox_mesh_server --registry-address`). Without it the nodes serve the
+   * admin-injected topology at block 0.
+   */
+  readonly registry?: { readonly address: string; readonly chainId: number };
 }
 
 function assertBinary(path: string, what: string, repo: string): void {
@@ -144,6 +150,13 @@ export async function startMesh(options: StartMeshOptions): Promise<RunningMesh>
       "--anvil-port", String(options.upstreamAnvilPort),
       "--mix-delay-ms", String(config.mixDelayMs),
       "--nox-binary", binaries.noxBin,
+      ...(options.registry === undefined
+        ? []
+        : [
+          "--registry-address", options.registry.address,
+          "--chain-id", String(options.registry.chainId),
+          "--block-poll-interval-secs", String(config.blockPollIntervalSecs),
+        ]),
     ],
     // Keep node logs after teardown for post-mortems (<data-dir>/node_N/node.log).
     env: { NOX_KEEP_LOGS: "1" },

@@ -17,3 +17,20 @@ pnpm compile:specifier        # or: bash scripts/compile-specifier.sh (SOLC=/pat
 
 `tests/unit/codecs.test.ts` ("vendored WorkerSpecifier artifact") checks that the artifact records the sha256 of the vendored source,
 so the two cannot drift apart silently.
+
+# Local chain fixtures
+
+`NoxRegistry.json` and `ERC1967Proxy.json` hold the ABI and creation bytecode of the Nox registry
+(`packages/evm-contracts/contracts/nox/NoxRegistry.sol` in hisoka-io/darkpool, Apache-2.0) and the OpenZeppelin
+proxy it is deployed behind, compiled with solc 0.8.28 and the darkpool settings for the registry (optimizer runs 1,
+evm cancun). Each artifact records the source commit and sha256. The bed deploys them on the upstream anvil so the
+mesh nodes observe a real registry and the worker's snapshot is generated from it (`src/registry.ts`).
+
+`E2eLogEmitter.sol` (Apache-2.0, this package) gives the JSON-RPC matrix an `eth_call` target and `eth_getLogs`
+results of a chosen size; `E2eLogEmitter.json` is its artifact.
+
+Regenerate all three with:
+
+```sh
+DARKPOOL_REPO=/path/to/darkpool bash scripts/compile-local-contracts.sh
+```

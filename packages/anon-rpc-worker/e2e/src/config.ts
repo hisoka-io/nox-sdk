@@ -37,6 +37,16 @@ export interface MeshConfig {
   readonly mixDelayMs: number;
   readonly startupTimeoutMs: number;
   readonly teardownGraceMs: number;
+  /**
+   * Deploy a NoxRegistry on the upstream chain and have the nodes observe it
+   * (default). Off: the nodes serve the admin-injected topology at block 0,
+   * which the classic path accepts and the KPS worker does not.
+   */
+  readonly localRegistry: boolean;
+  /** Chain observer poll interval of the mesh nodes (local NoxRegistry). */
+  readonly blockPollIntervalSecs: number;
+  /** Deadline for every node to serve the registry topology after registration. */
+  readonly registrySyncTimeoutMs: number;
 }
 
 export interface AnvilConfig {
@@ -158,6 +168,9 @@ export function loadConfig(env: Env = process.env, e2eRoot: string = E2E_ROOT): 
       mixDelayMs: numberFrom(env, "E2E_MIX_DELAY_MS", 0, 0, 10_000),
       startupTimeoutMs: intFrom(env, "E2E_MESH_STARTUP_TIMEOUT_MS", 180_000, 5_000, 1_800_000),
       teardownGraceMs: intFrom(env, "E2E_MESH_TEARDOWN_GRACE_MS", 10_000, 500, 120_000),
+      localRegistry: env["E2E_LOCAL_REGISTRY"] !== "0",
+      blockPollIntervalSecs: intFrom(env, "E2E_BLOCK_POLL_SECS", 1, 1, 60),
+      registrySyncTimeoutMs: intFrom(env, "E2E_REGISTRY_SYNC_TIMEOUT_MS", 60_000, 1_000, 600_000),
     },
     anvil: {
       bin: env["ANVIL_BIN"] ?? "anvil",

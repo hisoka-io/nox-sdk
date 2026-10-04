@@ -30,6 +30,7 @@ async function vars(dir: string): Promise<SidecarVars> {
     key_file: join(dir, "key"),
     config_file: join(dir, "config.toml"),
     bundle_dir: dir,
+    expected_certhash: "",
   };
 }
 

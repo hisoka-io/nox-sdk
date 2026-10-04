@@ -5,6 +5,8 @@ listen = "{listen}"
 advertise = ["{advertise_ip}"]
 allow_private_advertise = true
 key_file = "{key_file}"
+# The certhash `nox-kps init` printed; `run` serves no other identity.
+expected_certhash = "{expected_certhash}"
 node_address = "{node_address}"
 upstream_ingress = "127.0.0.1:{ingress_port}"
 upstream_topology = "127.0.0.1:{topology_port}"
@@ -12,3 +14,7 @@ keccak_dir = "{bundle_dir}"
 admin_listen = "127.0.0.1:{admin_port}"
 log_level = "info"
 summary_interval_secs = 0
+
+[limits]
+# Pick up bundles added for the kps: resolver within a second.
+bundle_rescan_secs = 1
