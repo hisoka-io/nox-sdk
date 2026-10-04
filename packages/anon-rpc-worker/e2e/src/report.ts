@@ -30,3 +30,22 @@ export function percentile(values: readonly number[], p: number): number | undef
   const rank = Math.max(1, Math.ceil((p / 100) * sorted.length));
   return sorted[Math.min(rank, sorted.length) - 1];
 }
+
+export interface LatencySummary {
+  readonly n: number;
+  readonly min: number | undefined;
+  readonly p50: number | undefined;
+  readonly p95: number | undefined;
+  readonly max: number | undefined;
+}
+
+/** n, min, nearest-rank p50 and p95, max of a sample. */
+export function summarize(values: readonly number[]): LatencySummary {
+  return {
+    n: values.length,
+    min: values.length === 0 ? undefined : Math.min(...values),
+    p50: percentile(values, 50),
+    p95: percentile(values, 95),
+    max: values.length === 0 ? undefined : Math.max(...values),
+  };
+}
