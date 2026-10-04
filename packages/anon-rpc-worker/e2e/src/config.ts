@@ -28,7 +28,11 @@ export interface NoxBinaries {
 export interface MeshConfig {
   readonly nodes: number;
   readonly roles: readonly MeshRole[];
-  /** Node i uses p2p base+10i, metrics base+10i+1, ingress base+10i+2. */
+  /**
+   * Node i uses p2p base+10i, metrics base+10i+1, ingress base+10i+2, and its
+   * nox-kps sidecar UDP base+10i+5 (TEST-PLAN bed L: 14005+10N) and admin
+   * TCP base+10i+6.
+   */
   readonly basePort: number;
   readonly mixDelayMs: number;
   readonly startupTimeoutMs: number;
@@ -55,10 +59,13 @@ export interface KpsConfig {
    * {placeholders} (see src/kps-server.ts). Unset: the sidecar tests skip.
    */
   readonly sidecarCommand: string | undefined;
+  /**
+   * Optional command template run to completion before each sidecar starts
+   * (nox-kps creates its identity with `init`; `run` never creates one).
+   */
+  readonly sidecarInitCommand: string | undefined;
   /** Optional config-file template rendered to {config_file}. */
   readonly sidecarConfigTemplate: string | undefined;
-  /** UDP port of the sidecar for node i is base + i. */
-  readonly sidecarBasePort: number;
   /** Set KPS_DEBUG=1 on the Rust KPS servers (frame-level tracing; slows them down). */
   readonly debug: boolean;
 }
@@ -66,6 +73,13 @@ export interface KpsConfig {
 export interface WorkerConfig {
   /** The Nox anon-rpc worker bundle produced by the worker package build. */
   readonly bundlePath: string;
+  /**
+   * Command that builds a test bundle for this run's mesh, with {testbed_json}
+   * (input: mesh nodes, sphinx keys, KPS addresses) and {out} (bundle path to
+   * write) placeholders. Unset: bundlePath is used as is.
+   */
+  readonly buildCommand: string | undefined;
+  readonly buildTimeoutMs: number;
   /** JSON file holding the worker config, used verbatim. */
   readonly configPath: string | undefined;
   /** Module exporting buildWorkerConfig(testbed) => unknown. */
@@ -74,6 +88,12 @@ export interface WorkerConfig {
   readonly callTimeoutMs: number;
   /** signalFailed code the worker documents for an unusable config. */
   readonly expectedBadConfigCode: string;
+}
+
+export interface ClassicSdkConfig {
+  /** Built @hisoka-io/nox-client ESM entry (pnpm --filter @hisoka-io/nox-client build). */
+  readonly clientEntry: string;
+  readonly callTimeoutMs: number;
 }
 
 export interface TestbedConfig {
@@ -86,8 +106,24 @@ export interface TestbedConfig {
   readonly anvil: AnvilConfig;
   readonly kps: KpsConfig;
   readonly worker: WorkerConfig;
+  readonly classic: ClassicSdkConfig;
   /** Upper bound for one Chromium page operation that has no other deadline. */
   readonly pageTimeoutMs: number;
+}
+
+/** Offset of a node's nox-kps UDP port from its p2p port (bed L: 14005+10N). */
+export const KPS_UDP_OFFSET = 5;
+/** Offset of a node's nox-kps admin (metrics, health) TCP port from its p2p port. */
+export const KPS_ADMIN_OFFSET = 6;
+
+/** Admin TCP port of the nox-kps sidecar in front of mesh node `id`. */
+export function sidecarAdminPort(basePort: number, id: number): number {
+  return basePort + id * 10 + KPS_ADMIN_OFFSET;
+}
+
+/** UDP port of the nox-kps sidecar in front of mesh node `id`. */
+export function sidecarUdpPort(basePort: number, id: number): number {
+  return basePort + id * 10 + KPS_UDP_OFFSET;
 }
 
 /** Root of this e2e package (the directory holding package.json). */
@@ -101,7 +137,7 @@ export function loadConfig(env: Env = process.env, e2eRoot: string = E2E_ROOT): 
   const nodes = intFrom(env, "E2E_MESH_NODES", 10, 3, 32);
   const roles = rolesFrom(env, "E2E_MESH_ROLES", nodes);
   const basePort = intFrom(env, "E2E_BASE_PORT", 27_000, 1_024, 65_533);
-  const lastPort = basePort + (nodes - 1) * 10 + 2;
+  const lastPort = basePort + (nodes - 1) * 10 + KPS_ADMIN_OFFSET;
   if (lastPort > 65_535) {
     throw new TestbedError(
       "config",
@@ -134,8 +170,8 @@ export function loadConfig(env: Env = process.env, e2eRoot: string = E2E_ROOT): 
       addressTimeoutMs: intFrom(env, "E2E_KPS_ADDRESS_TIMEOUT_MS", 30_000, 1_000, 300_000),
       advertiseIp: ipFrom(env, "E2E_KPS_IP", "127.0.0.1"),
       sidecarCommand: nonEmpty(env["NOX_KPS_CMD"]),
+      sidecarInitCommand: nonEmpty(env["NOX_KPS_INIT_CMD"]),
       sidecarConfigTemplate: optionalPath(env, "NOX_KPS_CONFIG_TEMPLATE", e2eRoot),
-      sidecarBasePort: intFrom(env, "E2E_KPS_BASE_PORT", 27_500, 1_024, 65_000),
       debug: env["E2E_KPS_DEBUG"] === "1",
     },
     worker: {
@@ -145,11 +181,22 @@ export function loadConfig(env: Env = process.env, e2eRoot: string = E2E_ROOT): 
         join(e2eRoot, "..", "dist", "anon-rpc-worker.js"),
         e2eRoot,
       ),
+      buildCommand: nonEmpty(env["NOX_WORKER_BUILD_CMD"]),
+      buildTimeoutMs: intFrom(env, "E2E_WORKER_BUILD_TIMEOUT_MS", 600_000, 1_000, 3_600_000),
       configPath: optionalPath(env, "NOX_WORKER_CONFIG", e2eRoot),
       configModule: optionalPath(env, "NOX_WORKER_CONFIG_MODULE", e2eRoot),
       readyTimeoutMs: intFrom(env, "E2E_WORKER_READY_TIMEOUT_MS", 60_000, 1_000, 600_000),
       callTimeoutMs: intFrom(env, "E2E_CALL_TIMEOUT_MS", 30_000, 1_000, 600_000),
       expectedBadConfigCode: env["E2E_EXPECT_BAD_CONFIG_CODE"] ?? "bad-config",
+    },
+    classic: {
+      clientEntry: pathFrom(
+        env,
+        "NOX_CLIENT_ENTRY",
+        join(sdkRoot, "packages", "nox-client", "dist", "index.js"),
+        e2eRoot,
+      ),
+      callTimeoutMs: intFrom(env, "E2E_CLASSIC_CALL_TIMEOUT_MS", 60_000, 1_000, 600_000),
     },
     pageTimeoutMs: intFrom(env, "E2E_PAGE_TIMEOUT_MS", 30_000, 1_000, 600_000),
   };
@@ -159,7 +206,7 @@ function noxBinaries(env: Env, sdkRoot: string, e2eRoot: string): NoxBinaries {
   const explicitRepo = optionalPath(env, "NOX_REPO", e2eRoot);
   const candidates = explicitRepo !== undefined
     ? [explicitRepo]
-    : [resolve(sdkRoot, "..", "nox"), resolve(sdkRoot, "..", "nox-clean")];
+    : ["nox-e2e", "nox", "nox-clean"].map((name) => resolve(sdkRoot, "..", name));
   const repo = candidates.find((dir) => existsSync(join(dir, "crates"))) ?? candidates[0] ?? sdkRoot;
   return {
     repo,

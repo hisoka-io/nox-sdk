@@ -38,7 +38,7 @@ describe("loadConfig", () => {
   });
 
   it("rejects a base port whose mesh would run past 65535", () => {
-    expect(() => loadConfig({ E2E_BASE_PORT: "65500" }, ROOT)).toThrow(/above 65535/u);
+    expect(() => loadConfig({ E2E_BASE_PORT: "65480" }, ROOT)).toThrow(/above 65535/u);
   });
 
   it("rejects a malformed advertise IP", () => {

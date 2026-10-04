@@ -104,13 +104,15 @@ describe("KPS addresses", () => {
 describe("nox-kps sidecar templates", () => {
   const vars: SidecarVars = {
     node: 3,
-    udp_port: 27_503,
+    node_address: "0x0000000000000000000000000000000000b00003",
+    udp_port: 27_035,
     advertise_ip: "127.0.0.1",
-    listen: "127.0.0.1:27503",
+    listen: "127.0.0.1:27035",
     ingress_port: 27_032,
     ingress_url: "http://127.0.0.1:27032",
     topology_port: 27_031,
     topology_url: "http://127.0.0.1:27031/topology",
+    admin_port: 27_036,
     key_file: "/run/kps/node-3.key",
     config_file: "/run/kps/node-3.conf",
     bundle_dir: "/run/keccak",
@@ -120,7 +122,7 @@ describe("nox-kps sidecar templates", () => {
     const rendered = renderTemplate("/bin/nox-kps --config {config_file} run --port {udp_port}", vars);
     expect(splitCommand(rendered)).toEqual({
       command: "/bin/nox-kps",
-      args: ["--config", "/run/kps/node-3.conf", "run", "--port", "27503"],
+      args: ["--config", "/run/kps/node-3.conf", "run", "--port", "27035"],
     });
   });
 

@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { startAnvil, type AnvilChain } from "./anvil.js";
-import type { TestbedConfig } from "./config.js";
+import { sidecarAdminPort, sidecarUdpPort, type TestbedConfig } from "./config.js";
 import { ContentStore } from "./content-store.js";
 import { TestbedError } from "./errors.js";
 import { startSidecar, type RunningKpsServer } from "./kps-server.js";
@@ -135,16 +135,18 @@ export async function startMeshWithSidecars(
   if (config.kps.sidecarCommand !== undefined) {
     try {
       for (const node of mesh.info.nodes) {
-        const udpPort = config.kps.sidecarBasePort + node.id;
+        const udpPort = sidecarUdpPort(config.mesh.basePort, node.id);
         sidecars.set(
           node.id,
           await startSidecar({
             commandTemplate: config.kps.sidecarCommand,
+            initCommandTemplate: config.kps.sidecarInitCommand,
             configTemplate: config.kps.sidecarConfigTemplate,
             logDir: paths.logs,
             addressTimeoutMs: config.kps.addressTimeoutMs,
             vars: {
               node: node.id,
+              node_address: node.address,
               udp_port: udpPort,
               advertise_ip: config.kps.advertiseIp,
               listen: `${config.kps.advertiseIp}:${udpPort}`,
@@ -152,6 +154,7 @@ export async function startMeshWithSidecars(
               ingress_url: node.ingressUrl,
               topology_port: node.metricsPort,
               topology_url: node.topologyUrl,
+              admin_port: sidecarAdminPort(config.mesh.basePort, node.id),
               key_file: join(paths.kps, `node-${node.id}.key`),
               config_file: join(paths.kps, `node-${node.id}.conf`),
               bundle_dir: paths.keccak,
