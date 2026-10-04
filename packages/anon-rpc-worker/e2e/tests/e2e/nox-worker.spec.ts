@@ -46,7 +46,7 @@ interface Published {
   readonly bundleSource: string;
 }
 
-test.describe.serial("Nox anon-rpc worker over KPS through the local mesh", () => {
+test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
   test.skip(prerequisites.length > 0, prerequisites.join("; "));
 
   let published: Published | undefined;
