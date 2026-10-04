@@ -3,6 +3,8 @@
 #   - Rust `kps-server` from ethereum/kps libs/rust (the `kps` crate v0.2.2 that
 #     the nox-kps sidecar is built on, with its vendored webrtc-rs patches)
 #   - Go `cmd/server` from ethereum/kps libs/go (pion), as a comparison peer
+#   - tools/kps-bulk-server (this package), built against the same libs/go: a
+#     small request in, a large response out, the Nox KPS transport's shape
 #
 # The kps repository is cloned once into the cache directory at a pinned commit.
 #
@@ -42,8 +44,13 @@ if [ "${KPS_SKIP_GO:-0}" != "1" ]; then
     if command -v go >/dev/null 2>&1; then
         echo "[kps] building Go cmd/server"
         (cd "$KPS_REPO_DIR/libs/go" && go build -o "$BIN_DIR/kps-go-server" ./cmd/server)
+        echo "[kps] building Go bulk-response server (tools/kps-bulk-server)"
+        BULK_DIR="$KPS_REPO_DIR/libs/go/cmd/e2e-bulk-server"
+        mkdir -p "$BULK_DIR"
+        install -m 0644 "$HERE/tools/kps-bulk-server/main.go" "$BULK_DIR/main.go"
+        (cd "$KPS_REPO_DIR/libs/go" && go build -o "$BIN_DIR/kps-go-bulk-server" ./cmd/e2e-bulk-server)
     else
-        echo "[kps] go not found; the Go comparison server is skipped"
+        echo "[kps] go not found; the Go comparison and bulk-response servers are skipped"
     fi
 fi
 

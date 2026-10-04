@@ -66,13 +66,15 @@ export interface RunningKpsServer {
   stop(): Promise<void>;
 }
 
-export type EchoServerKind = "rust" | "rust-ipfilter" | "go";
+/** Reference echo servers, plus "go-bulk" (tools/kps-bulk-server: small request, large response). */
+export type EchoServerKind = "rust" | "rust-ipfilter" | "go" | "go-bulk";
 
 /** Binary names produced by scripts/build-kps-servers.sh and build-kps-ipfilter-probe.sh. */
 export const ECHO_SERVER_BINARIES: Readonly<Record<EchoServerKind, string>> = {
   rust: "kps-rust-server",
   "rust-ipfilter": "kps-rust-server-ipfilter",
   go: "kps-go-server",
+  "go-bulk": "kps-go-bulk-server",
 };
 
 export interface StartEchoServerOptions {
@@ -122,6 +124,8 @@ export async function startEchoServer(options: StartEchoServerOptions): Promise<
 /** Values substituted into NOX_KPS_CMD and NOX_KPS_CONFIG_TEMPLATE for mesh node N. */
 export interface SidecarVars {
   readonly node: number;
+  /** Registry-style address of the mesh node (informational, /metadata.json). */
+  readonly node_address: string;
   readonly udp_port: number;
   readonly advertise_ip: string;
   readonly listen: string;
@@ -129,6 +133,7 @@ export interface SidecarVars {
   readonly ingress_url: string;
   readonly topology_port: number;
   readonly topology_url: string;
+  readonly admin_port: number;
   readonly key_file: string;
   readonly config_file: string;
   readonly bundle_dir: string;
@@ -161,6 +166,7 @@ export function splitCommand(rendered: string): { command: string; args: string[
 
 export interface StartSidecarOptions {
   readonly commandTemplate: string;
+  readonly initCommandTemplate: string | undefined;
   readonly configTemplate: string | undefined;
   readonly vars: SidecarVars;
   readonly logDir: string;
@@ -178,9 +184,22 @@ export async function startSidecar(options: StartSidecarOptions): Promise<Runnin
     const template = readFileSync(options.configTemplate, "utf8");
     writeFileSync(options.vars.config_file, renderTemplate(template, options.vars));
   }
-  const { command, args } = splitCommand(renderTemplate(options.commandTemplate, options.vars));
   const label = `nox-kps(node ${options.vars.node})`;
   const logFile = join(options.logDir, `nox-kps-node-${options.vars.node}.log`);
+  if (options.initCommandTemplate !== undefined) {
+    const init = splitCommand(renderTemplate(options.initCommandTemplate, options.vars));
+    const initProc = ManagedProcess.start({ label: `${label} init`, command: init.command, args: init.args, logFile });
+    const timer = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), options.addressTimeoutMs));
+    const outcome = await Promise.race([initProc.exited, timer]);
+    await initProc.stop();
+    if (outcome === "timeout" || outcome.code !== 0) {
+      throw new TestbedError(
+        outcome === "timeout" ? "timeout" : "process-exit",
+        `${label}: NOX_KPS_INIT_CMD ${outcome === "timeout" ? `did not finish within ${options.addressTimeoutMs} ms` : `exited with code ${String(outcome.code)}`} (log: ${logFile})\n${initProc.tail()}`,
+      );
+    }
+  }
+  const { command, args } = splitCommand(renderTemplate(options.commandTemplate, options.vars));
   const proc = ManagedProcess.start({ label, command, args, logFile });
   const match = await proc.waitForOutput(KPS_ADDRESS_PATTERN, options.addressTimeoutMs, "KPS address");
   const address = formatKpsAddress(parseKpsAddress(match[1] ?? ""));

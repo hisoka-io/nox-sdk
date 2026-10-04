@@ -20,6 +20,11 @@ export interface BootRequest {
   /** Worker config (§7.1); omitted means the harness passes no config at all. */
   readonly config?: unknown;
   readonly readyTimeoutMs: number;
+  /**
+   * false: return right after construction, without waiting for `ready`, so
+   * calls can be issued before the worker is ready (AR-37). Default true.
+   */
+  readonly awaitReady?: boolean;
 }
 
 export interface BootResult {
@@ -59,6 +64,8 @@ export interface LogLine {
 
 export interface DirectEchoRequest {
   readonly addr: string;
+  /** "echo" (default) or "download" against tools/kps-bulk-server. */
+  readonly transfer?: "echo" | "download";
   readonly sizes: readonly number[];
   /** Additional sequential streams of sizes[0] bytes on the same connection. */
   readonly sequentialStreams: number;
@@ -83,6 +90,8 @@ export interface E2EPageApi {
   readonly harnessVersion: string;
   boot(request: BootRequest): Promise<BootResult>;
   fetch(request: FetchRequest): Promise<FetchResult>;
+  /** Wait for `ready` of a worker booted with awaitReady: false. */
+  ready(id: string, timeoutMs: number): Promise<BootResult>;
   /** Drain up to `max` log entries, waiting at most `waitMs` for each. */
   logs(id: string, max: number, waitMs: number): Promise<LogLine[]>;
   close(id: string): void;

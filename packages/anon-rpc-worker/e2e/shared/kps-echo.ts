@@ -73,3 +73,30 @@ export async function echoOverStream(stream: ByteStream, size: number, seed: num
     return { bytes: size, ms: Math.round(performance.now() - started), ok: false, error: describe(error) };
   }
 }
+
+/**
+ * Request `size` bytes from a bulk-response server (tools/kps-bulk-server):
+ * write "<size> <seed>\n", half-close, read the response to EOF and compare it
+ * with the expected pattern. This is the Nox transport's shape: a small
+ * request, then a large response.
+ */
+export async function downloadOverStream(stream: ByteStream, size: number, seed: number): Promise<EchoSample> {
+  const started = performance.now();
+  try {
+    const response = readToEnd(stream.readable, size);
+    response.catch(() => undefined);
+    const writer = stream.writable.getWriter();
+    await writer.write(new TextEncoder().encode(`${size} ${seed}\n`));
+    await writer.close();
+    const got = await response;
+    const expected = patternBytes(size, seed);
+    let ok = got.byteLength === size;
+    for (let i = 0; ok && i < size; i++) ok = got[i] === expected[i];
+    const ms = Math.round(performance.now() - started);
+    return ok
+      ? { bytes: size, ms, ok }
+      : { bytes: size, ms, ok, error: `download mismatch: wanted ${size} bytes, got ${got.byteLength}` };
+  } catch (error) {
+    return { bytes: size, ms: Math.round(performance.now() - started), ok: false, error: describe(error) };
+  }
+}

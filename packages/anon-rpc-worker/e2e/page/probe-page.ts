@@ -26,6 +26,8 @@ interface RpcProvider {
 }
 
 const workers = new Map<string, AnonRpcWorker>();
+/** Construction time and the iframes that existed before, per booted worker. */
+const booted = new Map<string, { readonly started: number; readonly before: ReadonlySet<Element> }>();
 
 function errorInfo(error: unknown): ErrorInfo {
   if (error instanceof Error || (typeof error === "object" && error !== null && "message" in error)) {
@@ -96,14 +98,27 @@ const api: E2EPageApi = {
       ...(hasConfig ? { config: request.config } : {}),
     });
     workers.set(request.id, worker);
+    // Observed by ready(); keeps an early rejection from being unhandled.
+    worker.ready.catch(() => undefined);
+    booted.set(request.id, { started, before });
+    if (request.awaitReady === false) {
+      return { ok: true, readyMs: 0, sandbox: null };
+    }
+    return api.ready(request.id, request.readyTimeoutMs);
+  },
+
+  async ready(id: string, timeoutMs: number): Promise<BootResult> {
+    const worker = workerFor(id);
+    const meta = booted.get(id);
+    const started = meta?.started ?? performance.now();
     // The harness creates its iframe once the bundle is verified, so look for
     // it after `ready` settles.
     const sandboxOfNewFrame = (): string | null => {
-      const frame = [...document.querySelectorAll("iframe")].find((candidate) => !before.has(candidate));
+      const frame = [...document.querySelectorAll("iframe")].find((candidate) => !meta?.before.has(candidate));
       return frame?.getAttribute("sandbox") ?? null;
     };
     try {
-      await withTimeout(worker.ready, request.readyTimeoutMs, "worker.ready");
+      await withTimeout(worker.ready, timeoutMs, "worker.ready");
       return { ok: true, readyMs: Math.round(performance.now() - started), sandbox: sandboxOfNewFrame() };
     } catch (error) {
       return {
@@ -161,6 +176,7 @@ const api: E2EPageApi = {
   close(id: string): void {
     workers.get(id)?.close();
     workers.delete(id);
+    booted.delete(id);
   },
 
   async directKpsEcho(request: DirectEchoRequest): Promise<DirectEchoResult> {

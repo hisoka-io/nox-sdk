@@ -7,6 +7,8 @@
 //       dial once (mode=dial) or use kps.openStream per stream (mode=open),
 //       echo each size, then seq sequential and par parallel streams of the first
 //       size; responds 200 with a JSON report (ok=false when any stream failed).
+//       transfer=download switches to small-request/large-response streams
+//       against tools/kps-bulk-server.
 //   kps-http://<ip:port:certhash>/<path>
 //       one KPS-HTTP/1 exchange with the call's method, headers and body;
 //       responds with the server's status, headers and body.
@@ -14,7 +16,7 @@
 import type { AnonFetchResponse, AnonRequestInit, AnonRpcWorkerApi, KpsStream } from "@anon-rpc/browser-harness";
 import { describe, readToEnd } from "../shared/kps-echo.js";
 import { certhashOf, exchange } from "../shared/kps-http.js";
-import { runEchoPlan, type ClosableStream, type StreamOpener } from "../shared/kps-probe.js";
+import { runEchoPlan, type ClosableStream, type EchoPlan, type StreamOpener } from "../shared/kps-probe.js";
 
 declare const anonRpcWorker: AnonRpcWorkerApi;
 
@@ -55,8 +57,10 @@ async function kpsEcho(rest: string): Promise<AnonFetchResponse> {
     if (!Number.isSafeInteger(size) || size < 0 || size > MAX_BYTES) throw new Error(`bad size ${part}`);
     return size;
   });
-  const plan = {
+  const transfer = params.get("transfer") === "download" ? "download" : "echo";
+  const plan: EchoPlan = {
     sizes,
+    transfer,
     sequentialStreams: intParam(params, "seq", 0),
     parallelStreams: intParam(params, "par", 0),
     streamTimeoutMs: intParam(params, "timeout", DEFAULT_TIMEOUT_MS),

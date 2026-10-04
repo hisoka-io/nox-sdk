@@ -1,10 +1,13 @@
 // Step 2 of the test bed: does browser WebRTC-KPS work here (WSL2, headless
-// Chromium)? Each reference KPS echo server from ethereum/kps is dialled
+// Chromium)? Each KPS server is dialled
 //   (a) straight from the host page with @kpstreams/webrtc-client, and
-//   (b) from inside a hash-pinned worker through the harness's anonRpcWorker.kps,
-// with 32 B, 32 KiB (one Sphinx packet) and 1 MiB (past the 1 MiB stream
-// window) echoes, sequential stream cycling and parallel streams. Results are
-// written to .run/reports/kps-webrtc-<project>.json.
+//   (b) from inside a hash-pinned worker through the harness's anonRpcWorker.kps
+//       (kps.dial and the kps.openStream sugar).
+// Echo servers (ethereum/kps Go and Rust): 32 B, 32 KiB (one Sphinx packet) and
+// 512 KiB echoes, sequential stream cycling and parallel streams.
+// Bulk-response server (tools/kps-bulk-server): small request, then 32 KiB to
+// 16 MiB responses, the shape of a Nox response claim.
+// One JSON report per test lands in .run/reports/kps-webrtc-<project>-<server>-<ip>.json.
 
 import { existsSync, readFileSync } from "node:fs";
 import { release } from "node:os";
@@ -13,17 +16,45 @@ import { buildProbeWorker } from "../../src/bundles.js";
 import { echoServerBinary, startEchoServer, type EchoServerKind } from "../../src/kps-server.js";
 import { percentile, writeReport } from "../../src/report.js";
 import { publishWorker, type PublishedWorker } from "../../src/testbed.js";
+import type { TransferKind } from "../../shared/kps-probe.js";
 import { expect, test } from "./fixtures.js";
 import { externalIpv4, loopbackIpv4Addresses } from "./helpers.js";
 
-const SERVER_KINDS: readonly EchoServerKind[] = ["go", "rust", "rust-ipfilter"];
-const SIZES = [32, 32 * 1024, 1024 * 1024];
+const KIB = 1024;
+const MIB = 1024 * KIB;
+
+interface ServerPlan {
+  readonly kind: EchoServerKind;
+  readonly transfer: TransferKind;
+  readonly sizes: readonly number[];
+  /** Size used for sequential and parallel stream cycling. */
+  readonly cycleSize: number;
+}
+
+/**
+ * Echo sizes stay below the default 1 MiB KPS stream window: a single-stream
+ * echo of 1,048,560 bytes or more stalls with both reference servers (pinned
+ * by the "echo at the stream window" test below). Nox requests are at most
+ * 64 KiB per stream, so the Nox path never meets this.
+ */
+const ECHO_SIZES = sizesFrom(process.env["E2E_KPS_ECHO_SIZES"], [32, 32 * KIB, 512 * KIB]);
+const DOWNLOAD_SIZES = sizesFrom(process.env["E2E_KPS_DOWNLOAD_SIZES"], [32 * KIB, 1 * MIB, 4 * MIB, 16 * MIB]);
+
+const SERVER_PLANS: readonly ServerPlan[] = [
+  { kind: "go", transfer: "echo", sizes: ECHO_SIZES, cycleSize: 32 },
+  { kind: "rust", transfer: "echo", sizes: ECHO_SIZES, cycleSize: 32 },
+  { kind: "rust-ipfilter", transfer: "echo", sizes: ECHO_SIZES, cycleSize: 32 },
+  { kind: "go-bulk", transfer: "download", sizes: DOWNLOAD_SIZES, cycleSize: 32 * KIB },
+];
 const SEQUENTIAL_STREAMS = 10;
 const PARALLEL_STREAMS = 4;
 const DIAL_ATTEMPTS = 3;
 /** The KPS client's own HELLO deadline is 15 s; a dial cannot take longer. */
 const DIAL_TIMEOUT_MS = 15_000;
-const STREAM_TIMEOUT_MS = 20_000;
+const STREAM_TIMEOUT_MS = 30_000;
+/** Largest single-stream echo measured to complete (1 MiB - 64 B). */
+const WINDOW_ECHO_PASS_BYTES = MIB - 64;
+const WINDOW_ECHO_TIMEOUT_MS = 15_000;
 
 const loopbacks = loopbackIpv4Addresses();
 const external = externalIpv4();
@@ -39,6 +70,7 @@ interface HarnessProbe {
 interface ProbeRecord {
   readonly project: string;
   readonly server: EchoServerKind;
+  readonly transfer: TransferKind;
   readonly bindIp: string;
   readonly address: string;
   readonly knownIssue: boolean;
@@ -46,7 +78,7 @@ interface ProbeRecord {
     readonly attempts: number;
     readonly successes: number;
     readonly dialMs: number[];
-    readonly echo: { bytes: number; ms: number; ok: boolean; error?: string }[];
+    readonly samples: { bytes: number; ms: number; ok: boolean; error?: string }[];
     readonly sequentialP50Ms: number | undefined;
     readonly parallel: { ms: number; ok: boolean; error?: string }[];
     readonly errors: string[];
@@ -54,8 +86,18 @@ interface ProbeRecord {
   readonly harness: HarnessProbe[];
 }
 
-const records: ProbeRecord[] = [];
 let probeWorker: PublishedWorker | undefined;
+
+function sizesFrom(raw: string | undefined, fallback: number[]): number[] {
+  if (raw === undefined || raw.trim() === "") return fallback;
+  return raw.split(",").map((part) => {
+    const size = Number(part.trim());
+    if (!Number.isSafeInteger(size) || size < 0 || size > 64 * MIB) {
+      throw new Error(`size list entry ${part} is not a byte count in [0, 64 MiB]`);
+    }
+    return size;
+  });
+}
 
 function failureText(result: DirectEchoResult): string {
   const failed = [...result.samples, ...result.sequential, ...result.parallel].filter((sample) => !sample.ok);
@@ -66,20 +108,14 @@ function reportOk(report: unknown): boolean {
   return typeof report === "object" && report !== null && (report as { ok?: unknown }).ok === true;
 }
 
-test.describe("browser WebRTC-KPS against the reference KPS servers", () => {
-  test.afterAll(async ({ cfg, runPaths }, workerInfo) => {
-    writeReport(cfg, runPaths, `kps-webrtc-${workerInfo.project.name}`, {
-      kernel: release(),
-      loopbackIpv4: loopbacks,
-      externalIpv4: external ?? null,
-      chromiumArgs: workerInfo.project.use.launchOptions?.args ?? [],
-      records,
-    });
-  });
-
-  for (const kind of SERVER_KINDS) {
+test.describe("browser WebRTC-KPS against reference KPS servers", () => {
+  for (const plan of SERVER_PLANS) {
     for (const bindIp of bindIps) {
-      test(`${kind} server on ${bindIp}`, async ({ cfg, runPaths, chains, resolver, openHost }, testInfo) => {
+      test(`${plan.kind} server (${plan.transfer}) on ${bindIp}`, async (
+        { cfg, runPaths, chains, resolver, openHost },
+        testInfo,
+      ) => {
+        const { kind } = plan;
         const bin = echoServerBinary(cfg.kps.binDir, kind);
         test.skip(
           !existsSync(bin),
@@ -88,7 +124,7 @@ test.describe("browser WebRTC-KPS against the reference KPS servers", () => {
         );
         // The stock kps crate pins WebRTC ICE gathering to interfaces named lo*
         // and expects one candidate per family; a second IPv4 on lo (WSL2 adds
-        // 10.255.255.254) breaks ICE convergence. See LANE-NOTES / README.
+        // 10.255.255.254) breaks ICE convergence. See README "Findings".
         const knownIssue = kind === "rust" && loopbacks.length > 1;
         test.fail(
           knownIssue,
@@ -102,20 +138,22 @@ test.describe("browser WebRTC-KPS against the reference KPS servers", () => {
           stateDir: runPaths.kps,
           logDir: runPaths.logs,
           addressTimeoutMs: cfg.kps.addressTimeoutMs,
-          ...(cfg.kps.debug && kind !== "go" ? { env: { KPS_DEBUG: "1" } } : {}),
+          ...(cfg.kps.debug && kind.startsWith("rust") ? { env: { KPS_DEBUG: "1" } } : {}),
         });
         try {
           const page = await openHost("0.3.2");
           const browserVersion = page.context().browser()?.version() ?? "unknown";
           testInfo.annotations.push({ type: "browser", description: browserVersion });
 
-          // (a) Direct: the page dials with @kpstreams/webrtc-client.
+          // (a) Direct: the page dials with @kpstreams/webrtc-client. The first
+          // attempt runs the full plan; later attempts measure dial reliability.
           const attempts: DirectEchoResult[] = [];
           for (let attempt = 0; attempt < DIAL_ATTEMPTS; attempt++) {
             attempts.push(
               await page.evaluate((request) => window.e2e.directKpsEcho(request), {
                 addr: server.address,
-                sizes: attempt === 0 ? SIZES : [SIZES[0] ?? 32],
+                transfer: plan.transfer,
+                sizes: attempt === 0 ? plan.sizes : [plan.cycleSize],
                 sequentialStreams: attempt === 0 ? SEQUENTIAL_STREAMS : 0,
                 parallelStreams: attempt === 0 ? PARALLEL_STREAMS : 0,
                 dialTimeoutMs: DIAL_TIMEOUT_MS,
@@ -138,11 +176,11 @@ test.describe("browser WebRTC-KPS against the reference KPS servers", () => {
           const harness: HarnessProbe[] = [];
           for (const mode of modes) {
             const query = mode === "dial"
-              ? `sizes=${SIZES.join(",")}&seq=${SEQUENTIAL_STREAMS}&par=${PARALLEL_STREAMS}&mode=dial&timeout=${STREAM_TIMEOUT_MS}`
-              : `sizes=${32 * 1024}&seq=2&mode=open&timeout=${STREAM_TIMEOUT_MS}`;
+              ? `sizes=${plan.sizes.join(",")}&seq=${SEQUENTIAL_STREAMS}&par=${PARALLEL_STREAMS}`
+              : `sizes=${plan.cycleSize}&seq=2`;
             const result = await page.evaluate((request) => window.e2e.fetch(request), {
               id: "kps-probe",
-              url: `kps-echo://${server.address}?${query}`,
+              url: `kps-echo://${server.address}?${query}&mode=${mode}&transfer=${plan.transfer}&timeout=${STREAM_TIMEOUT_MS}`,
               timeoutMs: 4 * 60_000,
             });
             let report: unknown;
@@ -161,9 +199,10 @@ test.describe("browser WebRTC-KPS against the reference KPS servers", () => {
           await page.evaluate((id) => window.e2e.close(id), "kps-probe");
 
           const sequentialMs = (first?.sequential ?? []).filter((s) => s.ok).map((s) => s.ms);
-          records.push({
+          const record: ProbeRecord = {
             project: testInfo.project.name,
             server: kind,
+            transfer: plan.transfer,
             bindIp,
             address: server.address,
             knownIssue,
@@ -171,12 +210,22 @@ test.describe("browser WebRTC-KPS against the reference KPS servers", () => {
               attempts: attempts.length,
               successes: attempts.filter((a) => a.ok).length,
               dialMs: attempts.map((a) => a.dialMs),
-              echo: (first?.samples ?? []).map((s) => ({ ...s })),
+              samples: (first?.samples ?? []).map((s) => ({ ...s })),
               sequentialP50Ms: percentile(sequentialMs, 50),
               parallel: (first?.parallel ?? []).map((s) => ({ ...s })),
               errors: attempts.filter((a) => !a.ok).map(failureText),
             },
             harness,
+          };
+          // One report per test: Playwright restarts the worker process after a
+          // failure, so module-level state cannot collect a whole run.
+          writeReport(cfg, runPaths, `kps-webrtc-${testInfo.project.name}-${kind}-${bindIp}`, {
+            kernel: release(),
+            loopbackIpv4: loopbacks,
+            externalIpv4: external ?? null,
+            chromiumArgs: testInfo.project.use.launchOptions?.args ?? [],
+            browser: browserVersion,
+            record,
           });
 
           for (const attempt of attempts) expect(attempt.ok, failureText(attempt)).toBe(true);
@@ -194,4 +243,41 @@ test.describe("browser WebRTC-KPS against the reference KPS servers", () => {
       });
     }
   }
+
+  test("finding: a single-stream echo of 1 MiB stalls (Go reference server)", async (
+    { cfg, runPaths, openHost },
+    testInfo,
+  ) => {
+    const bin = echoServerBinary(cfg.kps.binDir, "go");
+    test.skip(!existsSync(bin), `${bin} is missing: run scripts/build-kps-servers.sh`);
+    // Expected to fail until the cause is found and fixed upstream: the test
+    // turns red ("expected to fail, but passed") the day the stall is gone.
+    test.fail(true, "single-stream echo at the 1 MiB stream window does not complete");
+    const server = await startEchoServer({
+      kind: "go",
+      binDir: cfg.kps.binDir,
+      bindIp: "127.0.0.1",
+      stateDir: runPaths.kps,
+      logDir: runPaths.logs,
+      addressTimeoutMs: cfg.kps.addressTimeoutMs,
+    });
+    try {
+      const page = await openHost("0.3.2");
+      const result = await page.evaluate((request) => window.e2e.directKpsEcho(request), {
+        addr: server.address,
+        transfer: "echo" as const,
+        sizes: [WINDOW_ECHO_PASS_BYTES, MIB],
+        sequentialStreams: 0,
+        parallelStreams: 0,
+        dialTimeoutMs: DIAL_TIMEOUT_MS,
+        streamTimeoutMs: WINDOW_ECHO_TIMEOUT_MS,
+      });
+      writeReport(cfg, runPaths, `kps-echo-window-${testInfo.project.name}`, { samples: result.samples });
+      expect(result.samples[0]?.ok, "echo just below the window must pass").toBe(true);
+      expect(result.ok, failureText(result)).toBe(true);
+    } finally {
+      await server.stop();
+    }
+  });
 });
+
