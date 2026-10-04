@@ -357,7 +357,7 @@ export enum NoxClientErrorCode {
   KpsUnavailable = "KPS_UNAVAILABLE",
   /** A non-`kps:` endpoint in KPS mode, or KPS options in classic mode. */
   ModeViolation = "MODE_VIOLATION",
-  /** KPS mode: the pinned member set no longer forms a route. */
+  /** KPS mode: served topologies agree the registry no longer lists every pinned member of a route layer. */
   TopologyStale = "TOPOLOGY_STALE",
   /** The caller aborted the request. */
   Aborted = "ABORTED",

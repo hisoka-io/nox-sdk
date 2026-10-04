@@ -11,7 +11,7 @@ import {
 import { primaryLayerForRole } from "../src/topology.js";
 import { NoxClientError, NoxClientErrorCode, type PinnedSnapshot } from "../src/types.js";
 import { kpsAddressFor } from "./helpers/fake_kps.js";
-import { PINNED_BLOCK, makePinned, memberAddress, served } from "./helpers/pinned_fixture.js";
+import { PINNED_BLOCK, makePinned, memberAddress, served, type ServedSpec } from "./helpers/pinned_fixture.js";
 
 const NOW = 1_800_000_000;
 const OPTIONS: ApplyServedOptions = { clockSkewToleranceSeconds: 600, livenessMaxAgeSeconds: 180 };
@@ -294,19 +294,66 @@ describe("applyServedTopologies (removals only)", () => {
     expect(shorter.removed.sort()).toEqual([memberAddress(5), memberAddress(7)]);
   });
 
-  it("declares the snapshot stale when two sources agree it has no route", () => {
+  describe("stale only on registry evidence, never on liveness alone", () => {
     const exits = pinned.members.flatMap((member, offset) => (member.role === 2 ? [offset + 1] : []));
-    expect(() =>
-      applyServedTopologies(
-        pinned,
-        [
-          { anchor: kpsAddressFor(1), snapshot: served(pinned, NOW, { offline: exits }) },
-          { anchor: kpsAddressFor(2), snapshot: served(pinned, NOW, { omit: exits }) },
-        ],
-        NOW,
-        OPTIONS,
-      )
-    ).toThrow(expect.objectContaining({ code: NoxClientErrorCode.TopologyStale }));
+    const exitAddresses = exits.map((index) => memberAddress(index));
+    const two = (left: ServedSpec = {}, right: ServedSpec = left) => [
+      { anchor: kpsAddressFor(1), snapshot: served(pinned, NOW, left) },
+      { anchor: kpsAddressFor(2), snapshot: served(pinned, NOW, right) },
+    ];
+
+    it("declares the snapshot stale when two sources agree every exit left the registry", () => {
+      expect(() => applyServedTopologies(pinned, two({ omit: exits }), NOW, OPTIONS)).toThrow(
+        expect.objectContaining({ code: NoxClientErrorCode.TopologyStale, message: expect.stringMatching(/exit/u) }),
+      );
+    });
+
+    it("declares the snapshot stale when two sources agree every exit changed its profile", () => {
+      const rotated: ServedSpec = {
+        mutate: (node, index) => (exits.includes(index) ? { ...node, sphinx_key: "ff".repeat(32) } : node),
+      };
+      expect(() => applyServedTopologies(pinned, two(rotated), NOW, OPTIONS)).toThrow(
+        expect.objectContaining({ code: NoxClientErrorCode.TopologyStale }),
+      );
+    });
+
+    it("keeps the exits when two sources list them all but report them offline (mesh re-forming)", () => {
+      const result = applyServedTopologies(pinned, two({ offline: exits }), NOW, OPTIONS);
+      expect(result.offlineLayers).toEqual(["exit"]);
+      expect(result.floorLayers).toEqual(["exit"]);
+      expect(result.members.map((node) => node.address)).toEqual(expect.arrayContaining(exitAddresses));
+      expect(result.removed).toEqual([]);
+      expect(formsRoute(pinned, result.members)).toBe(true);
+    });
+
+    it("keeps the exits when one source reports them offline and the other omits them", () => {
+      const result = applyServedTopologies(pinned, two({ offline: exits }, { omit: exits }), NOW, OPTIONS);
+      expect(result.offlineLayers).toEqual(["exit"]);
+      expect(result.members.map((node) => node.address)).toEqual(expect.arrayContaining(exitAddresses));
+    });
+
+    it("restores only the previous working set's exits for an offline layer", () => {
+      const previous = applyServedTopologies(pinned, two({ omit: [exits[0]!] }), NOW, OPTIONS).members;
+      expect(previous.map((node) => node.address)).not.toContain(exitAddresses[0]);
+      const result = applyServedTopologies(pinned, two({ offline: exits }), NOW, { ...OPTIONS, previous });
+      expect(result.offlineLayers).toEqual(["exit"]);
+      expect(result.removed).toEqual([exitAddresses[0]]);
+    });
+
+    it("falls back to the listed members when the previous set has none of the offline layer", () => {
+      const previous = applyServedTopologies(pinned, two(), NOW, OPTIONS).members.filter(
+        (node) => !exitAddresses.includes(node.address),
+      );
+      const result = applyServedTopologies(pinned, two({ offline: exits }), NOW, { ...OPTIONS, previous });
+      expect(result.offlineLayers).toEqual(["exit"]);
+      expect(result.members.map((node) => node.address)).toEqual(expect.arrayContaining(exitAddresses));
+    });
+
+    it("reports no offline layer while a layer has an online member", () => {
+      const result = applyServedTopologies(pinned, two({ offline: exits.slice(1) }), NOW, OPTIONS);
+      expect(result.offlineLayers).toEqual([]);
+      expect(result.floorLayers).toEqual(["exit"]);
+    });
   });
 
   it("never routes over ineligible pinned members", () => {

@@ -421,6 +421,9 @@ export class NoxClient {
       if (working.floorApplied) {
         emitLog(log, "warn", "topology.floor", { sources: working.sourcesAccepted, layers: working.floorLayers.join(",") });
       }
+      if (working.offlineLayers.length > 0) {
+        emitLog(log, "warn", "topology.offline", { sources: working.sourcesAccepted, layers: working.offlineLayers.join(",") });
+      }
       const rejectedAnchors = new Set(working.rejected.map((entry) => entry.anchor));
       const accepted = boot.sources.filter((source) => !rejectedAnchors.has(source.anchor));
       const nodes = kpsTopologyNodes(options.pinned, working.members, options.entries);
@@ -1867,6 +1870,12 @@ export class NoxClient {
     }
     if (working.floorApplied) {
       emitLog(this._log, "warn", "topology.floor", { sources: working.sourcesAccepted, layers: working.floorLayers.join(",") });
+    }
+    if (working.offlineLayers.length > 0) {
+      emitLog(this._log, "warn", "topology.offline", {
+        sources: working.sourcesAccepted,
+        layers: working.offlineLayers.join(","),
+      });
     }
     const rejected = new Set(working.rejected.map((entry) => entry.anchor));
     this._config.powDifficulty = effectivePowDifficulty(

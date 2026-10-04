@@ -97,6 +97,13 @@ export interface WorkingSet {
   floorApplied: boolean;
   /** Layers that hit the floor. */
   floorLayers: RouteLayer[];
+  /**
+   * Layers whose members every accepted document still lists with the pinned
+   * profile but none reports online (for example while the P2P mesh re-forms
+   * after a fleet restart). They keep their previous members; calls through
+   * them fail one by one until a refresh sees members online again.
+   */
+  offlineLayers: RouteLayer[];
   /** Why each rejected served document was rejected, by anchor. */
   rejected: { anchor: string; reason: string }[];
 }
@@ -214,9 +221,16 @@ export function kpsTopologyNodes(
  *
  * Floor: each layer (KPS entries, mixes, exits) keeps at least
  * `min(2, pinned eligible members in that layer)` members. A layer the agreed
- * removals would empty means the pinned set has no route (`TOPOLOGY_STALE`); a
- * layer they would leave non-empty but below the floor keeps the previous
- * working set's members of that layer and is listed in `floorLayers`.
+ * removals would leave below the floor keeps the previous working set's
+ * members of that layer and is listed in `floorLayers`.
+ *
+ * Registry evidence versus liveness: `TOPOLOGY_STALE` (a newer bundle is due)
+ * rests on registry evidence only, that is every accepted document omits each
+ * pinned eligible member of a layer or lists it with a changed profile. A
+ * layer whose members are still listed but reported offline (node liveness is
+ * an in-memory P2P view that starts empty after a restart) is a transient
+ * state: the layer keeps its previous members, is listed in `floorLayers` and
+ * `offlineLayers`, and calls fail one by one until members come back online.
  */
 export function applyServedTopologies(
   pinned: PinnedSnapshot,
@@ -258,16 +272,22 @@ export function applyServedTopologies(
     removalQuorum,
     floorApplied: false,
     floorLayers: [],
+    offlineLayers: [],
     rejected,
   });
   if (acceptedAnchors.size < MIN_REMOVAL_SOURCES) return unchanged(false);
 
+  // `listed`: registry evidence, some accepted document lists the member with
+  // its pinned profile. `kept`: listed and reported online by such a document.
+  const listed = new Set<string>();
   const kept = new Set<string>();
   for (const member of eligible) {
-    const keep = accepted.some((snapshot) =>
-      isPresentWithPinnedProfile(snapshot, member) && isOnline(snapshot, member.address, options.livenessMaxAgeSeconds)
-    );
-    if (keep) kept.add(member.address);
+    const present = accepted.filter((snapshot) => isPresentWithPinnedProfile(snapshot, member));
+    if (present.length === 0) continue;
+    listed.add(member.address);
+    if (present.some((snapshot) => isOnline(snapshot, member.address, options.livenessMaxAgeSeconds))) {
+      kept.add(member.address);
+    }
   }
 
   const eligibleNodes = kpsTopologyNodes(pinned, eligible.map(toRelayerNode), options.entryAddresses);
@@ -276,22 +296,32 @@ export function applyServedTopologies(
   // against the agreed set before any layer gets its previous members back.
   const agreed = new Set(kept);
   const floorLayers: RouteLayer[] = [];
-  const empty: RouteLayer[] = [];
+  const offlineLayers: RouteLayer[] = [];
+  const gone: RouteLayer[] = [];
   for (const layer of ROUTE_LAYERS) {
     const inLayer = eligibleNodes.filter((node) => isInLayer(node, layer));
+    if (!inLayer.some((node) => listed.has(node.id))) {
+      gone.push(layer);
+      continue;
+    }
     const floor = Math.min(MIN_MEMBERS_PER_LAYER, inLayer.length);
     const remaining = inLayer.filter((node) => agreed.has(node.id)).length;
+    if (remaining >= floor) continue;
+    floorLayers.push(layer);
+    const restored = inLayer.filter((node) => previous.has(node.id));
     if (remaining === 0) {
-      empty.push(layer);
-    } else if (remaining < floor) {
-      floorLayers.push(layer);
-      for (const node of inLayer) if (previous.has(node.id)) kept.add(node.id);
+      offlineLayers.push(layer);
+      // A previous set without this layer falls back to the members still listed.
+      const back = restored.length > 0 ? restored : inLayer.filter((node) => listed.has(node.id));
+      for (const node of back) kept.add(node.id);
+    } else {
+      for (const node of restored) kept.add(node.id);
     }
   }
-  if (empty.length > 0) {
+  if (gone.length > 0) {
     throw new NoxClientError(
-      `${acceptedAnchors.size} served topologies from different anchors agree that the pinned members no longer ` +
-        `form a route (no ${empty.join(", no ")} left of ${eligible.length} eligible members); ` +
+      `${acceptedAnchors.size} served topologies from different anchors agree that the registry no longer lists ` +
+        `the pinned ${gone.join(", ")} members with their pinned profiles (${eligible.length} eligible members pinned); ` +
         "this bundle's snapshot is stale",
       NoxClientErrorCode.TopologyStale,
     );
@@ -304,6 +334,7 @@ export function applyServedTopologies(
     removalQuorum: true,
     floorApplied: floorLayers.length > 0,
     floorLayers,
+    offlineLayers,
     rejected,
   };
 }

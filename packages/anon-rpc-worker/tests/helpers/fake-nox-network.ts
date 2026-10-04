@@ -66,6 +66,10 @@ export class FakeNoxNetwork {
   readonly dials: string[] = [];
   readonly served: ServiceRequest[] = [];
   readonly refused = new Set<string>();
+  /** Member addresses every served topology lists but reports offline (P2P liveness not yet re-formed). */
+  readonly offline = new Set<string>();
+  /** Member addresses every served topology leaves out (gone from the registry). */
+  readonly omitted = new Set<string>();
   readonly conns: { address: string; open: boolean }[] = [];
   private readonly buffered = new Map<string, { id: string; data: number[] }>();
   private next = 1;
@@ -81,9 +85,9 @@ export class FakeNoxNetwork {
     openStream: async (address) => (await this.dial(address)).openStream(),
   };
 
-  /** A node-served schema v2 topology consistent with the pinned snapshot. */
+  /** A node-served schema v2 topology consistent with the pinned snapshot, minus `omitted`. */
   topology(): TopologySnapshot {
-    const nodes = this.pinned.members.map(relayerOf);
+    const nodes = this.pinned.members.filter((member) => !this.omitted.has(member.address)).map(relayerOf);
     const now = Math.floor(Date.now() / 1000);
     return {
       nodes,
@@ -92,7 +96,11 @@ export class FakeNoxNetwork {
       block_number: this.pinned.blockNumber + 1,
       timestamp: now,
       pow_difficulty: 1,
-      liveness: nodes.map((node) => ({ address: node.address, status: "online" as const, observed_at_unix: now })),
+      liveness: nodes.map((node) => ({
+        address: node.address,
+        status: this.offline.has(node.address) ? "offline" as const : "online" as const,
+        observed_at_unix: now,
+      })),
     };
   }
 

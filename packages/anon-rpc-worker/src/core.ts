@@ -317,7 +317,7 @@ class NoxWorker {
       const logLevel: LogLevel = level;
       this.log[logLevel](event, fields);
       if (event === "topology.stale" && this.client !== undefined) {
-        this.fail(FAILED_CODES.snapshotStale, "Served topologies agree the pinned node set no longer forms a route");
+        this.fail(FAILED_CODES.snapshotStale, "Served topologies agree the registry no longer lists every pinned member of a route layer");
       }
     };
   }

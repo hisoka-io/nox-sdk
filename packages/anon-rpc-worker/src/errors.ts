@@ -20,7 +20,7 @@ export const FAILED_CODES = Object.freeze({
   wasmBlocked: "wasm-blocked",
   /** The pinned snapshot inside the bundle fails its own check (a build defect). */
   snapshotInvalid: "snapshot-invalid",
-  /** Two or more nodes agree the pinned member set no longer forms a route: the bundle is superseded. */
+  /** Two or more nodes agree the registry no longer lists every pinned member of a route layer: the bundle is superseded. */
   snapshotStale: "snapshot-stale",
   /** An invariant broke, or WebAssembly trapped repeatedly. */
   internalError: "internal-error",

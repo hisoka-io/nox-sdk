@@ -235,12 +235,20 @@ describe("KPS mode connect", () => {
     expect(ambientFetch).not.toHaveBeenCalled();
   });
 
-  it("declares the snapshot stale when two sources agree the pinned set has no route", async () => {
+  it("declares the snapshot stale when two sources agree every exit left the registry", async () => {
+    const t = bed();
+    t.servedSpec = { omit: [6, 7, 8] };
+    await expect(connect(t.config({}, { entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 }))).rejects
+      .toMatchObject({ code: NoxClientErrorCode.TopologyStale });
+  });
+
+  it("connects over the pinned exits when two sources list them all but report them offline", async () => {
     const t = bed();
     t.servedSpec = { offline: [6, 7, 8] };
-    await expect(connect(t.config({}, { topologySources: 2 }))).rejects.toMatchObject({
-      code: NoxClientErrorCode.TopologyStale,
-    });
+    const client = await connect(t.config({}, { entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 }));
+    expect(client.nodes).toHaveLength(8);
+    expect(t.logs.find((entry) => entry.event === "topology.offline")?.fields).toMatchObject({ sources: 2, layers: "exit" });
+    expect(t.logs.some((entry) => entry.event === "topology.stale")).toBe(false);
   });
 
   it("verifies the pinned snapshot before any dial", async () => {
@@ -530,10 +538,23 @@ describe("KPS mode background work", () => {
     await vi.waitFor(() => expect(client.nodes).toHaveLength(8), { timeout: 2_000, interval: 20 });
   });
 
-  it("logs topology.stale and keeps routing when refresh sources agree the set is gone", async () => {
+  it("logs topology.offline and keeps every exit when refresh sources report them all offline", async () => {
     const t = bed();
     const client = await connect(t.config({ topologyRefreshMs: 40 }, { entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 }));
     t.servedSpec = { offline: [6, 7, 8] };
+    await vi.waitFor(() => expect(t.logs.some((entry) => entry.event === "topology.offline")).toBe(true), {
+      timeout: 2_000,
+      interval: 20,
+    });
+    expect(t.logs.some((entry) => entry.event === "topology.stale")).toBe(false);
+    expect(client.topologyRefreshError?.code).not.toBe(NoxClientErrorCode.TopologyStale);
+    expect(client.nodes).toHaveLength(8);
+  });
+
+  it("logs topology.stale and keeps routing when refresh sources agree the exits left the registry", async () => {
+    const t = bed();
+    const client = await connect(t.config({ topologyRefreshMs: 40 }, { entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 }));
+    t.servedSpec = { omit: [6, 7, 8] };
     await vi.waitFor(() => expect(t.logs.some((entry) => entry.event === "topology.stale")).toBe(true), {
       timeout: 2_000,
       interval: 20,

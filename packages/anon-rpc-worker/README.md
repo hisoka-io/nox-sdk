@@ -53,8 +53,10 @@ a topology fetch failing) are retried with back-off while `ready` stays pending.
 
 `signalFailed` codes: `bad-config`, `unsupported-platform` (no KPS dialer, `crypto.getRandomValues` or
 WebAssembly), `wasm-blocked` (the embedder's CSP must allow `'wasm-unsafe-eval'`), `snapshot-invalid`,
-`snapshot-stale` (two or more nodes agree the pinned set no longer forms a route: a newer bundle is due) and
-`internal-error`.
+`snapshot-stale` (two or more nodes agree the registry no longer lists every pinned member of a route layer with its
+pinned profile: a newer bundle is due) and `internal-error`. Members that are listed but reported offline, as while
+nodes reconnect after a restart, keep the worker running: calls through them fail one by one (`timeout` or
+`network-error`) until a topology refresh sees them online.
 
 A rejected call carries a string `code`: `cancelled` (`AbortError`), `timeout`, `network-error`, `too-large`,
 `unsupported`, `protocol-error` or `internal-error`. Redirects follow `fetch` rules inside the call deadline (at

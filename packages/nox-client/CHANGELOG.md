@@ -17,6 +17,10 @@ test suite runs unchanged against it.
   HTTPS or WebSocket.
   - Served topologies are accepted only as removals from the pinned set, only when documents from two different
     nodes agree, and every route layer keeps at least two members; additions need a new snapshot.
+  - `TOPOLOGY_STALE` rests on registry evidence: two nodes agree that every pinned member of a route layer is gone
+    from the registry or has a changed profile. A layer whose members are listed but reported offline (as while
+    the P2P mesh re-forms after a restart) keeps its previous members, logs `topology.offline` and fails calls one
+    by one until a refresh sees members online again.
   - Entries are limited to members that publish a KPS address in their `metadataUrl`
     (`kps:<ip>:<port>:<certhash>/metadata.json`), optionally narrowed with `kps.entries`.
   - At most one reply claim per entry is in flight, and one claim carries at most `KPS_CLAIM_MAX_SURB_IDS` (128)

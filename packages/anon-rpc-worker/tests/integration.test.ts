@@ -114,3 +114,75 @@ describe("worker on the real SDK in KPS mode", () => {
     expect(harness.events("boot.retry").length).toBeGreaterThanOrEqual(1);
   });
 });
+
+describe("worker liveness versus registry evidence (real SDK, two anchors)", () => {
+  const anchors = { gateways: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 };
+  const ok = () => exitReply(200, [["content-type", "application/json"]], '{"jsonrpc":"2.0","id":1,"result":"0x10"}');
+  const call = (harness: FakeHarness) =>
+    harness.fetch("https://rpc.example.test/", {
+      method: "POST",
+      headers: [["content-type", "application/json"]],
+      body: new TextEncoder().encode('{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}'),
+    });
+
+  function start(prepare: (network: FakeNoxNetwork, pinned: ReturnType<typeof makePinned>) => void) {
+    const pinned = makePinned();
+    const network = new FakeNoxNetwork(pinned, ok);
+    prepare(network, pinned);
+    const harness = new FakeHarness(anchors, network.kps);
+    void runNoxWorker(harness.api, {
+      snapshot: pinned,
+      loadWasm: async () => fakeWasm(),
+      connect: async (clientConfig) => {
+        const client = await NoxClient.connect({ ...clientConfig, topologyRefreshMs: 40 });
+        disconnects.push(() => client.disconnect());
+        return client;
+      },
+    });
+    const exits = pinned.members.filter((member) => member.role === 2).map((member) => member.address);
+    return { pinned, network, harness, exits };
+  }
+
+  it("boots and stays up when two anchors list every exit but report them offline", async () => {
+    const { harness } = start((network, pinned) => {
+      for (const member of pinned.members) if (member.role === 2) network.offline.add(member.address);
+    });
+    await harness.ready;
+    expect(harness.failures).toEqual([]);
+    expect(harness.events("topology.offline")).not.toHaveLength(0);
+    // The exits keep their pinned place in the working set, so routing goes on.
+    const response = await call(harness);
+    expect(response.status).toBe(200);
+    expect(harness.failures).toEqual([]);
+  });
+
+  it("keeps running after ready when a refresh sees every exit offline, then serves calls again", async () => {
+    const { network, harness, exits } = start(() => undefined);
+    await harness.ready;
+    for (const exit of exits) network.offline.add(exit);
+    await vi.waitFor(() => expect(harness.events("topology.offline")).not.toHaveLength(0), { timeout: 3_000, interval: 20 });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(harness.failures).toEqual([]);
+    network.offline.clear();
+    const response = await call(harness);
+    expect(response.status).toBe(200);
+    expect(harness.failures).toEqual([]);
+  });
+
+  it("fails with snapshot-stale at boot when two anchors agree every exit left the registry", async () => {
+    const { harness } = start((network, pinned) => {
+      for (const member of pinned.members) if (member.role === 2) network.omitted.add(member.address);
+    });
+    await harness.failed;
+    expect(harness.failures.map((failure) => failure.code)).toEqual(["snapshot-stale"]);
+    expect(harness.readyCount).toBe(0);
+  });
+
+  it("fails with snapshot-stale after ready when a refresh finds every exit gone from the registry", async () => {
+    const { network, harness, exits } = start(() => undefined);
+    await harness.ready;
+    for (const exit of exits) network.omitted.add(exit);
+    await harness.failed;
+    expect(harness.failures.map((failure) => failure.code)).toEqual(["snapshot-stale"]);
+  });
+});
