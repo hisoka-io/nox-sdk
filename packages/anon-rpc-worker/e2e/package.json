@@ -9,7 +9,9 @@
     "typecheck": "tsc -p tsconfig.json && tsc -p page/tsconfig.json && tsc -p workers/tsconfig.json",
     "test": "vitest run",
     "e2e": "playwright test",
+    "e2e:all": "bash scripts/run-all.sh",
     "testbed": "tsx src/cli/testbed.ts",
+    "build:kps-servers": "bash scripts/build-kps-servers.sh",
     "compile:specifier": "bash scripts/compile-specifier.sh"
   },
   "devDependencies": {
