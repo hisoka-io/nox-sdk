@@ -52,6 +52,9 @@ This runs `tsc --noEmit`, the Foundry tests (`forge test`) and the TypeScript te
   parser; the bundle then arrives, hash-verified, from the first `https:` resolver.
 - `itest/plan.test.ts`: plans a deployment against a local chain standing in for mainnet, checks the gas and cost
   arithmetic, checks the target chain is untouched, and deploys with the printed signer command.
+- `itest/gas-calibration.test.ts`: replays the mainnet history of the passthrough and tor-js specifiers (two
+  deployments, two `setWorker` updates) on a local chain and checks each one uses exactly the gas of its mainnet
+  receipt (1,088,838; 1,113,503; 478,453; 152,782).
 
 ## Planning a deployment (dry run)
 
@@ -79,9 +82,20 @@ transaction signed by the deployer's own wallet, for example
 `cast send --rpc-url "$MAINNET_RPC_URL" --ledger --gas-limit <planned limit> --create "$(cat <file>)"`, as the plan
 prints it.
 
-Deployment gas grows with the resolver list (about 975 gas per byte of resolver strings). Measured on a mainnet
-fork on 2026-10-03 with three `kps:` and three `https:` resolvers (721 bytes): 1,032,324 gas for
-`ImmutableWorkerSpecifier` and 1,671,855 gas for `WorkerSpecifier`.
+The report also prices every sequence at fixed gas prices (1, 4 and 20 gwei by default) for budgeting ahead of the
+signing day.
+
+Deployment gas grows with the resolver list, by about 930 gas per byte of resolver strings. Measured on a mainnet
+fork at block 26,115,996 (2026-10-04) with three `https:` and three `kps:` resolvers (722 bytes):
+
+| Sequence | Gas | At 0.093 gwei (that block) | At 4 gwei | At 20 gwei |
+|---|---|---|---|---|
+| `ImmutableWorkerSpecifier` deploy | 1,032,360 | 0.000096 ETH | 0.0041 ETH | 0.0206 ETH |
+| `WorkerSpecifier` deploy | 1,671,891 | 0.000156 ETH | 0.0067 ETH | 0.0334 ETH |
+| `WorkerSpecifier` deploy + `renounceOwnership` | 1,695,252 | 0.000158 ETH | 0.0068 ETH | 0.0339 ETH |
+
+The same planner run with tor-js's first resolver list (two `https:` entries, 119 bytes) gives 1,113,503 gas for
+`WorkerSpecifier`, the gas of tor-js's own mainnet deployment.
 
 ## Inspecting a deployed specifier
 
