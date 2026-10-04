@@ -20,7 +20,7 @@ test suite runs unchanged against it.
   - Entries are limited to members that publish a KPS address in their `metadataUrl`
     (`kps:<ip>:<port>:<certhash>/metadata.json`), optionally narrowed with `kps.entries`.
   - At most one reply claim per entry is in flight, and one claim carries at most `KPS_CLAIM_MAX_SURB_IDS` (128)
-    IDs, the `nox-kps` limit; larger sets rotate across polls.
+    IDs, the `nox-kps` default limit; larger sets rotate across polls.
   - Two transport failures in a row move the pinned entry; replies already routed to the old entry are still
     claimed there.
 - `wasm` (both modes): pass initialised `@hisoka-io/nox-wasm` bindings instead of the dynamic import.
