@@ -70,6 +70,14 @@ export interface ServedTopology {
   snapshot: TopologySnapshot;
 }
 
+/** Route layers the floor rule protects (ARCHITECTURE §5.3). */
+export type RouteLayer = "entry" | "mix" | "exit";
+const ROUTE_LAYERS: readonly RouteLayer[] = ["entry", "mix", "exit"];
+/** Accepted documents from this many different anchors are needed before any member is removed. */
+export const MIN_REMOVAL_SOURCES = 2;
+/** Members each layer keeps (or every pinned eligible member of the layer, when fewer). */
+export const MIN_MEMBERS_PER_LAYER = 2;
+
 /** Members the client routes over after applying served topologies. */
 export interface WorkingSet {
   members: RelayerNode[];
@@ -79,8 +87,16 @@ export interface WorkingSet {
   ignoredAdditions: number;
   /** Served documents that passed every check. */
   sourcesAccepted: number;
-  /** True when the result would not form a route and the previous set was kept. */
+  /**
+   * True when accepted documents came from at least `MIN_REMOVAL_SOURCES`
+   * different anchors, so removals applied. False means the working set is
+   * every pinned eligible member.
+   */
+  removalQuorum: boolean;
+  /** True when a layer would have dropped below the floor and kept its previous members. */
   floorApplied: boolean;
+  /** Layers that hit the floor. */
+  floorLayers: RouteLayer[];
   /** Why each rejected served document was rejected, by anchor. */
   rejected: { anchor: string; reason: string }[];
 }
@@ -90,7 +106,7 @@ export interface ApplyServedOptions {
   livenessMaxAgeSeconds: number;
   /** KPS addresses allowed as entries; default every pinned member with one. */
   entryAddresses?: ReadonlySet<string>;
-  /** Working set to keep when the floor is hit; default every pinned eligible member. */
+  /** Working set whose members a layer below the floor keeps; default every pinned eligible member. */
   previous?: readonly RelayerNode[];
 }
 
@@ -190,9 +206,17 @@ export function kpsTopologyNodes(
  * observation, so a removal needs every accepted source to agree. Members a
  * document adds are ignored; a changed profile counts as absent.
  *
- * When the result would not form a route: with two or more accepted sources
- * the pinned set is stale (`TOPOLOGY_STALE`); otherwise the previous set is
- * kept and `floorApplied` is set.
+ * Single-source rule: removals apply only when documents from at least two
+ * different anchors are accepted. Two different anchors always include one
+ * that is not the current entry, so the entry, which already knows the
+ * client's address, can never shrink the set on its own. With fewer, the
+ * result is every pinned eligible member.
+ *
+ * Floor: each layer (KPS entries, mixes, exits) keeps at least
+ * `min(2, pinned eligible members in that layer)` members. A layer the agreed
+ * removals would empty means the pinned set has no route (`TOPOLOGY_STALE`); a
+ * layer they would leave non-empty but below the floor keeps the previous
+ * working set's members of that layer and is listed in `floorLayers`.
  */
 export function applyServedTopologies(
   pinned: PinnedSnapshot,
@@ -206,11 +230,16 @@ export function applyServedTopologies(
   const pinnedByAddress = new Map(pinned.members.map((member) => [member.address, member]));
 
   const accepted: TopologySnapshot[] = [];
+  const acceptedAnchors = new Set<string>();
   const rejected: { anchor: string; reason: string }[] = [];
   for (const source of served) {
     const reason = rejectionReason(pinned, source, memberByKps, nowUnix, options);
-    if (reason === null) accepted.push(source.snapshot);
-    else rejected.push({ anchor: source.anchor, reason });
+    if (reason === null) {
+      accepted.push(source.snapshot);
+      acceptedAnchors.add(source.anchor);
+    } else {
+      rejected.push({ anchor: source.anchor, reason });
+    }
   }
 
   const eligible = eligiblePinnedMembers(pinned);
@@ -221,52 +250,75 @@ export function applyServedTopologies(
       if (!pinnedByAddress.has(address)) additions.add(address);
     }
   }
-  if (accepted.length === 0) {
-    return {
-      members: (options.previous ?? eligible.map(toRelayerNode)).slice(),
-      removed: [],
-      ignoredAdditions: additions.size,
-      sourcesAccepted: 0,
-      floorApplied: false,
-      rejected,
-    };
-  }
+  const unchanged = (removalQuorum: boolean): WorkingSet => ({
+    members: eligible.map(toRelayerNode),
+    removed: [],
+    ignoredAdditions: additions.size,
+    sourcesAccepted: accepted.length,
+    removalQuorum,
+    floorApplied: false,
+    floorLayers: [],
+    rejected,
+  });
+  if (acceptedAnchors.size < MIN_REMOVAL_SOURCES) return unchanged(false);
 
-  const kept: PinnedMember[] = [];
-  const removed: string[] = [];
+  const kept = new Set<string>();
   for (const member of eligible) {
     const keep = accepted.some((snapshot) =>
       isPresentWithPinnedProfile(snapshot, member) && isOnline(snapshot, member.address, options.livenessMaxAgeSeconds)
     );
-    if (keep) kept.push(member);
-    else removed.push(member.address);
+    if (keep) kept.add(member.address);
   }
-  const members = kept.map(toRelayerNode);
-  if (formsRoute(pinned, members, options.entryAddresses)) {
-    return {
-      members,
-      removed,
-      ignoredAdditions: additions.size,
-      sourcesAccepted: accepted.length,
-      floorApplied: false,
-      rejected,
-    };
+
+  const eligibleNodes = kpsTopologyNodes(pinned, eligible.map(toRelayerNode), options.entryAddresses);
+  const previous = new Set((options.previous ?? eligible.map(toRelayerNode)).map((node) => node.address.toLowerCase()));
+  // Layers overlap (a relay can be entry and mix), so every layer is measured
+  // against the agreed set before any layer gets its previous members back.
+  const agreed = new Set(kept);
+  const floorLayers: RouteLayer[] = [];
+  const empty: RouteLayer[] = [];
+  for (const layer of ROUTE_LAYERS) {
+    const inLayer = eligibleNodes.filter((node) => isInLayer(node, layer));
+    const floor = Math.min(MIN_MEMBERS_PER_LAYER, inLayer.length);
+    const remaining = inLayer.filter((node) => agreed.has(node.id)).length;
+    if (remaining === 0) {
+      empty.push(layer);
+    } else if (remaining < floor) {
+      floorLayers.push(layer);
+      for (const node of inLayer) if (previous.has(node.id)) kept.add(node.id);
+    }
   }
-  if (accepted.length >= 2) {
+  if (empty.length > 0) {
     throw new NoxClientError(
-      `${accepted.length} served topologies agree that the pinned members no longer form a route ` +
-        `(${removed.length} of ${eligible.length} eligible members absent or offline); this bundle's snapshot is stale`,
+      `${acceptedAnchors.size} served topologies from different anchors agree that the pinned members no longer ` +
+        `form a route (no ${empty.join(", no ")} left of ${eligible.length} eligible members); ` +
+        "this bundle's snapshot is stale",
       NoxClientErrorCode.TopologyStale,
     );
   }
   return {
-    members: (options.previous ?? eligible.map(toRelayerNode)).slice(),
-    removed: [],
+    members: eligible.filter((member) => kept.has(member.address)).map(toRelayerNode),
+    removed: eligible.filter((member) => !kept.has(member.address)).map((member) => member.address),
     ignoredAdditions: additions.size,
     sourcesAccepted: accepted.length,
-    floorApplied: true,
+    removalQuorum: true,
+    floorApplied: floorLayers.length > 0,
+    floorLayers,
     rejected,
   };
+}
+
+/** True when `node` can serve `layer` under `selectRoute`'s rules (entries need a `kps:` endpoint). */
+function isInLayer(node: TopologyNode, layer: RouteLayer): boolean {
+  const layers = layersForRole(node.role);
+  switch (layer) {
+    case "entry":
+      return layers.includes(0) && node.address.length > 0;
+    case "mix":
+      return layers.includes(1);
+    case "exit":
+      return layers.includes(2) && (node.role === 2 || node.role === 3);
+  }
 }
 
 /** Highest PoW difficulty among the pinned value and accepted served documents, capped. */

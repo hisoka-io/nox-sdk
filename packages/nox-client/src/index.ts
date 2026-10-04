@@ -121,7 +121,7 @@ export {
   pinnedKpsAddresses,
   pinnedRelayerNodes,
 } from "./kps/pinned.js";
-export type { ServedTopology, WorkingSet, ApplyServedOptions } from "./kps/pinned.js";
+export type { ServedTopology, WorkingSet, ApplyServedOptions, RouteLayer } from "./kps/pinned.js";
 
 export type { IssuedPaidQuoteV2, PaidQuoteResultV2 } from "./paid.js";
 export { hashExecutionQuoteV1 } from "./paid.js";

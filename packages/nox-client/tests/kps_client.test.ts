@@ -161,10 +161,11 @@ describe("KPS mode connect", () => {
     });
   });
 
-  it("ignores members a served topology adds and drops members every source omits", async () => {
+  it("ignores members a served topology adds and lets a single-entry gateway remove nobody", async () => {
     const t = bed();
     t.servedSpec = {
       omit: [4],
+      offline: [2, 3, 5, 7],
       add: [{
         address: "0x00000000000000000000000000000000000000ff",
         sphinx_key: "ff".repeat(32),
@@ -178,12 +179,49 @@ describe("KPS mode connect", () => {
         metadata_url: "",
       }],
     };
-    const client = await connect(t.config({}, { entries: [kpsAddressFor(1)] }));
+    const client = await connect(t.config({}, { entries: [kpsAddressFor(1)], topologySources: 2 }));
     const ids = client.nodes.map((node) => node.id);
     expect(ids).not.toContain("0x00000000000000000000000000000000000000ff");
+    expect(ids.sort()).toEqual(t.pinned.members.map((member) => member.address));
+    expect(t.logs.find((entry) => entry.event === "topology.accepted")?.fields).toMatchObject({
+      ignoredAdditions: 1,
+      removed: 0,
+      removalQuorum: false,
+    });
+  });
+
+  it("drops members that two anchors agree are gone", async () => {
+    const t = bed();
+    t.servedSpec = { omit: [4] };
+    const client = await connect(t.config({}, { entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 }));
+    const ids = client.nodes.map((node) => node.id);
     expect(ids).not.toContain(t.pinned.members[3]!.address);
     expect(ids).toHaveLength(t.pinned.members.length - 1);
-    expect(t.logs.find((entry) => entry.event === "topology.accepted")?.fields).toMatchObject({ ignoredAdditions: 1, removed: 1 });
+    expect(t.logs.find((entry) => entry.event === "topology.accepted")?.fields).toMatchObject({
+      sources: 2,
+      removed: 1,
+      removalQuorum: true,
+    });
+  });
+
+  it("removes nobody when the only anchor that answers in time narrows the set to colluders", async () => {
+    const t = bed();
+    // Anchor 1 answers first and claims only itself, relay 2 and exit 6 are online; anchor 3 never answers.
+    t.servedSpec = { offline: [3, 4, 5, 7, 8] };
+    t.network.route(kpsAddressFor(3), () => ({ hang: true }));
+    const started = Date.now();
+    const client = await connect(t.config({}, {
+      entries: [kpsAddressFor(1), kpsAddressFor(3)],
+      topologySources: 2,
+      anchorParallelism: 2,
+    }));
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1_400);
+    expect(client.nodes.map((node) => node.id).sort()).toEqual(t.pinned.members.map((member) => member.address));
+    expect(t.logs.find((entry) => entry.event === "topology.accepted")?.fields).toMatchObject({
+      sources: 1,
+      removed: 0,
+      removalQuorum: false,
+    });
   });
 
   it("fails with KPS_UNAVAILABLE when no anchor answers, and never falls back to HTTPS", async () => {
@@ -431,6 +469,40 @@ describe("KPS mode background work", () => {
     t.servedSpec = {};
     await vi.waitFor(() => expect(client.nodes).toHaveLength(8), { timeout: 2_000, interval: 20 });
     expect(ambientFetch).not.toHaveBeenCalled();
+  });
+
+  it("draws refresh anchors from the pinned set, so removed members still serve as sources", async () => {
+    const t = bed();
+    const client = await connect(t.config({ topologyRefreshMs: 40 }, {
+      entries: [kpsAddressFor(1), kpsAddressFor(2), kpsAddressFor(6)],
+      topologySources: 2,
+    }));
+    const entry = client.entryUrl.slice("kps:".length);
+    const others = [kpsAddressFor(1), kpsAddressFor(2), kpsAddressFor(6)].filter((address) => address !== entry);
+    const removedIndex = others[0] === kpsAddressFor(1) ? 1 : others[0] === kpsAddressFor(2) ? 2 : 6;
+    const removedId = t.pinned.members[removedIndex - 1]!.address;
+    // Every source reports one non-entry member offline; it keeps serving its own document.
+    t.servedSpec = { offline: [removedIndex] };
+    await vi.waitFor(() => expect(client.nodes.map((node) => node.id)).not.toContain(removedId), {
+      timeout: 2_000,
+      interval: 20,
+    });
+    const topologyFrom = (address: string): number =>
+      t.network.requests.filter((request) => request.address === address && request.path === "/topology").length;
+    const before = topologyFrom(others[0]!);
+    await vi.waitFor(() => expect(topologyFrom(others[0]!)).toBeGreaterThan(before + 1), { timeout: 3_000, interval: 20 });
+    expect(ambientFetch).not.toHaveBeenCalled();
+  });
+
+  it("restores the pinned set when a refresh hears from one anchor only", async () => {
+    const t = bed();
+    const client = await connect(t.config({ topologyRefreshMs: 40 }, { entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 }));
+    t.servedSpec = { offline: [5] };
+    await vi.waitFor(() => expect(client.nodes).toHaveLength(7), { timeout: 2_000, interval: 20 });
+    const entry = client.entryUrl.slice("kps:".length);
+    const other = entry === kpsAddressFor(1) ? kpsAddressFor(2) : kpsAddressFor(1);
+    t.network.route(other, (request) => (request.path === "/topology" ? { status: 503 } : t.mixnet.handler(request)));
+    await vi.waitFor(() => expect(client.nodes).toHaveLength(8), { timeout: 2_000, interval: 20 });
   });
 
   it("logs topology.stale and keeps routing when refresh sources agree the set is gone", async () => {

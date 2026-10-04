@@ -84,6 +84,21 @@ describe("verifyPinnedSnapshot", () => {
 describe("applyServedTopologies (removals only)", () => {
   const pinned = makePinned();
   const all = pinned.members.map((member) => member.address);
+  const stranger = () => {
+    const address = memberAddress(200);
+    return {
+      address,
+      sphinx_key: "ee".repeat(32),
+      url: "/ip4/10.9.9.9/tcp/15000",
+      stake: "0",
+      last_seen: 0,
+      is_privileged: true,
+      layer: primaryLayerForRole(address, 1),
+      role: 1,
+      ingress_url: "https://stranger.test",
+      metadata_url: `kps:${kpsAddressFor(200)}/metadata.json`,
+    };
+  };
 
   it("keeps every pinned eligible member when a source reports them online", () => {
     const result = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(1), snapshot: served(pinned, NOW) }], NOW, OPTIONS);
@@ -93,38 +108,112 @@ describe("applyServedTopologies (removals only)", () => {
     expect(result.floorApplied).toBe(false);
   });
 
-  it("ignores additions, excludes changed profiles, omissions and offline members", () => {
-    const stranger = memberAddress(200);
-    const addition = {
-      address: stranger,
-      sphinx_key: "ee".repeat(32),
-      url: "/ip4/10.9.9.9/tcp/15000",
-      stake: "0",
-      last_seen: 0,
-      is_privileged: true,
-      layer: primaryLayerForRole(stranger, 1),
-      role: 1,
-      ingress_url: "https://stranger.test",
-      metadata_url: `kps:${kpsAddressFor(200)}/metadata.json`,
-    };
+  it("removes nothing on one source's word, however much it omits (single-source rule)", () => {
     const document = served(pinned, NOW, {
-      add: [addition],
+      add: [stranger()],
       omit: [2],
       offline: [3],
       mutate: (node, index) => (index === 4 ? { ...node, sphinx_key: "ff".repeat(32) } : node),
     });
     const result = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(1), snapshot: document }], NOW, OPTIONS);
+    expect(result.sourcesAccepted).toBe(1);
+    expect(result.removalQuorum).toBe(false);
+    expect(result.ignoredAdditions).toBe(1);
+    expect(result.removed).toEqual([]);
+    expect(result.members.map((node) => node.address)).toEqual(all);
+  });
+
+  it("ignores additions and removes changed profiles, omissions and offline members two anchors agree on", () => {
+    const document = served(pinned, NOW, {
+      add: [stranger()],
+      omit: [2],
+      offline: [3],
+      mutate: (node, index) => (index === 4 ? { ...node, sphinx_key: "ff".repeat(32) } : node),
+    });
+    const result = applyServedTopologies(
+      pinned,
+      [{ anchor: kpsAddressFor(1), snapshot: document }, { anchor: kpsAddressFor(6), snapshot: document }],
+      NOW,
+      OPTIONS,
+    );
+    expect(result.removalQuorum).toBe(true);
     expect(result.ignoredAdditions).toBe(1);
     expect(result.removed.sort()).toEqual([memberAddress(2), memberAddress(3), memberAddress(4)]);
-    expect(result.members.map((node) => node.address)).not.toContain(stranger);
+    expect(result.members.map((node) => node.address)).not.toContain(memberAddress(200));
     expect(result.members).toHaveLength(pinned.members.length - 3);
+  });
+
+  it("counts the same anchor twice as one source", () => {
+    const document = served(pinned, NOW, { offline: [2, 3, 4] });
+    const result = applyServedTopologies(
+      pinned,
+      [{ anchor: kpsAddressFor(1), snapshot: document }, { anchor: kpsAddressFor(1), snapshot: document }],
+      NOW,
+      OPTIONS,
+    );
+    expect(result.sourcesAccepted).toBe(2);
+    expect(result.removalQuorum).toBe(false);
+    expect(result.removed).toEqual([]);
+  });
+
+  it("lets a single-entry gateway remove nothing, even when it lists only colluders as online", () => {
+    // The wallet's only gateway (member 1) claims the fleet is itself, one relay and one exit.
+    const colluders = served(pinned, NOW, { offline: [2, 3, 4, 7, 8] });
+    const result = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(1), snapshot: colluders }], NOW, {
+      ...OPTIONS,
+      entryAddresses: new Set([kpsAddressFor(1)]),
+    });
+    expect(result.removalQuorum).toBe(false);
+    expect(result.removed).toEqual([]);
+    expect(result.members.map((node) => node.address)).toEqual(all);
+  });
+
+  it("refuses to let one source shrink any layer to one node", () => {
+    // Only exit 6 left online: one entry, one mix and one exit.
+    const shrink = served(pinned, NOW, { offline: [1, 2, 3, 4, 5, 7, 8] });
+    const single = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(1), snapshot: shrink }], NOW, OPTIONS);
+    expect(single.removed).toEqual([]);
+    expect(single.floorApplied).toBe(false);
+    expect(single.members.map((node) => node.address)).toEqual(all);
+  });
+
+  it("keeps every layer at the floor even when two sources agree to shrink it to one node", () => {
+    const shrink = served(pinned, NOW, { offline: [1, 2, 3, 4, 5, 7, 8] });
+    const result = applyServedTopologies(
+      pinned,
+      [{ anchor: kpsAddressFor(1), snapshot: shrink }, { anchor: kpsAddressFor(2), snapshot: shrink }],
+      NOW,
+      OPTIONS,
+    );
+    expect(result.floorApplied).toBe(true);
+    expect(result.floorLayers).toEqual(["entry", "mix", "exit"]);
+    expect(result.removed).toEqual([]);
+    expect(result.members.map((node) => node.address)).toEqual(all);
+  });
+
+  it("applies the entry floor to the entries the client may use", () => {
+    const entryAddresses = new Set([kpsAddressFor(1), kpsAddressFor(2), kpsAddressFor(3)]);
+    const document = served(pinned, NOW, { offline: [1, 2] });
+    const result = applyServedTopologies(
+      pinned,
+      [{ anchor: kpsAddressFor(1), snapshot: document }, { anchor: kpsAddressFor(3), snapshot: document }],
+      NOW,
+      { ...OPTIONS, entryAddresses },
+    );
+    expect(result.floorLayers).toEqual(["entry"]);
+    expect(result.removed).toEqual([]);
   });
 
   it("treats a changed KPS identity (metadataUrl) as absent", () => {
     const document = served(pinned, NOW, {
       mutate: (node, index) => (index === 5 ? { ...node, metadata_url: `kps:${kpsAddressFor(99)}/metadata.json` } : node),
     });
-    const result = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(1), snapshot: document }], NOW, OPTIONS);
+    const result = applyServedTopologies(
+      pinned,
+      [{ anchor: kpsAddressFor(1), snapshot: document }, { anchor: kpsAddressFor(6), snapshot: document }],
+      NOW,
+      OPTIONS,
+    );
     expect(result.removed).toEqual([memberAddress(5)]);
   });
 
@@ -170,9 +259,8 @@ describe("applyServedTopologies (removals only)", () => {
     expect(foreign.rejected[0]?.reason).toMatch(/not a pinned member/u);
   });
 
-  it("keeps the previous set when one source would leave no route (floor)", () => {
-    const exits = pinned.members.flatMap((member, offset) => (member.role === 2 ? [offset + 1] : []));
-    const previous = eligiblePinnedMembers(pinned).slice(0, 7).map((member) => ({
+  it("keeps the previous members of a layer that two sources would push below the floor", () => {
+    const toRelayer = (member: (typeof pinned.members)[number]) => ({
       address: member.address,
       sphinx_key: member.sphinxKey,
       url: member.url,
@@ -183,15 +271,27 @@ describe("applyServedTopologies (removals only)", () => {
       role: member.role,
       ingress_url: member.ingressUrl,
       metadata_url: member.metadataUrl,
-    }));
-    const result = applyServedTopologies(
-      pinned,
-      [{ anchor: kpsAddressFor(1), snapshot: served(pinned, NOW, { offline: exits }) }],
-      NOW,
-      { ...OPTIONS, previous },
-    );
+    });
+    // Previous working set: relays 1-4 and exits 6-7 (relay 5 and exit 8 removed earlier).
+    const previous = eligiblePinnedMembers(pinned)
+      .filter((member) => member.address !== memberAddress(5) && member.address !== memberAddress(8))
+      .map(toRelayer);
+    const both = (offline: number[]) => [
+      { anchor: kpsAddressFor(1), snapshot: served(pinned, NOW, { offline }) },
+      { anchor: kpsAddressFor(2), snapshot: served(pinned, NOW, { offline }) },
+    ];
+    // Exit 8 is online in both documents; exits 6 and 7 come back from the previous set.
+    const result = applyServedTopologies(pinned, both([6, 7]), NOW, { ...OPTIONS, previous });
     expect(result.floorApplied).toBe(true);
-    expect(result.members).toEqual(previous);
+    expect(result.floorLayers).toEqual(["exit"]);
+    expect(result.members.map((node) => node.address)).toEqual(all);
+    // Without exit 7 in the previous set only exit 6 returns; relay 5 stays removed.
+    const shorter = applyServedTopologies(pinned, both([5, 6, 7]), NOW, {
+      ...OPTIONS,
+      previous: previous.filter((node) => node.address !== memberAddress(7)),
+    });
+    expect(shorter.floorLayers).toEqual(["exit"]);
+    expect(shorter.removed.sort()).toEqual([memberAddress(5), memberAddress(7)]);
   });
 
   it("declares the snapshot stale when two sources agree it has no route", () => {

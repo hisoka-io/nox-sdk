@@ -26,6 +26,7 @@ import { kpsTransportSettingsFrom } from "./kps/fetch.js";
 import { isKpsAddress, kpsAddressLabel, kpsAddressOfEntry, kpsEntryEndpoint } from "./kps/address.js";
 import {
   applyServedTopologies,
+  MIN_REMOVAL_SOURCES,
   eligiblePinnedMembers,
   kpsTopologyNodes,
   pinnedKpsAddresses,
@@ -411,9 +412,10 @@ export class NoxClient {
         members: working.members.length,
         removed: working.removed.length,
         ignoredAdditions: working.ignoredAdditions,
+        removalQuorum: working.removalQuorum,
       });
       if (working.floorApplied) {
-        emitLog(log, "warn", "topology.floor", { removedWouldBe: options.pinned.members.length - working.members.length });
+        emitLog(log, "warn", "topology.floor", { sources: working.sourcesAccepted, layers: working.floorLayers.join(",") });
       }
       const rejectedAnchors = new Set(working.rejected.map((entry) => entry.anchor));
       const accepted = boot.sources.filter((source) => !rejectedAnchors.has(source.anchor));
@@ -1848,7 +1850,7 @@ export class NoxClient {
       return;
     }
     if (working.floorApplied) {
-      emitLog(this._log, "warn", "topology.floor", { sources: working.sourcesAccepted });
+      emitLog(this._log, "warn", "topology.floor", { sources: working.sourcesAccepted, layers: working.floorLayers.join(",") });
     }
     const rejected = new Set(working.rejected.map((entry) => entry.anchor));
     this._config.powDifficulty = effectivePowDifficulty(
@@ -1865,22 +1867,23 @@ export class NoxClient {
       sources: working.sourcesAccepted,
       members: working.members.length,
       removed: working.removed.length,
+      removalQuorum: working.removalQuorum,
     });
   }
 
-  /** The current entry's KPS address first, then random other KPS-capable members of the working set. */
+  /**
+   * The current entry's KPS address first, then random other members drawn
+   * from the pinned KPS-capable eligible set (restricted by `entries`), never
+   * from the working set: a set that served topologies pruned must not pick
+   * the sources that confirm it (ARCHITECTURE §3.4 step 7, §5.3).
+   */
   private _kpsRefreshAnchors(kps: KpsState): string[] {
     const anchors: string[] = [];
     const current = kpsAddressOfEntry(this._entryUrl);
     if (current !== null) anchors.push(current);
-    const others = Array.from(
-      new Set(
-        this._nodes
-          .map((node) => kpsAddressOfEntry(node.address))
-          .filter((address): address is string => address !== null && address !== current),
-      ),
-    );
-    while (anchors.length < kps.options.topologySources && others.length > 0) {
+    const others = pinnedAnchorAddresses(kps.options).filter((address) => address !== current);
+    const wanted = Math.max(MIN_REMOVAL_SOURCES, kps.options.topologySources);
+    while (anchors.length < wanted && others.length > 0) {
       anchors.push(others.splice(secureRandomIndex(others.length), 1)[0]!);
     }
     return anchors;
@@ -2738,6 +2741,22 @@ async function loadWasmBindings(provider: NoxWasmProvider): Promise<NoxWasmBindi
   return record;
 }
 
+/** Pinned eligible members with a KPS address this client may use as an entry, in pinned order. */
+function pinnedAnchors(options: ResolvedKpsOptions): { member: string; address: string }[] {
+  const kpsByMember = pinnedKpsAddresses(options.pinned);
+  return eligiblePinnedMembers(options.pinned).flatMap((member) => {
+    const address = kpsByMember.get(member.address);
+    return address !== undefined && (options.entries === undefined || options.entries.has(address))
+      ? [{ member: member.address, address }]
+      : [];
+  });
+}
+
+/** Distinct KPS addresses of `pinnedAnchors`. */
+function pinnedAnchorAddresses(options: ResolvedKpsOptions): string[] {
+  return Array.from(new Set(pinnedAnchors(options).map((entry) => entry.address)));
+}
+
 interface BootTopologies {
   sources: ServedTopology[];
   /** Short diagnostics for anchors that failed (label and code), never addresses in full. */
@@ -2756,13 +2775,7 @@ function gatherServedTopologies(
   options: ResolvedKpsOptions,
   log: NoxLogSink | undefined,
 ): Promise<BootTopologies> {
-  const kpsByMember = pinnedKpsAddresses(options.pinned);
-  const shuffled = eligiblePinnedMembers(options.pinned).flatMap((member) => {
-    const address = kpsByMember.get(member.address);
-    return address !== undefined && (options.entries === undefined || options.entries.has(address))
-      ? [{ member: member.address, address }]
-      : [];
-  });
+  const shuffled = pinnedAnchors(options);
   for (let index = shuffled.length - 1; index > 0; index--) {
     const other = secureRandomIndex(index + 1);
     [shuffled[index], shuffled[other]] = [shuffled[other]!, shuffled[index]!];
