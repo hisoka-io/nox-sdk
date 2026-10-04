@@ -14,11 +14,14 @@
  * Usage:
  *   node scripts/make-snapshot.mjs --rpc <url> [--rpc <url>] [--network arbitrum-sepolia]
  *        [--block finalized|safe|latest|<n>] [--out snapshot/nox-snapshot.json]
- *        [--capabilities snapshot/capabilities.json] [--pow-difficulty <n>]
+ *        [--capabilities snapshot/capabilities.json]
  *        [--networks scripts/networks.json] [--allow-unsafe-block]
  *        [--log-chunk-blocks <n>] [--min-log-chunk-blocks <n>]
  *        [--timeout-ms <n>] [--retries <n>] [--batch-size <n>]
  *
+ * The release inputs that are not on chain come from committed files, so
+ * anyone regenerating at the same block gets the same bytes: powDifficulty
+ * from scripts/networks.json, capability hints from snapshot/capabilities.json.
  * The RPC URL can also come from NOX_SNAPSHOT_RPC_URL, which keeps keyed URLs
  * out of shell history. Only endpoint origins are ever printed.
  */
@@ -172,7 +175,6 @@ export async function main(argv) {
       block: { type: "string" },
       out: { type: "string" },
       capabilities: { type: "string" },
-      "pow-difficulty": { type: "string" },
       "allow-unsafe-block": { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -180,14 +182,13 @@ export async function main(argv) {
   if (values.help) {
     process.stdout.write(
       "usage: make-snapshot.mjs --rpc <url> [--rpc <url>] [--network arbitrum-sepolia] [--block finalized|safe|latest|<n>]\n" +
-        "                         [--out <file>] [--capabilities <file>] [--pow-difficulty <n>] [--networks <file>]\n",
+        "                         [--out <file>] [--capabilities <file>] [--networks <file>]\n",
     );
     return 0;
   }
   const { rpcs, scan } = chainAccessFromArgs(values);
   const network = loadNetwork(values.network, values.networks ?? NETWORKS_PATH);
   const capabilities = loadCapabilities(values.capabilities ?? CAPABILITIES_PATH);
-  const powDifficulty = integerArg(values["pow-difficulty"], "pow-difficulty", network.pow_difficulty);
 
   const state = await collectAgreed({
     rpcs,
@@ -196,7 +197,7 @@ export async function main(argv) {
     requireSafe: !values["allow-unsafe-block"],
     scan,
   });
-  const snapshot = validateSnapshotDocument(buildSnapshot(state, { powDifficulty, capabilities }));
+  const snapshot = validateSnapshotDocument(buildSnapshot(state, { powDifficulty: network.pow_difficulty, capabilities }));
 
   const outPath = values.out === undefined ? SNAPSHOT_PATH : resolve(values.out);
   mkdirSync(dirname(outPath), { recursive: true });
