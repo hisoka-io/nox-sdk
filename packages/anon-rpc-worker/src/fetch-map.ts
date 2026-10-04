@@ -5,9 +5,10 @@
  * `AnonFetchResponse`.
  *
  * The exit sees the request (URL, headers, body) and never the sender. It
- * follows no redirects, returns headers as a map (duplicates collapse, order is
- * lost) and sends no reply at all to a request it cannot parse, so requests
- * are validated here before anything enters the mixnet.
+ * follows no redirects (`sendPrepared` follows them here), returns headers as
+ * a map (duplicates collapse, order is lost) and sends no reply at all to a
+ * request it cannot parse, so requests are validated here before anything
+ * enters the mixnet.
  */
 import { decodeHttpResponse, type DecodedHttpResponse, type HttpRequestOptions } from "@hisoka-io/nox-client";
 import type { AnonFetchResponse, AnonRequestInit, ByteBody, HeaderList } from "./spec-types.js";
@@ -59,6 +60,15 @@ const NORMALIZED_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "POST", 
 /** Methods `fetch` refuses (Fetch §2.2.1). */
 const FORBIDDEN_METHODS = new Set(["CONNECT", "TRACE", "TRACK"]);
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+/** Redirects followed per call (ARCHITECTURE §4.5); a further redirect is a network error. */
+export const MAX_REDIRECT_HOPS = 5;
+/** Fetch's redirect statuses. */
+const REDIRECT_STATUSES: ReadonlySet<number> = new Set([301, 302, 303, 307, 308]);
+/** Headers that describe a body, dropped when a redirect turns the request into a GET (Fetch "request-body-header name"). */
+const REQUEST_BODY_HEADERS = new Set(["content-encoding", "content-language", "content-location", "content-type"]);
+/** Credentials dropped when a redirect leaves the origin. */
+const CROSS_ORIGIN_DROPPED_HEADERS = new Set(["authorization", "cookie"]);
 
 /**
  * Request headers never forwarded: the exit drops `host` and `user-agent`
@@ -134,14 +144,29 @@ export interface CallBudget {
 }
 
 /**
- * Send a prepared request through the mixnet and map the exit's reply.
+ * Send a prepared request through the mixnet and map the exit's reply,
+ * applying the call's redirect mode (ARCHITECTURE §4.5). The exit never
+ * follows redirects, so the worker does it with fetch's rules:
  *
- * Small and medium reads (and safe methods) get `attemptTimeoutMs` per attempt
- * and one resend on a different route after a response timeout; large reads,
- * writes and anything else get one attempt with the whole remaining deadline,
- * since large replies need time and writes are never resent (ARCHITECTURE
- * §4.7). The SDK still resends any request whose packet was certainly never
- * sent (a KPS dial or stream-open failure) through another entry.
+ * - `follow` (the SPEC default): a 301, 302, 303, 307 or 308 with a
+ *   `Location` is re-issued as a new mixnet request inside the same call
+ *   deadline, at most `MAX_REDIRECT_HOPS` times. 303, and 301/302 after POST,
+ *   become GET without a body; 307 and 308 keep method and body. A
+ *   cross-origin hop drops `authorization` and `cookie`. `url` is the final
+ *   URL. A write (`eth_sendRawTransaction`) is never re-issued with a changed
+ *   method; that 3xx is returned as it came.
+ * - `manual`: the 3xx is returned unchanged.
+ * - `error`: a redirect is a `network-error`, as are a hop past the cap, a
+ *   `Location` that is not an absolute http(s) URL, and the deadline passing
+ *   between hops.
+ *
+ * Each hop is sized and retried by its profile: small and medium reads (and
+ * safe methods) get `attemptTimeoutMs` per attempt and one resend on a
+ * different route after a response timeout; large reads, writes and anything
+ * else get one attempt with the whole remaining deadline, since large replies
+ * need time and writes are never resent (ARCHITECTURE §4.7). The SDK still
+ * resends any request whose packet was certainly never sent (a KPS dial or
+ * stream-open failure) through another entry.
  */
 export async function sendPrepared(
   request: PreparedRequest,
@@ -149,8 +174,43 @@ export async function sendPrepared(
   settings: FetchSettings,
   budget: CallBudget,
 ): Promise<AnonFetchResponse> {
+  if (budget.remainingMs() <= 0) throw callError(CALL_CODES.timeout, "The call deadline passed before sending");
+  let current = request;
+  for (let hop = 0; ; hop++) {
+    const reply = await exchange(current, port, settings, budget);
+    checkStatus(reply);
+    if (!REDIRECT_STATUSES.has(reply.status) || current.redirect === "manual") {
+      return toAnonResponse(reply, current, settings);
+    }
+    if (current.redirect === "error") {
+      throw callError(
+        CALL_CODES.networkError,
+        `Redirect refused: the upstream answered ${reply.status} and the call set redirect: "error"`,
+      );
+    }
+    const location = reply.headers.find(([name]) => name.toLowerCase() === "location")?.[1];
+    // fetch returns a redirect status without a Location as an ordinary response.
+    if (location === undefined) return toAnonResponse(reply, current, settings);
+    const next = redirectedRequest(current, reply.status, location);
+    if (next === null) return toAnonResponse(reply, current, settings);
+    if (hop + 1 > MAX_REDIRECT_HOPS) {
+      throw callError(CALL_CODES.networkError, `Too many redirects: more than ${MAX_REDIRECT_HOPS} hops`);
+    }
+    if (budget.remainingMs() <= 0) {
+      throw callError(CALL_CODES.networkError, `The call deadline passed after ${hop + 1} redirect(s)`);
+    }
+    current = next;
+  }
+}
+
+/** One mixnet exchange for `request`, decoded. */
+async function exchange(
+  request: PreparedRequest,
+  port: NoxHttpPort,
+  settings: FetchSettings,
+  budget: CallBudget,
+): Promise<DecodedHttpResponse> {
   const remaining = budget.remainingMs();
-  if (remaining <= 0) throw callError(CALL_CODES.timeout, "The call deadline passed before sending");
   const resendable = request.profile.retryable ||
     (request.profile.rpcClass === "other" && SAFE_METHODS.has(request.method));
   const options: HttpRequestOptions = {
@@ -171,24 +231,72 @@ export async function sendPrepared(
     if (budget.signal.aborted) throw budget.signal.reason;
     throw mapClientError(error);
   }
-  let reply: DecodedHttpResponse;
   try {
-    reply = decodeHttpResponse(bytes);
+    return decodeHttpResponse(bytes);
   } catch (error) {
     throw callError(CALL_CODES.protocolError, "The exit's reply could not be decoded", error);
   }
-  return toAnonResponse(reply, request, settings);
 }
 
-/** Map the exit's decoded reply to an `AnonFetchResponse`. */
-export function toAnonResponse(
-  reply: DecodedHttpResponse,
-  request: Pick<PreparedRequest, "url" | "redirect">,
-  settings: Pick<FetchSettings, "maxResponseBytes">,
-): AnonFetchResponse {
+/**
+ * The request a redirect leads to (Fetch §4.4 HTTP-redirect fetch), or `null`
+ * when the redirect is returned as it came (a write whose method would change).
+ * Throws `network-error` for a `Location` that is not an absolute http(s) URL.
+ */
+export function redirectedRequest(request: PreparedRequest, status: number, location: string): PreparedRequest | null {
+  const url = redirectTarget(location, request.url);
+  const toGet = status === 303
+    ? request.method !== "GET" && request.method !== "HEAD"
+    : (status === 301 || status === 302) && request.method === "POST";
+  if (toGet && request.profile.rpcClass === "write") return null;
+  let headers = request.headers;
+  if (toGet) headers = headers.filter(([name]) => !REQUEST_BODY_HEADERS.has(name.toLowerCase()));
+  if (new URL(url).origin !== new URL(request.url).origin) {
+    headers = headers.filter(([name]) => !CROSS_ORIGIN_DROPPED_HEADERS.has(name.toLowerCase()));
+  }
+  const method = toGet ? "GET" : request.method;
+  const body = toGet ? new Uint8Array(0) : request.body;
+  const contentType = headers.find(([name]) => name.toLowerCase() === "content-type")?.[1];
+  return {
+    method,
+    url,
+    headers,
+    body,
+    redirect: request.redirect,
+    profile: toGet ? profileRequest(method, contentType, body) : request.profile,
+  };
+}
+
+function redirectTarget(location: string, base: string): string {
+  let url: URL;
+  try {
+    url = new URL(location, base);
+  } catch {
+    throw callError(CALL_CODES.networkError, "Redirect refused: the Location header is not a valid URL");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    throw callError(CALL_CODES.networkError, `Redirect refused: the target scheme ${url.protocol} is not http(s)`);
+  }
+  url.hash = "";
+  if (url.href.length > MAX_URL_LENGTH) {
+    throw callError(CALL_CODES.networkError, `Redirect refused: the target URL is longer than ${MAX_URL_LENGTH} characters`);
+  }
+  return url.href;
+}
+
+function checkStatus(reply: DecodedHttpResponse): void {
   if (!Number.isInteger(reply.status) || reply.status < 200 || reply.status > 599) {
     throw callError(CALL_CODES.protocolError, `The exit returned status ${reply.status}, outside 200-599`);
   }
+}
+
+/** Map the exit's decoded reply to an `AnonFetchResponse`; `request.url` becomes `url`. */
+export function toAnonResponse(
+  reply: DecodedHttpResponse,
+  request: Pick<PreparedRequest, "url">,
+  settings: Pick<FetchSettings, "maxResponseBytes">,
+): AnonFetchResponse {
+  checkStatus(reply);
   if (reply.truncated) {
     throw callError(CALL_CODES.tooLarge, "The exit cut the response body at its response size limit");
   }
@@ -197,9 +305,6 @@ export function toAnonResponse(
       CALL_CODES.tooLarge,
       `The response body has ${reply.body.length} bytes; the limit is ${settings.maxResponseBytes}`,
     );
-  }
-  if (reply.status >= 300 && reply.status <= 399 && request.redirect === "error") {
-    throw callError(CALL_CODES.unsupported, `Redirect refused: the upstream answered ${reply.status} and the call set redirect: "error"`);
   }
   const headers: HeaderList = [];
   for (const [name, value] of reply.headers) {

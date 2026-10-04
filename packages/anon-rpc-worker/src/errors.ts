@@ -44,11 +44,15 @@ export const CALL_CODES = Object.freeze({
   cancelled: "cancelled",
   /** The call deadline passed: not ready in time, or no reply after the allowed attempts. */
   timeout: "timeout",
-  /** No KPS entry reachable, or packet submission failed on every entry tried. */
+  /**
+   * No KPS entry reachable, or packet submission failed on every entry tried;
+   * or a redirect refused (`redirect: "error"`, more than 5 hops, a target
+   * that is not http(s), the deadline between hops).
+   */
   networkError: "network-error",
   /** The request or the reply is over a size limit, or the exit truncated the reply. */
   tooLarge: "too-large",
-  /** Not an absolute http(s) URL, an invalid method or header, or `redirect: "error"` met a 3xx. */
+  /** Not an absolute http(s) URL, or an invalid method, header or redirect mode. */
   unsupported: "unsupported",
   /** The exit's reply could not be decoded or is not a valid HTTP response. */
   protocolError: "protocol-error",

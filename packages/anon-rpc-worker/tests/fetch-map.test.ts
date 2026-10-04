@@ -1,9 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { HttpRequestOptions } from "@hisoka-io/nox-client";
 import {
+  MAX_REDIRECT_HOPS,
   RESPONSE_ENVELOPE_ALLOWANCE,
   mapClientError,
   prepareRequest,
+  redirectedRequest,
   sendPrepared,
   toAnonResponse,
   type FetchSettings,
@@ -238,11 +240,200 @@ describe("response mapping", () => {
     expect(() => toAnonResponse({ ...base, status: 600 }, request, SETTINGS)).toThrow(expect.objectContaining({ code: "protocol-error" }));
     expect(toAnonResponse({ ...base, headers: [["content-encoding", "identity"]] }, request, SETTINGS).headers).toEqual([]);
   });
+});
 
-  it("returns redirects unchanged for follow and manual, and refuses them for error", () => {
-    const reply = { status: 302, headers: [["location", "https://other.test/"]] as [string, string][], body: new Uint8Array(0), truncated: false };
-    expect(toAnonResponse(reply, { ...request, redirect: "follow" }, SETTINGS).status).toBe(302);
-    expect(toAnonResponse(reply, { ...request, redirect: "manual" }, SETTINGS).status).toBe(302);
-    expect(() => toAnonResponse(reply, { ...request, redirect: "error" }, SETTINGS)).toThrow(expect.objectContaining({ code: "unsupported" }));
+describe("redirects (ARCHITECTURE §4.5)", () => {
+  interface Sent {
+    method: string;
+    url: string;
+    headers: [string, string][];
+    body: string;
+  }
+
+  /** A port that answers each URL from `routes` (default 200 "final") and records what it was sent. */
+  function scripted(routes: Record<string, Uint8Array>): NoxHttpPort & { sent: Sent[] } {
+    const sent: Sent[] = [];
+    return {
+      sent,
+      httpRequest: async (method, url, headers, body) => {
+        sent.push({ method, url, headers, body: new TextDecoder().decode(body) });
+        return routes[url] ?? exitReply(200, [["content-type", "text/plain"]], "final");
+      },
+    };
+  }
+  const budget = (remaining = 25_000) => ({ signal: signal(), remainingMs: () => remaining });
+  const to = (status: number, location: string) => exitReply(status, [["Location", location]], "moved");
+  const rpcBody = '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}';
+
+  it("follows a redirect by default and reports the final URL", async () => {
+    const target = scripted({ "http://rpc.test/v1": to(301, "https://rpc.test/v1") });
+    const response = await sendPrepared(await prepare("http://rpc.test/v1"), target, SETTINGS, budget());
+    expect(response.status).toBe(200);
+    expect(response.url).toBe("https://rpc.test/v1");
+    expect(new TextDecoder().decode(response.body as Uint8Array)).toBe("final");
+    expect(target.sent.map((entry) => entry.url)).toEqual(["http://rpc.test/v1", "https://rpc.test/v1"]);
+  });
+
+  it("resolves a relative Location against the current URL", async () => {
+    const target = scripted({ "https://rpc.test/a/b": to(302, "../c?x=1#frag") });
+    const response = await sendPrepared(await prepare("https://rpc.test/a/b"), target, SETTINGS, budget());
+    expect(response.url).toBe("https://rpc.test/c?x=1");
+  });
+
+  it("turns POST into GET without a body on 301, 302 and 303, dropping body headers", async () => {
+    for (const status of [301, 302, 303]) {
+      const target = scripted({ "https://rpc.test/": to(status, "https://rpc.test/moved") });
+      const request = await prepare("https://rpc.test/", {
+        method: "POST",
+        headers: [["content-type", "application/json"], ["x-keep", "1"]],
+        body: encoder.encode(rpcBody),
+      });
+      await sendPrepared(request, target, SETTINGS, budget());
+      const hop = target.sent[1];
+      expect(hop?.method).toBe("GET");
+      expect(hop?.body).toBe("");
+      expect(hop?.headers.map(([name]) => name)).toEqual(["x-keep", "accept-encoding"]);
+    }
+  });
+
+  it("turns PUT into GET only on 303", async () => {
+    for (const [status, expected] of [[302, { method: "PUT", body: "data" }], [303, { method: "GET", body: "" }]] as const) {
+      const target = scripted({ "https://rpc.test/": to(status, "https://rpc.test/moved") });
+      await sendPrepared(await prepare("https://rpc.test/", { method: "PUT", body: encoder.encode("data") }), target, SETTINGS, budget());
+      expect(target.sent[1]).toMatchObject(expected);
+    }
+  });
+
+  it("keeps method and body on 307 and 308", async () => {
+    for (const status of [307, 308]) {
+      const target = scripted({ "https://rpc.test/": to(status, "https://rpc.test/moved") });
+      await sendPrepared(
+        await prepare("https://rpc.test/", { method: "POST", body: encoder.encode(rpcBody) }),
+        target,
+        SETTINGS,
+        budget(),
+      );
+      expect(target.sent[1]).toMatchObject({ method: "POST", url: "https://rpc.test/moved", body: rpcBody });
+    }
+  });
+
+  it("drops authorization and cookie on a cross-origin hop and keeps them on a same-origin one", async () => {
+    const target = scripted({
+      "https://rpc.test/a": to(307, "https://rpc.test/b"),
+      "https://rpc.test/b": to(307, "https://other.test/c"),
+    });
+    await sendPrepared(
+      await prepare("https://rpc.test/a", { headers: [["Authorization", "Bearer t"], ["x-keep", "1"]] }),
+      target,
+      SETTINGS,
+      budget(),
+    );
+    expect(target.sent[1]?.headers).toContainEqual(["Authorization", "Bearer t"]);
+    expect(target.sent[2]?.headers.map(([name]) => name.toLowerCase())).toEqual(["x-keep", "accept-encoding"]);
+    const next = redirectedRequest(
+      { ...(await prepare("https://rpc.test/")), headers: [["Cookie", "id=1"], ["authorization", "x"], ["x", "1"]] },
+      308,
+      "http://rpc.test/",
+    );
+    expect(next?.headers).toEqual([["x", "1"]]);
+  });
+
+  it(`follows at most ${MAX_REDIRECT_HOPS} redirects; the next one is a network-error`, async () => {
+    const chain = (hops: number): Record<string, Uint8Array> => {
+      const routes: Record<string, Uint8Array> = {};
+      for (let index = 0; index < hops; index++) routes[`https://rpc.test/${index}`] = to(302, `/${index + 1}`);
+      return routes;
+    };
+    const ok = scripted(chain(MAX_REDIRECT_HOPS));
+    const response = await sendPrepared(await prepare("https://rpc.test/0"), ok, SETTINGS, budget());
+    expect(response.url).toBe(`https://rpc.test/${MAX_REDIRECT_HOPS}`);
+    expect(ok.sent).toHaveLength(MAX_REDIRECT_HOPS + 1);
+    const tooMany = scripted(chain(MAX_REDIRECT_HOPS + 1));
+    await expectCode(sendPrepared(await prepare("https://rpc.test/0"), tooMany, SETTINGS, budget()), "network-error");
+    expect(tooMany.sent).toHaveLength(MAX_REDIRECT_HOPS + 1);
+  });
+
+  it("refuses a target that is not http(s) or not a URL with network-error, without sending it", async () => {
+    for (const location of ["ftp://rpc.test/file", "javascript:alert(1)", "http://[bad"]) {
+      const target = scripted({ "https://rpc.test/": to(302, location) });
+      await expectCode(sendPrepared(await prepare("https://rpc.test/"), target, SETTINGS, budget()), "network-error");
+      expect(target.sent).toHaveLength(1);
+    }
+  });
+
+  it("returns the 3xx unchanged for manual and refuses it with network-error for error", async () => {
+    const manual = scripted({ "https://rpc.test/": to(301, "https://other.test/") });
+    const response = await sendPrepared(await prepare("https://rpc.test/", { redirect: "manual" }), manual, SETTINGS, budget());
+    expect(response.status).toBe(301);
+    expect(response.url).toBe("https://rpc.test/");
+    expect(response.headers).toContainEqual(["location", "https://other.test/"]);
+    expect(manual.sent).toHaveLength(1);
+    const refused = scripted({ "https://rpc.test/": to(308, "https://other.test/") });
+    await expectCode(sendPrepared(await prepare("https://rpc.test/", { redirect: "error" }), refused, SETTINGS, budget()), "network-error");
+    expect(refused.sent).toHaveLength(1);
+  });
+
+  it("returns non-redirect 3xx statuses and a redirect without Location as they came", async () => {
+    for (const status of [300, 304]) {
+      const target = scripted({ "https://rpc.test/": exitReply(status, [["location", "/x"]], "") });
+      const response = await sendPrepared(await prepare("https://rpc.test/", { redirect: "error" }), target, SETTINGS, budget());
+      expect(response.status).toBe(status);
+      expect(target.sent).toHaveLength(1);
+    }
+    const missing = scripted({ "https://rpc.test/": exitReply(302, [], "") });
+    expect((await sendPrepared(await prepare("https://rpc.test/"), missing, SETTINGS, budget())).status).toBe(302);
+    expect(missing.sent).toHaveLength(1);
+  });
+
+  it("never re-issues eth_sendRawTransaction with a changed method, but keeps it on 307 and 308", async () => {
+    const tx = '{"jsonrpc":"2.0","id":1,"method":"eth_sendRawTransaction","params":["0x00"]}';
+    for (const status of [301, 302, 303]) {
+      const target = scripted({ "https://rpc.test/": to(status, "https://rpc.test/moved") });
+      const response = await sendPrepared(
+        await prepare("https://rpc.test/", { method: "POST", body: encoder.encode(tx) }),
+        target,
+        SETTINGS,
+        budget(),
+      );
+      expect(response.status).toBe(status);
+      expect(target.sent).toHaveLength(1);
+    }
+    const kept = scripted({ "https://rpc.test/": to(307, "https://rpc.test/moved") });
+    await sendPrepared(await prepare("https://rpc.test/", { method: "POST", body: encoder.encode(tx) }), kept, SETTINGS, budget());
+    expect(kept.sent[1]).toMatchObject({ method: "POST", body: tx });
+  });
+
+  it("stops with network-error when the deadline passes between hops", async () => {
+    let remaining = 25_000;
+    const target = scripted({ "https://rpc.test/": to(302, "/next") });
+    const original = target.httpRequest;
+    target.httpRequest = async (...args) => {
+      const reply = await original(...args);
+      remaining = 0;
+      return reply;
+    };
+    await expectCode(
+      sendPrepared(await prepare("https://rpc.test/"), target, SETTINGS, { signal: signal(), remainingMs: () => remaining }),
+      "network-error",
+    );
+    expect(target.sent).toHaveLength(1);
+  });
+
+  it("re-profiles a hop that became a GET", async () => {
+    const options: HttpRequestOptions[] = [];
+    const target: NoxHttpPort = {
+      httpRequest: async (_method, url, _headers, _body, opts) => {
+        options.push(opts);
+        return url === "https://rpc.test/" ? to(303, "/moved") : exitReply(200, [], "{}");
+      },
+    };
+    await sendPrepared(
+      await prepare("https://rpc.test/", { method: "POST", body: encoder.encode('{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{}]}') }),
+      target,
+      SETTINGS,
+      budget(),
+    );
+    expect(options[0]).toMatchObject({ retry: "none", opKey: "http:jsonrpc:eth_getLogs" });
+    expect(options[1]).toMatchObject({ retry: "route", opKey: "http:other" });
   });
 });
