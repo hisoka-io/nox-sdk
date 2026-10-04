@@ -327,12 +327,28 @@ export function toAnonResponse(
  * Map a Nox client failure to a per-call code. The client reports its own
  * failures as `NoxClientError` with a string `code`.
  */
+/** Causes followed when looking for the KPS code of a transport failure. */
+const MAX_CAUSE_DEPTH = 5;
+
+/**
+ * The KPS error code recorded anywhere in the cause chain. A packet failure
+ * arrives as NoxClientError(TransportFailed) → packet error → transport error
+ * → `{ phase, kpsCode }`, so one level is not enough.
+ */
+function kpsCodeInChain(error: unknown): unknown {
+  let current: unknown = error;
+  for (let depth = 0; depth <= MAX_CAUSE_DEPTH && typeof current === "object" && current !== null; depth++) {
+    const kpsCode = (current as { kpsCode?: unknown }).kpsCode;
+    if (kpsCode !== undefined) return kpsCode;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
 export function mapClientError(error: unknown): NoxWorkerError {
   if (error instanceof NoxWorkerError) return error;
   const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
-  const kpsCode = typeof error === "object" && error !== null
-    ? (error as { cause?: { kpsCode?: unknown } }).cause?.kpsCode
-    : undefined;
+  const kpsCode = kpsCodeInChain(error);
   const detail = describeError(error);
   switch (code) {
     case "RESPONSE_TIMEOUT":

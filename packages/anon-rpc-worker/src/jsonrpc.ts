@@ -58,17 +58,27 @@ export interface RequestProfile {
   readonly expectedResponseBytes: number | undefined;
   /** Small and medium reads only: a resend cannot change the outcome. */
   readonly retryable: boolean;
-  /** Adaptive budget key: `http:jsonrpc:<method>`, `http:jsonrpc:batch` or `http:other`. */
+  /**
+   * Adaptive budget key: `http:jsonrpc:<method>` for the methods the class
+   * table names, `http:jsonrpc:batch`, or `http:other` for everything else
+   * (so an app cannot grow the SDK's budget map without bound).
+   */
   readonly opKey: string;
   /** JSON-RPC method of a single call (for debug logs), `batch`, or undefined. */
   readonly method: string | undefined;
 }
 
+/**
+ * Adaptive-budget key for requests outside the class table: non-JSON-RPC
+ * bodies and stateful or unlisted methods share it (ARCHITECTURE §4.6).
+ */
+export const OTHER_OP_KEY = "http:other";
+
 const OTHER: RequestProfile = Object.freeze({
   rpcClass: "other",
   expectedResponseBytes: undefined,
   retryable: false,
-  opKey: "http:other",
+  opKey: OTHER_OP_KEY,
   method: undefined,
 });
 
@@ -117,7 +127,7 @@ export function profileRequest(method: string, contentType: string | undefined, 
       rpcClass,
       expectedResponseBytes: rpcClass === "other" ? undefined : CLASS_REPLY_BYTES[rpcClass],
       retryable: rpcClass === "small" || rpcClass === "medium",
-      opKey: `http:jsonrpc:${safeMethodName(firstMethod ?? "")}`,
+      opKey: rpcClass === "other" ? OTHER_OP_KEY : `http:jsonrpc:${safeMethodName(firstMethod ?? "")}`,
       method: safeMethodName(firstMethod ?? ""),
     };
   }

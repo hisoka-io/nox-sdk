@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { NoxClientConfig } from "@hisoka-io/nox-client";
-import { bootBackoffMs, runNoxWorker, snapshotIdentity, type WorkerDeps } from "../src/core.js";
+import { bootBackoffMs, installUnhandledRejectionLog, runNoxWorker, snapshotIdentity, UNHANDLED_REJECTION_EVENT, type WorkerDeps } from "../src/core.js";
 import { REMOVAL_CACHE_KEY } from "../src/storage.js";
 import type { KpsApi } from "../src/spec-types.js";
 import { FakeHarness, idleKps } from "./helpers/fake-harness.js";
@@ -271,14 +271,40 @@ describe("accept loop", () => {
     expect(client.requests).toHaveLength(50);
   });
 
-  it("stops and disconnects when acceptCall rejects", async () => {
+  it("signals internal-error and disconnects when acceptCall rejects", async () => {
     const { harness, client } = setup();
     await harness.ready;
     harness.breakAccept(new Error("harness closed"));
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(harness.events("accept.failed")).toHaveLength(1);
     expect(client.disconnected).toBe(1);
-    expect(harness.failures).toEqual([]);
+    expect(harness.failures).toHaveLength(1);
+    expect(harness.failures[0]).toMatchObject({ code: "internal-error" });
+    expect(harness.failures[0]?.message).toContain("acceptCall rejected");
+  });
+
+  it("signals internal-error before ready when acceptCall rejects during boot", async () => {
+    const gate = deferred<void>();
+    const pinned = makePinned();
+    const client = new FakeClient(pinned);
+    const { harness } = setup({
+      deps: {
+        snapshot: pinned,
+        connect: async () => {
+          await gate.promise;
+          return client;
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    harness.breakAccept(new Error("harness closed"));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(harness.failures).toHaveLength(1);
+    expect(harness.failures[0]).toMatchObject({ code: "internal-error" });
+    gate.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(harness.readyCount).toBe(0);
+    expect(client.disconnected).toBe(1);
   });
 
   it("rejects an aborted call promptly with AbortError / cancelled", async () => {
@@ -383,5 +409,31 @@ describe("logging policy", () => {
     void runNoxWorker(api, { snapshot: pinned, loadWasm: async () => ({}), connect: scriptedConnect(new FakeClient(pinned)).connect });
     await harness.ready;
     expect(harness.readyCount).toBe(1);
+  });
+});
+
+describe("unhandled rejections", () => {
+  it("are logged with a code and kept from the default handler", () => {
+    const harness = new FakeHarness(undefined, idleKps());
+    let listener: ((event: { reason?: unknown; preventDefault?(): void }) => void) | undefined;
+    const target = {
+      addEventListener: (type: string, fn: typeof listener) => {
+        expect(type).toBe("unhandledrejection");
+        listener = fn;
+      },
+    };
+    expect(installUnhandledRejectionLog(harness.api, target)).toBe(true);
+    let prevented = false;
+    listener?.({ reason: Object.assign(new Error("lost https://rpc.example/key"), { code: "E_LOST" }), preventDefault: () => (prevented = true) });
+    expect(prevented).toBe(true);
+    const entries = harness.events(UNHANDLED_REJECTION_EVENT);
+    expect(entries).toHaveLength(1);
+    expect(JSON.stringify(entries[0]?.args)).toContain("E_LOST");
+    expect(JSON.stringify(entries[0]?.args)).not.toContain("rpc.example");
+  });
+
+  it("are skipped on a global without addEventListener", () => {
+    const harness = new FakeHarness(undefined, idleKps());
+    expect(installUnhandledRejectionLog(harness.api, {})).toBe(false);
   });
 });

@@ -187,6 +187,9 @@ describe("sending", () => {
       ["RESPONSE_TIMEOUT", undefined, "timeout"],
       ["TRANSPORT_FAILED", { kpsCode: "timeout", phase: "read" }, "timeout"],
       ["TRANSPORT_FAILED", { phase: "dial" }, "network-error"],
+      // The SDK's real nesting: client error → packet error → transport error → { phase, kpsCode }.
+      ["TRANSPORT_FAILED", new Error("packet", { cause: new Error("transport", { cause: { phase: "read", kpsCode: "timeout" } }) }), "timeout"],
+      ["TRANSPORT_FAILED", new Error("packet", { cause: new Error("transport", { cause: { phase: "dial", kpsCode: "network-error" } }) }), "network-error"],
       ["KPS_UNAVAILABLE", undefined, "network-error"],
       ["NO_NODES_AVAILABLE", undefined, "network-error"],
       ["TOPOLOGY_STALE", undefined, "network-error"],

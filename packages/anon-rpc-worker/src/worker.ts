@@ -7,10 +7,12 @@
 import { NoxClient, type NoxWasmBindings } from "@hisoka-io/nox-client";
 import initNoxWasm, * as noxWasm from "@hisoka-io/nox-wasm";
 import snapshot from "nox-embed:snapshot";
-import { runNoxWorker } from "./core.js";
+import { installUnhandledRejectionLog, runNoxWorker } from "./core.js";
 import type { AnonRpcWorkerApi } from "./spec-types.js";
 
 declare const anonRpcWorker: AnonRpcWorkerApi;
+
+installUnhandledRejectionLog(anonRpcWorker, globalThis);
 
 void runNoxWorker(anonRpcWorker, {
   snapshot,

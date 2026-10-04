@@ -87,7 +87,11 @@ describe("JSON-RPC profiling", () => {
       expectedResponseBytes: undefined,
       retryable: false,
     });
-    expect(post({ jsonrpc: "2.0", id: 1, method: "weird method!" }).opKey).toBe("http:jsonrpc:nonstandard");
+    expect(post({ jsonrpc: "2.0", id: 1, method: "weird method!" }).opKey).toBe("http:other");
+    // Unlisted methods share one budget key, so distinct names cannot grow the SDK's map.
+    const keys = new Set(Array.from({ length: 50 }, (_, i) => post({ jsonrpc: "2.0", id: i, method: `app_method${i}` }).opKey));
+    expect([...keys]).toEqual(["http:other"]);
+    expect(post({ jsonrpc: "2.0", id: 1, method: "eth_getFilterChanges" }).method).toBe("eth_getFilterChanges");
   });
 
   it("profiles batches: summed size capped at large, retried only when every call is a read", () => {

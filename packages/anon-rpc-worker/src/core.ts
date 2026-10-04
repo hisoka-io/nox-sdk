@@ -79,6 +79,34 @@ export function bootBackoffMs(attempt: number, maxMs: number, random: () => numb
   return Math.max(1, Math.round(ceiling * (0.5 + 0.5 * random())));
 }
 
+/** The slice of a worker global the unhandled-rejection guard uses. */
+export interface RejectionEventTarget {
+  addEventListener(type: "unhandledrejection", listener: (event: { reason?: unknown; preventDefault?(): void }) => void): void;
+}
+
+/** Log event for a promise rejection nothing handled. */
+export const UNHANDLED_REJECTION_EVENT = "worker.unhandled";
+
+/**
+ * Log promise rejections nothing handled, with a code (ARCHITECTURE §4.3).
+ * The harness does not forward them to the host, so without this a lost
+ * promise would be invisible; call failures already reach the host through
+ * `respond`. Returns false when `target` has no `addEventListener`.
+ */
+export function installUnhandledRejectionLog(api: AnonRpcWorkerApi, target: unknown): boolean {
+  const events = target as Partial<RejectionEventTarget> | null | undefined;
+  if (typeof events?.addEventListener !== "function") return false;
+  const log = createLogger(api.log, "error");
+  events.addEventListener("unhandledrejection", (event) => {
+    event.preventDefault?.();
+    log.error(UNHANDLED_REJECTION_EVENT, {
+      code: errorCode(event.reason) ?? "error",
+      reason: describeError(event.reason),
+    });
+  });
+  return true;
+}
+
 /**
  * Run the worker until it fails or the harness stops delivering calls.
  * Never rejects: every failure path logs and, when permanent, signals failure.
@@ -322,11 +350,13 @@ class NoxWorker {
       try {
         call = await this.api.acceptCall();
       } catch (error) {
+        // The call source is gone: fail loudly so the host never waits on a
+        // worker that can no longer serve (ARCHITECTURE §4.4).
         slots.release();
         if (this.failed) return;
         this.stopped = true;
         this.log.error("accept.failed", { code: errorCode(error) ?? "error", reason: describeError(error) });
-        this.shutdown(new NoxWorkerError(CALL_CODES.networkError, "The harness stopped delivering calls"));
+        this.fail(FAILED_CODES.internalError, `acceptCall rejected: ${describeError(error)}`);
         return;
       }
       if (call.kind !== "fetch") {
