@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NoxClient } from "../src/client.js";
 import { decodeHttpResponse } from "../src/http_response.js";
+import { KPS_CLAIM_MAX_SURB_IDS, claimWindow } from "../src/kps/constants.js";
 import {
   NoxClientError,
   NoxClientErrorCode,
@@ -455,6 +456,30 @@ describe("KPS mode background work", () => {
     expect(claims).toBe(1);
   });
 
+  it("claims at most KPS_CLAIM_MAX_SURB_IDS IDs per exchange and rotates through larger sets", async () => {
+    const t = bed();
+    const client = await connect(t.config({}, { claimIntervalMs: 10 }));
+    const entryAddress = client.entryUrl.slice("kps:".length);
+    const claimed: string[][] = [];
+    t.network.route(entryAddress, (request) => {
+      if (request.path === "/api/v1/responses/claim") {
+        const body = JSON.parse(new TextDecoder().decode(request.body)) as { surb_ids: string[] };
+        claimed.push(body.surb_ids);
+        return { status: 200, body: "[]" };
+      }
+      return t.mixnet.handler(request);
+    });
+    const pending = client.httpRequest("GET", "https://example.test/", [], new Uint8Array(0), {
+      timeoutMs: 600,
+      minSurbs: KPS_CLAIM_MAX_SURB_IDS + 40,
+    });
+    await expect(pending).rejects.toMatchObject({ code: NoxClientErrorCode.ResponseTimeout });
+    expect(claimed.length).toBeGreaterThanOrEqual(2);
+    expect(Math.max(...claimed.map((ids) => ids.length))).toBe(KPS_CLAIM_MAX_SURB_IDS);
+    const seen = new Set(claimed.flat());
+    expect(seen.size).toBeGreaterThan(KPS_CLAIM_MAX_SURB_IDS);
+  });
+
   it("refreshes over KPS with the removals-only rule and brings recovered members back", async () => {
     const t = bed();
     const client = await connect(t.config({ topologyRefreshMs: 40 }, { entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 }));
@@ -549,5 +574,26 @@ describe("WASM injection in classic mode", () => {
     Reflect.set(client, "_wasmProvider", () => bindings);
     await (Reflect.get(client, "_initWasm") as () => Promise<void>).call(client);
     expect(client.wasm).toBe(bindings);
+  });
+});
+
+describe("claimWindow", () => {
+  const ids = Array.from({ length: 10 }, (_, i) => `id${i}`);
+
+  it("returns every ID when the set fits", () => {
+    expect(claimWindow(ids, 7, 10)).toEqual({ window: ids, next: 0 });
+  });
+
+  it("rotates through a larger set and wraps", () => {
+    const first = claimWindow(ids, 0, 4);
+    expect(first).toEqual({ window: ["id0", "id1", "id2", "id3"], next: 4 });
+    const second = claimWindow(ids, first.next, 4);
+    expect(second).toEqual({ window: ["id4", "id5", "id6", "id7"], next: 8 });
+    const third = claimWindow(ids, second.next, 4);
+    expect(third).toEqual({ window: ["id8", "id9", "id0", "id1"], next: 2 });
+  });
+
+  it("restarts inside a set that shrank", () => {
+    expect(claimWindow(ids.slice(0, 5), 8, 4)).toEqual({ window: ["id3", "id4", "id0", "id1"], next: 2 });
   });
 });

@@ -82,6 +82,8 @@ import {
   KPS_ANCHOR_STAGGER_MS,
   KPS_SECOND_SOURCE_WAIT_MS,
   KPS_ENTRY_SWITCH_AFTER_FAILURES,
+  KPS_CLAIM_MAX_SURB_IDS,
+  claimWindow,
 } from "./kps/constants.js";
 import {
   validateIssuedPaidQuote,
@@ -190,6 +192,8 @@ interface KpsState {
   members: RelayerNode[];
   /** Entry endpoints with a reply claim in flight (single-flight, ARCHITECTURE §3.6). */
   readonly claimsInFlight: Set<string>;
+  /** Per entry, where the next claim window starts when more than `KPS_CLAIM_MAX_SURB_IDS` IDs are active. */
+  readonly claimCursors: Map<string, number>;
   /** Consecutive transport failures on the pinned entry. */
   pinnedEntryFailures: number;
 }
@@ -440,6 +444,7 @@ export class NoxClient {
         transport,
         members: working.members,
         claimsInFlight: new Set(),
+        claimCursors: new Map(),
         pinnedEntryFailures: 0,
       };
       client._log = log;
@@ -849,6 +854,7 @@ export class NoxClient {
     const kps = this._kps;
     if (kps !== undefined) {
       kps.claimsInFlight.clear();
+      kps.claimCursors.clear();
       void kps.transport.close();
     }
   }
@@ -1529,17 +1535,27 @@ export class NoxClient {
   /**
    * Claim replies from one entry. In KPS mode at most one claim per entry is
    * in flight: a tick that finds one running is skipped, so a slow claim never
-   * stacks streams (ARCHITECTURE §3.6). Returns `null` when skipped or failed.
+   * stacks streams (ARCHITECTURE §3.6), and one claim carries at most
+   * `KPS_CLAIM_MAX_SURB_IDS` IDs, rotating through larger sets on successive
+   * ticks (the `nox-kps` claim limit). Returns `null` when skipped or failed.
    */
   private async _claimSingleFlight(
     entryUrl: string,
     surbIds: string[],
   ): Promise<import("./types.js").BatchResponseItem[] | null> {
-    const inFlight = this._kps?.claimsInFlight;
+    const kps = this._kps;
+    const inFlight = kps?.claimsInFlight;
     if (inFlight?.has(entryUrl) === true) return null;
     inFlight?.add(entryUrl);
+    let ids = surbIds;
+    if (kps !== undefined) {
+      const { window, next } = claimWindow(surbIds, kps.claimCursors.get(entryUrl) ?? 0, KPS_CLAIM_MAX_SURB_IDS);
+      ids = window;
+      if (next === 0) kps.claimCursors.delete(entryUrl);
+      else kps.claimCursors.set(entryUrl, next);
+    }
     try {
-      return await claimResponses(entryUrl, surbIds, undefined, this.fetch);
+      return await claimResponses(entryUrl, ids, undefined, this.fetch);
     } catch (pollErr) {
       if (this._debugPoll) {
         this._debug(`[poll] fetch error: ${String(pollErr).slice(0, 120)}`);

@@ -112,7 +112,7 @@ export type {
   KpsFetchStats,
   KpsTransportSettings,
 } from "./kps/transport.js";
-export { KPS_CLIENT_DEFAULTS } from "./kps/constants.js";
+export { KPS_CLIENT_DEFAULTS, KPS_CLAIM_MAX_SURB_IDS, claimWindow } from "./kps/constants.js";
 export {
   PINNED_SNAPSHOT_FORMAT,
   verifyPinnedSnapshot,
