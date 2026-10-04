@@ -254,7 +254,8 @@ function isCanonicalAddressOrder(addresses: readonly string[]): boolean {
   return addresses.every((address, index) => index === 0 || addresses[index - 1]! < address);
 }
 
-function primaryLayerForRole(address: string, role: number): number {
+/** Layer a member must report for its role (same rule as nox-core `primary_layer_for_role`). */
+export function primaryLayerForRole(address: string, role: number): number {
   const firstHashByte = Number.parseInt(
     sha256(toUtf8Bytes(normalizeAddress(address))).slice(2, 4),
     16,
@@ -659,22 +660,31 @@ export function parseNodes(snapshot: TopologySnapshot): TopologyNode[] {
   return snapshot.nodes.map(parseNode);
 }
 
+/** Classic entry rule: the node has an HTTP(S) ingress URL. */
+export function hasHttpEntry(node: TopologyNode): boolean {
+  return hasUsableIngress(node.address);
+}
+
 /**
  * Select a random 3-hop route (entry, mix, exit).
  *
  * `avoid` holds node IDs to leave out of the random mix and exit choice when
  * another candidate exists. It never overrides `pinnedEntry` or `selectedExit`,
  * and it never makes an otherwise possible route impossible.
+ *
+ * `isEntry` decides which layer-0-capable nodes the client can reach as an
+ * entry. The default is the classic rule (an HTTP(S) ingress URL); KPS mode
+ * passes a rule that admits only nodes with a KPS address.
  */
 export function selectRoute(
   nodes: TopologyNode[],
   pinnedEntry?: TopologyNode,
   selectedExit?: TopologyNode,
   avoid?: ReadonlySet<string>,
+  isEntry: (node: TopologyNode) => boolean = hasHttpEntry,
 ): Route {
   const entries = nodes.filter(
-    (node) =>
-      layersForRole(node.role).includes(0) && hasUsableIngress(node.address),
+    (node) => layersForRole(node.role).includes(0) && isEntry(node),
   );
   const mixes = nodes.filter((node) => layersForRole(node.role).includes(1));
   const exits = nodes.filter(
