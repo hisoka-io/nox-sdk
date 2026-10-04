@@ -31,6 +31,9 @@ export class FakeHarness {
   readonly api: AnonRpcWorkerApi;
   /** Calls answered, by call index: how many times `respond` ran. */
   readonly respondCounts: number[] = [];
+  /** When `acceptCall` handed each call to the worker (`Date.now()`), by call index. */
+  readonly acceptedAt: (number | undefined)[] = [];
+  private readonly callIndex = new WeakMap<IncomingCall, number>();
   private readonly queue: IncomingCall[] = [];
   private readonly waiters: Waiter[] = [];
   private acceptError: unknown;
@@ -92,6 +95,7 @@ export class FakeHarness {
   fetch(url: string, requestInit?: AnonRequestInit): Promise<AnonFetchResponse> {
     const index = this.respondCounts.length;
     this.respondCounts.push(0);
+    this.acceptedAt.push(undefined);
     return new Promise<AnonFetchResponse>((resolve, reject) => {
       const call: IncomingCall = {
         kind: "fetch",
@@ -103,6 +107,7 @@ export class FakeHarness {
           Promise.resolve(response).then(resolve, reject);
         },
       };
+      this.callIndex.set(call, index);
       this.deliver(call);
     });
   }
@@ -125,14 +130,20 @@ export class FakeHarness {
 
   private deliver(call: IncomingCall): void {
     const waiter = this.waiters.shift();
-    if (waiter !== undefined) waiter.resolve(call);
+    if (waiter !== undefined) waiter.resolve(this.handOut(call));
     else this.queue.push(call);
+  }
+
+  private handOut(call: IncomingCall): IncomingCall {
+    const index = this.callIndex.get(call);
+    if (index !== undefined) this.acceptedAt[index] = Date.now();
+    return call;
   }
 
   private acceptCall(): Promise<IncomingCall> {
     if (this.acceptError !== undefined) return Promise.reject(this.acceptError);
     const next = this.queue.shift();
-    if (next !== undefined) return Promise.resolve(next);
+    if (next !== undefined) return Promise.resolve(this.handOut(next));
     return new Promise((resolve, reject) => this.waiters.push({ resolve, reject }));
   }
 }

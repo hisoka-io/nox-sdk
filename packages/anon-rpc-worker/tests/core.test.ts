@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { NoxClientConfig } from "@hisoka-io/nox-client";
 import { bootBackoffMs, installUnhandledRejectionLog, runNoxWorker, snapshotIdentity, UNHANDLED_REJECTION_EVENT, type WorkerDeps } from "../src/core.js";
 import { REMOVAL_CACHE_KEY } from "../src/storage.js";
@@ -321,16 +321,34 @@ describe("accept loop", () => {
   });
 
   it("rejects with timeout at the call deadline, including time spent waiting for ready", async () => {
-    const pinned = makePinned();
-    const { harness } = setup({
-      config: { callDeadlineMs: 3_000, attemptTimeoutMs: 3_000 },
-      deps: { snapshot: pinned, connect: () => new Promise(() => undefined) },
-    });
-    const started = Date.now();
-    await expect(rpcCall(harness)).rejects.toMatchObject({ code: "timeout" });
-    const elapsed = Date.now() - started;
-    expect(elapsed).toBeGreaterThanOrEqual(2_900);
-    expect(elapsed).toBeLessThan(3_300);
+    // Fake timers make the deadline exact: wall-clock bounds flake when the
+    // host stalls the event loop (observed stalls of 400-650 ms).
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const pinned = makePinned();
+      const { harness } = setup({
+        config: { callDeadlineMs: 3_000, attemptTimeoutMs: 3_000 },
+        deps: { snapshot: pinned, connect: () => new Promise(() => undefined) },
+      });
+      let outcome: unknown;
+      rpcCall(harness).then(
+        () => (outcome = "resolved"),
+        (error: unknown) => (outcome = error),
+      );
+      // Boot reaches acceptCall through promise jobs only; no timer has to run
+      // (vi.waitFor would advance the fake clock while it polls).
+      for (let turn = 0; turn < 1_000 && harness.acceptedAt[0] === undefined; turn++) await Promise.resolve();
+      expect(harness.acceptedAt[0]).toBeDefined();
+      await vi.advanceTimersByTimeAsync(2_999);
+      expect(outcome).toBeUndefined();
+      expect(harness.readyCount).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(outcome).toMatchObject({ code: "timeout" });
+      expect(harness.readyCount).toBe(0);
+      expect(harness.failures).toEqual([]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("maps client failures to per-call codes without failing the worker", async () => {
