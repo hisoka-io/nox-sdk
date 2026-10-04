@@ -177,6 +177,27 @@ const body = await client.httpRequest(
 );
 ```
 
+### KPS mode
+
+For hosts that reach nodes over [KPS](https://github.com/ethereum/kps) (for example inside an anon-rpc worker),
+the client boots from a pinned registry snapshot and sends everything over KPS streams, with no seed, no
+Ethereum RPC, no `fetch` and no WebSocket. Only members that publish a KPS address in their registry
+`metadataUrl` serve as entries.
+
+```ts
+const client = await NoxClient.connect({
+  mode: "kps",
+  wasm: noxWasmBindings,                    // initialised @hisoka-io/nox-wasm exports
+  kps: {
+    dial: (address, opts) => anonRpcWorker.kps.dial(address, opts),
+    pinned: snapshot,                       // "nox-anon-rpc-snapshot/1"
+  },
+});
+```
+
+KPS mode never falls back to HTTPS: classic-only settings (`seeds`, `ethRpcUrl`, `transport`) and non-`kps:`
+endpoints fail with `MODE_VIOLATION`. Classic mode stays the default.
+
 ### Cover traffic
 
 Send dummy packets at a configurable rate to hide when you're actually using the network:
