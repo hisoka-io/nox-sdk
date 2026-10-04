@@ -339,10 +339,23 @@ describe("verify-snapshot.mjs", () => {
 
   it("applies the release gate", async () => {
     expect(await verifySnapshot(["--offline", "--release"])).toBe(1);
-    expect(stdout()).toContain("release gate: FAIL");
+    expect(stdout()).toContain("release gate (document only, the chain was not read): FAIL");
     const all = committed.members.map((member) => member.address).join(",");
     output.length = 0;
     expect(await verifySnapshot(["--offline", "--release", "--allow-missing-kps", all])).toBe(0);
+    expect(stdout()).toContain("release gate (document only, the chain was not read): pass");
+  });
+
+  it("passes the release gate against the chain only through two providers", async () => {
+    const all = committed.members.map((member) => member.address).join(",");
+    const a = await startChain(chainOptions());
+    const b = await startChain(chainOptions());
+    output.length = 0;
+    expect(await verifySnapshot(["--rpc", a.url, "--release", "--allow-missing-kps", all])).toBe(1);
+    expect(stdout()).toContain("read through 1 provider(s); a release snapshot needs 2");
+    output.length = 0;
+    expect(await verifySnapshot(["--rpc", a.url, "--rpc", b.url, "--release", "--allow-missing-kps", all])).toBe(0);
     expect(stdout()).toContain("release gate: pass");
+    expect(stdout()).not.toContain("FAIL");
   });
 });

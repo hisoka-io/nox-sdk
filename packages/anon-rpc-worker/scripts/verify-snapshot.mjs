@@ -24,6 +24,10 @@
  *                    configured release network, and every member publishes a
  *                    KPS address in its metadataUrl, except the addresses given
  *                    with --allow-missing-kps (named in the release notes).
+ *                    With --offline this checks the document only (the
+ *                    output says so): metadataUrl values are taken as
+ *                    committed, so a canary overlay would pass. A release
+ *                    snapshot passes the gate with two --rpc providers.
  *
  * Usage:
  *   node scripts/verify-snapshot.mjs [--snapshot snapshot/nox-snapshot.json] --offline
@@ -33,6 +37,8 @@
  * The RPC URL can also come from NOX_SNAPSHOT_RPC_URL.
  */
 import { readFileSync } from "node:fs";
+/** Independent RPC providers a release snapshot is re-read through (ARCHITECTURE §5.2). */
+export const RELEASE_MIN_PROVIDERS = 2;
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { checkHashFile, KECCAK_FILE_SUFFIX } from "./hash.mjs";
@@ -296,11 +302,21 @@ export async function main(argv) {
       (values["allow-missing-kps"] ?? "").split(",").map((entry) => entry.trim().toLowerCase()).filter((entry) => entry !== ""),
     );
     const problems = releaseGateProblems(snapshot, allowMissing);
+    const scope = values.offline ? " (document only, the chain was not read)" : "";
     if (problems.length === 0) {
-      process.stdout.write(`release gate: pass (${network.name}, every member publishes a KPS address or is named in --allow-missing-kps)\n`);
+      process.stdout.write(
+        `release gate${scope}: pass (${network.name}, every member publishes a KPS address or is named in --allow-missing-kps)\n`,
+      );
     } else {
       failed = true;
-      process.stdout.write(`release gate: FAIL\n${problems.map((line) => `  ${line}`).join("\n")}\n`);
+      process.stdout.write(`release gate${scope}: FAIL\n${problems.map((line) => `  ${line}`).join("\n")}\n`);
+    }
+    const providers = values.rpc?.length ?? (hasRpc ? 1 : 0);
+    if (!values.offline && providers < RELEASE_MIN_PROVIDERS) {
+      failed = true;
+      process.stdout.write(
+        `release gate: FAIL, the chain was read through ${providers} provider(s); a release snapshot needs ${RELEASE_MIN_PROVIDERS} (--rpc <a> --rpc <b>)\n`,
+      );
     }
   }
   if (values.offline) return failed ? 1 : 0;

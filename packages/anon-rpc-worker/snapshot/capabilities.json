@@ -35,5 +35,5 @@
       "surb_v2"
     ]
   },
-  "source": "Capability hints reviewed for the release snapshot. Taken from the liveness section of the public seed topology (https://api.hisoka.io/seed/topology, block 315529537, fleet build 0.4.0-rc.4+b30e46d3ab9d2d707de37011a10639a4c15232ce). Hints are untrusted by design and only choose between reply-block formats."
+  "source": "Capability hints reviewed for the release snapshot. Taken from the liveness section of the public seed topology (https://api.hisoka.io/seed/topology, fleet build 0.4.0-rc.4+b30e46d3ab9d2d707de37011a10639a4c15232ce), re-read at block 315566145 on 2026-10-04 with identical hints for all 10 members. Hints are untrusted by design and only choose between reply-block formats."
 }
