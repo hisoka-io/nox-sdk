@@ -1,0 +1,31 @@
+# Worker specifier contracts for the Nox anon-rpc worker (anon-rpc SPEC §4).
+#
+# The compiler settings below are the ones that reproduce, byte for byte, the
+# runtime code of the reference WorkerSpecifier that ethereum/anon-rpc deployed
+# on Ethereum mainnet (passthrough, tor-js and the Nym PoC all share codehash
+# 0xc4c54384a9c1f1201ef3711a7ed7ba20e078a432e85ecc4f8b14927587cc7b5f).
+# test/ReferenceBytecode.t.sol fails if any of them drifts, so keep them
+# pinned rather than inherited from the Foundry defaults of the day.
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+cache_path = "cache"
+libs = []
+auto_detect_remappings = false
+remappings = []
+solc_version = "0.8.28"
+evm_version = "prague"
+optimizer = false
+optimizer_runs = 200
+via_ir = false
+bytecode_hash = "ipfs"
+cbor_metadata = true
+
+[fuzz]
+runs = 512
+
+[lint]
+# test/WorkerSpecifier.t.sol is a verbatim upstream copy (see NOTICE) and is
+# kept byte-identical, so its style notes are not ours to fix.
+ignore = ["test/WorkerSpecifier.t.sol"]

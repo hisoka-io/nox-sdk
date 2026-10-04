@@ -1,0 +1,51 @@
+anon-rpc worker specifier for the Nox anon-rpc worker
+Copyright 2026 Hisoka Labs
+
+This directory is licensed under the Apache License, Version 2.0 (see LICENSE at
+the repository root), except for the files listed below, which come from
+ethereum/anon-rpc (https://github.com/ethereum/anon-rpc) at commit
+f2c8a758caaa555974a3c79769e8cb4a40ac1ae1 and remain under the MIT License
+reproduced at the end of this notice.
+
+- src/WorkerSpecifier.sol
+  Copy of impl/specifier/src/WorkerSpecifier.sol, byte for byte
+  (sha256 f86a1da4e84433a731bf6f96b0a0b7f196fc946c5753914d1e0471c0033ce5be).
+  Kept unmodified so that it compiles to the same runtime code as the
+  WorkerSpecifier deployments on Ethereum mainnet (test/ReferenceBytecode.t.sol).
+
+- test/WorkerSpecifier.t.sol
+  Copy of impl/specifier/test/WorkerSpecifier.t.sol, byte for byte
+  (sha256 e924eb24d971335f4392e597ed37eacbb99967927a13084a9a2400aa51707ba2).
+
+- src/IWorkerSpecifier.sol
+  The IWorkerSpecifier interface from SPEC.md §4 (anon-rpc specification
+  version 0.3.2), with the same declarations and comments, re-indented by
+  forge fmt.
+
+The tests also execute src/host/specifier.ts and src/host/kps-http.ts of the npm
+package @anon-rpc/browser-harness 0.3.2 (MIT, Ethereum Foundation), installed as
+a development dependency and not redistributed here.
+
+--------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 Ethereum Foundation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

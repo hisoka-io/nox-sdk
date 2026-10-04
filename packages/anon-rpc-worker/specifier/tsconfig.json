@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "types": ["node"],
+    "strict": true,
+    "exactOptionalPropertyTypes": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "paths": {
+      "@anon-rpc-harness/*": ["./node_modules/@anon-rpc/browser-harness/dist/types/host/*"]
+    }
+  },
+  "include": ["tools/**/*.ts", "scripts/**/*.ts", "itest/**/*.ts", "vite.config.ts"]
+}
