@@ -1,0 +1,42 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:hisoka:nox-anon-rpc-snapshot:1",
+  "title": "Nox anon-rpc pinned registry snapshot",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["format", "chainId", "registry", "blockNumber", "blockHash", "fingerprint",
+               "relayerCount", "powDifficulty", "members"],
+  "properties": {
+    "format":        { "const": "nox-anon-rpc-snapshot/1" },
+    "chainId":       { "type": "integer", "minimum": 1 },
+    "registry":      { "type": "string", "pattern": "^0x[0-9a-f]{40}$" },
+    "blockNumber":   { "type": "integer", "minimum": 1 },
+    "blockHash":     { "type": "string", "pattern": "^0x[0-9a-f]{64}$" },
+    "fingerprint":   { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "relayerCount":  { "type": "integer", "minimum": 1, "maximum": 256 },
+    "powDifficulty": { "type": "integer", "minimum": 0, "maximum": 16 },
+    "members": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/$defs/member" } }
+  },
+  "$defs": {
+    "member": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["address", "sphinxKey", "url", "ingressUrl", "metadataUrl", "stake",
+                   "role", "layer", "status", "frozen", "capabilities"],
+      "properties": {
+        "address":      { "type": "string", "pattern": "^0x[0-9a-f]{40}$" },
+        "sphinxKey":    { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "url":          { "type": "string", "minLength": 1, "maxLength": 256 },
+        "ingressUrl":   { "type": "string", "maxLength": 256 },
+        "metadataUrl":  { "type": "string", "maxLength": 256 },
+        "stake":        { "type": "string", "pattern": "^(0|[1-9][0-9]*)$" },
+        "role":         { "enum": [1, 2, 3] },
+        "layer":        { "enum": [0, 1, 2] },
+        "status":       { "enum": [1, 2] },
+        "frozen":       { "type": "boolean" },
+        "capabilities": { "type": "array", "maxItems": 32, "uniqueItems": true,
+                          "items": { "type": "string", "minLength": 1, "maxLength": 64 } }
+      }
+    }
+  }
+}

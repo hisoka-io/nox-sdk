@@ -1,0 +1,85 @@
+{
+  "contractName": "ERC1967Proxy",
+  "source": {
+    "package": "@openzeppelin/contracts",
+    "version": "5.6.1",
+    "path": "proxy/ERC1967/ERC1967Proxy.sol"
+  },
+  "compiler": {
+    "solc": "0.8.28+commit.7893614a.Linux.g++",
+    "settings": "--optimize --optimize-runs 1 --evm-version cancun --metadata-hash none"
+  },
+  "abi": [
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "implementation",
+          "type": "address"
+        },
+        {
+          "internalType": "bytes",
+          "name": "_data",
+          "type": "bytes"
+        }
+      ],
+      "stateMutability": "payable",
+      "type": "constructor"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "target",
+          "type": "address"
+        }
+      ],
+      "name": "AddressEmptyCode",
+      "type": "error"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "address",
+          "name": "implementation",
+          "type": "address"
+        }
+      ],
+      "name": "ERC1967InvalidImplementation",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ERC1967NonPayable",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "ERC1967ProxyUninitialized",
+      "type": "error"
+    },
+    {
+      "inputs": [],
+      "name": "FailedCall",
+      "type": "error"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "implementation",
+          "type": "address"
+        }
+      ],
+      "name": "Upgraded",
+      "type": "event"
+    },
+    {
+      "stateMutability": "payable",
+      "type": "fallback"
+    }
+  ],
+  "bytecode": "0x60806040526040516103933803806103938339810160408190526100229161022a565b8051610041576040516330a289cf60e21b815260040160405180910390fd5b61004b8282610052565b505061030d565b61005b826100b0565b6040516001600160a01b038316907fbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b905f90a28051156100a45761009f8282610126565b505050565b6100ac6101be565b5050565b806001600160a01b03163b5f036100e55780604051634c9c8ce360e01b81526004016100dc91906102f9565b60405180910390fd5b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc80546001600160a01b0319166001600160a01b0392909216919091179055565b60605f61013384846101df565b905080801561015457505f3d118061015457505f846001600160a01b03163b115b15610169576101616101f2565b9150506101b8565b801561018a5783604051639996b31560e01b81526004016100dc91906102f9565b3d1561019d5761019861020b565b6101b6565b60405163d6bda27560e01b815260040160405180910390fd5b505b92915050565b34156101dd5760405163b398979f60e01b815260040160405180910390fd5b565b5f5f5f835160208501865af49392505050565b6040513d81523d5f602083013e3d602001810160405290565b6040513d5f823e3d81fd5b634e487b7160e01b5f52604160045260245ffd5b5f5f6040838503121561023b575f5ffd5b82516001600160a01b0381168114610251575f5ffd5b60208401519092506001600160401b0381111561026c575f5ffd5b8301601f8101851361027c575f5ffd5b80516001600160401b0381111561029557610295610216565b604051601f8201601f19908116603f011681016001600160401b03811182821017156102c3576102c3610216565b6040528181528282016020018710156102da575f5ffd5b8160208401602083015e5f602083830101528093505050509250929050565b6001600160a01b0391909116815260200190565b607a806103195f395ff3fe6080604052600a600c565b005b60186014601a565b6050565b565b5f604b7f360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc546001600160a01b031690565b905090565b365f5f375f5f365f845af43d5f5f3e8080156069573d5ff35b3d5ffdfea164736f6c634300081c000a"
+}

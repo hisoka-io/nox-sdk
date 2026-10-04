@@ -1,0 +1,39 @@
+{
+  "format": "nox-capabilities/1",
+  "members": {
+    "0x03a42846c18b99c453a49d7fce69f336f865c48b": [
+      "paid_v2",
+      "surb_v2"
+    ],
+    "0x074a13b271b73eb5c0c44e2037d035e7eef4a462": [
+      "surb_v2"
+    ],
+    "0x1efa385556a6e8643df0033048ba1dd67ec43f93": [
+      "paid_v2",
+      "surb_v2"
+    ],
+    "0x3e98ee4572741fd932e031ac60e79f7c012758be": [
+      "surb_v2"
+    ],
+    "0x6774ca4baf6fff84f02898a3dee4299ed1f5ab4e": [
+      "paid_v2",
+      "surb_v2"
+    ],
+    "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9": [
+      "surb_v2"
+    ],
+    "0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463": [
+      "surb_v2"
+    ],
+    "0x8c9fb3e9fe537067c8430480f80a4a5b9a12be1a": [
+      "surb_v2"
+    ],
+    "0xbeb31ac0c57b3765cb855fa02081eadb9edb2426": [
+      "surb_v2"
+    ],
+    "0xf8681a0acb60effcd9c169226e6f9c1ae9dd7894": [
+      "surb_v2"
+    ]
+  },
+  "source": "Capability hints reviewed for the release snapshot. Taken from the liveness section of the public seed topology (https://api.hisoka.io/seed/topology, fleet build 0.4.0-rc.4+b30e46d3ab9d2d707de37011a10639a4c15232ce), re-read at block 315566145 on 2026-10-04 with identical hints for all 10 members. Hints are untrusted by design and only choose between reply-block formats."
+}

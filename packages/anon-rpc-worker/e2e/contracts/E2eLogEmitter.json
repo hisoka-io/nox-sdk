@@ -1,0 +1,112 @@
+{
+  "contractName": "E2eLogEmitter",
+  "source": {
+    "path": "contracts/E2eLogEmitter.sol",
+    "sha256": "b7153c55d9e9756762db3db5f0cc45a2b3d1835871396c6be1c958fb6a8c0f25"
+  },
+  "compiler": {
+    "solc": "0.8.28+commit.7893614a.Linux.g++",
+    "settings": "--optimize --optimize-runs 200 --evm-version cancun --metadata-hash none"
+  },
+  "abi": [
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "index",
+          "type": "uint256"
+        },
+        {
+          "indexed": false,
+          "internalType": "bytes",
+          "name": "data",
+          "type": "bytes"
+        }
+      ],
+      "name": "Blob",
+      "type": "event"
+    },
+    {
+      "anonymous": false,
+      "inputs": [
+        {
+          "indexed": true,
+          "internalType": "address",
+          "name": "from",
+          "type": "address"
+        },
+        {
+          "indexed": true,
+          "internalType": "uint256",
+          "name": "value",
+          "type": "uint256"
+        }
+      ],
+      "name": "Ping",
+      "type": "event"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "count",
+          "type": "uint256"
+        },
+        {
+          "internalType": "uint256",
+          "name": "size",
+          "type": "uint256"
+        }
+      ],
+      "name": "emitBlobs",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "value",
+          "type": "uint256"
+        }
+      ],
+      "name": "ping",
+      "outputs": [],
+      "stateMutability": "nonpayable",
+      "type": "function"
+    },
+    {
+      "inputs": [
+        {
+          "internalType": "uint256",
+          "name": "value",
+          "type": "uint256"
+        }
+      ],
+      "name": "probe",
+      "outputs": [
+        {
+          "internalType": "uint256",
+          "name": "doubled",
+          "type": "uint256"
+        },
+        {
+          "internalType": "address",
+          "name": "caller",
+          "type": "address"
+        },
+        {
+          "internalType": "uint256",
+          "name": "blockNumber",
+          "type": "uint256"
+        }
+      ],
+      "stateMutability": "view",
+      "type": "function"
+    }
+  ],
+  "bytecode": "0x6080604052348015600e575f5ffd5b506102d98061001c5f395ff3fe608060405234801561000f575f5ffd5b506004361061003f575f3560e01c80630640808414610043578063773acdef14610058578063db0824401461006b575b5f5ffd5b6100566100513660046101e9565b6100a5565b005b610056610066366004610209565b6101a0565b61007e610079366004610209565b6101cf565b604080519384526001600160a01b0390921660208401529082015260600160405180910390f35b5f8167ffffffffffffffff8111156100bf576100bf610220565b6040519080825280601f01601f1916602001820160405280156100e9576020820181803683370190505b5090505f60206100fa84601f610248565b6101049190610261565b90505f5b8181101561014e575f8160405160200161012491815260200190565b60408051601f19818403018152919052805160209182012083820286019091015250600101610108565b505f5b8481101561019957807fc9ad41baf6f932404a30267c4d7b5159039d5c7beb2278edffca9d5ab091e361846040516101899190610280565b60405180910390a2600101610151565b5050505050565b604051819033907ffd8d0c1dc3ab254ec49463a1192bb2423b3b851adedec1aa94dcd362dc063c9d905f90a350565b5f80806101dd8460026102b5565b94339450439350915050565b5f5f604083850312156101fa575f5ffd5b50508035926020909101359150565b5f60208284031215610219575f5ffd5b5035919050565b634e487b7160e01b5f52604160045260245ffd5b634e487b7160e01b5f52601160045260245ffd5b8082018082111561025b5761025b610234565b92915050565b5f8261027b57634e487b7160e01b5f52601260045260245ffd5b500490565b602081525f82518060208401528060208501604085015e5f604082850101526040601f19601f83011684010191505092915050565b808202811582820484141761025b5761025b61023456fea164736f6c634300081c000a"
+}

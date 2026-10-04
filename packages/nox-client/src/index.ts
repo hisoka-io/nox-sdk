@@ -12,6 +12,20 @@ export type {
   NoxWebSocketConstructor,
   TopologyLiveness,
   SurbFormat,
+  NoxTransportMode,
+  KpsErrorCode,
+  KpsReason,
+  KpsStreamLike,
+  KpsConnLike,
+  KpsDial,
+  PinnedMember,
+  PinnedSnapshot,
+  KpsModeOptions,
+  NoxWasmBindings,
+  NoxWasmProvider,
+  NoxLogLevel,
+  NoxLogSink,
+  HttpRequestOptions,
 } from "./types.js";
 
 export {
@@ -33,6 +47,8 @@ export {
   selectRoute,
   layersForRole,
   hasUsableIngress,
+  hasHttpEntry,
+  primaryLayerForRole,
   supportsSurbV2,
   routeSupportsSurbV2,
   MAX_SURB_V2_ADDRESS_BYTES,
@@ -73,6 +89,39 @@ export type {
   SubmitRejectionCode,
   SubmitTransactionResponse,
 } from "./bincode.js";
+
+export { decodeHttpResponse } from "./http_response.js";
+export type { DecodedHttpResponse } from "./http_response.js";
+
+export {
+  parseKpsAddress,
+  parseKpsEndpoint,
+  isKpsAddress,
+  kpsAddrFromMetadataUrl,
+  KPS_ENDPOINT_PREFIX,
+  KPS_METADATA_PATH,
+} from "./kps/address.js";
+export type { KpsAddressParts } from "./kps/address.js";
+export { NoxKpsError } from "./kps/errors.js";
+export { createKpsFetch } from "./kps/fetch.js";
+export type { KpsFetch } from "./kps/fetch.js";
+export { KPS_TRANSPORT_DEFAULTS, kpsFailurePhase } from "./kps/transport.js";
+export type {
+  KpsFailureCause,
+  KpsFailurePhase,
+  KpsFetchStats,
+  KpsTransportSettings,
+} from "./kps/transport.js";
+export { KPS_CLIENT_DEFAULTS, KPS_CLAIM_MAX_SURB_IDS, claimWindow } from "./kps/constants.js";
+export {
+  PINNED_SNAPSHOT_FORMAT,
+  verifyPinnedSnapshot,
+  applyServedTopologies,
+  eligiblePinnedMembers,
+  pinnedKpsAddresses,
+  pinnedRelayerNodes,
+} from "./kps/pinned.js";
+export type { ServedTopology, WorkingSet, ApplyServedOptions, RouteLayer } from "./kps/pinned.js";
 
 export type { IssuedPaidQuoteV2, PaidQuoteResultV2 } from "./paid.js";
 export { hashExecutionQuoteV1 } from "./paid.js";

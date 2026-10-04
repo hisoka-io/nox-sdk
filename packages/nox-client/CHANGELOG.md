@@ -2,6 +2,42 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
+## 0.5.0
+
+Needs `@hisoka-io/nox-wasm` 0.2.0 (unchanged). Classic mode is the default and behaves exactly as 0.4.0: the 0.4.0
+test suite runs unchanged against it.
+
+### Added
+
+- KPS mode (`mode: "kps"`), opt-in, for hosts that dial nodes over KPS, such as the anon-rpc worker harness. The client
+  boots from a pinned NoxRegistry snapshot (`kps.pinned`, format `nox-anon-rpc-snapshot/1`) through
+  `kps.dial`, with no seed and no Ethereum RPC; packets, reply claims and topology refreshes all travel over KPS
+  streams (HTTP/1.1, one stream per exchange, one connection per entry). It fails closed: seeds, `ethRpcUrl`,
+  `transport` and any non-`kps:` endpoint are refused with `MODE_VIOLATION`, and the client never switches to
+  HTTPS or WebSocket.
+  - Served topologies are accepted only as removals from the pinned set, only when documents from two different
+    nodes agree, and every route layer keeps at least two members; additions need a new snapshot.
+  - `TOPOLOGY_STALE` rests on registry evidence: two nodes agree that every pinned member of a route layer is gone
+    from the registry or has a changed profile. A layer whose members are listed but reported offline (as while
+    the P2P mesh re-forms after a restart) keeps its previous members, logs `topology.offline` and fails calls one
+    by one until a refresh sees members online again.
+  - Entries are limited to members that publish a KPS address in their `metadataUrl`
+    (`kps:<ip>:<port>:<certhash>/metadata.json`), optionally narrowed with `kps.entries`.
+  - At most one reply claim per entry is in flight, and one claim carries at most `KPS_CLAIM_MAX_SURB_IDS` (128)
+    IDs, the `nox-kps` default limit; larger sets rotate across polls.
+  - Two transport failures in a row move the pinned entry; replies already routed to the old entry are still
+    claimed there.
+- `wasm` (both modes): pass initialised `@hisoka-io/nox-wasm` bindings instead of the dynamic import.
+- `log` (both modes): a structured diagnostics sink that never receives URLs, bodies, keys or SURB IDs.
+- `httpRequest` options: `opKey`, `minSurbs`, `retry`, `signal` (rejects with `ABORTED` and frees the reply blocks
+  at once) and `maxResponseBytes` (`RESPONSE_TOO_LARGE`).
+- `decodeHttpResponse` for the exit's HTTP reply encoding.
+- New exports: `createKpsFetch`, `parseKpsAddress`, `parseKpsEndpoint`, `isKpsAddress`, `kpsAddrFromMetadataUrl`,
+  `verifyPinnedSnapshot`, `applyServedTopologies`, `eligiblePinnedMembers`, `pinnedKpsAddresses`,
+  `pinnedRelayerNodes`, `primaryLayerForRole`, `KPS_CLIENT_DEFAULTS`, `KPS_TRANSPORT_DEFAULTS`,
+  `KPS_CLAIM_MAX_SURB_IDS`, `NoxKpsError` and their types.
+- Error codes `KPS_UNAVAILABLE`, `MODE_VIOLATION`, `TOPOLOGY_STALE`, `ABORTED` and `RESPONSE_TOO_LARGE`.
+
 ## 0.4.0 (2026-10-03)
 
 Needs `@hisoka-io/nox-wasm` 0.2.0. Wire-compatible with nox 0.4.0-rc.2 and

@@ -1,0 +1,9 @@
+{
+  "arbitrum-sepolia": {
+    "chain_id": 421614,
+    "registry": "0xf7bff88a1412054a001dc4b8acbddad6f9b26cb6",
+    "from_block": 312414608,
+    "pow_difficulty": 1,
+    "source": "registry, chain and start block: hisoka-io/run-nox configs/arbitrum-sepolia.deployment.json (contracts.noxRegistry, meta.chainId, meta.startBlock), deployment of 2026-09-25. pow_difficulty: the fleet's minimum, as published in the seed topology (pow_difficulty 1, re-read at block 315566145 on 2026-10-04)."
+  }
+}
