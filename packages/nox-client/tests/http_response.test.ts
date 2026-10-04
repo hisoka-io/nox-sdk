@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { decodeHttpResponse } from "../src/bincode.js";
+import { decodeHttpResponse } from "../src/http_response.js";
 import { NoxClientError } from "../src/types.js";
 
 /** Produced by bincode 1.3 `serialize` of nox-node's `SerializableHttpResponse`. */
@@ -30,11 +30,18 @@ describe("decodeHttpResponse", () => {
   it("rejects truncated input, trailing bytes and invalid bools", () => {
     const ok = hex(RUST_OK);
     expect(() => decodeHttpResponse(ok.subarray(0, ok.length - 1))).toThrow(NoxClientError);
-    expect(() => decodeHttpResponse(Uint8Array.from([...ok, 0]))).toThrow(/trailing bytes/u);
+    expect(() => decodeHttpResponse(Uint8Array.from([...ok, 0]))).toThrow(/malformed exit HTTP reply: 1 trailing bytes/u);
     const badBool = Uint8Array.from(ok);
     badBool[badBool.length - 1] = 2;
-    expect(() => decodeHttpResponse(badBool)).toThrow(/invalid bool/u);
+    expect(() => decodeHttpResponse(badBool)).toThrow(/not a bool/u);
     expect(() => decodeHttpResponse(new Uint8Array(0))).toThrow(NoxClientError);
+  });
+
+  it("rejects header text that is not UTF-8", () => {
+    const bytes = hex(RUST_OK);
+    // First header name byte ("c" of content-type) replaced by 0xff.
+    bytes[2 + 8 + 8] = 0xff;
+    expect(() => decodeHttpResponse(bytes)).toThrow(/not UTF-8/u);
   });
 
   it("rejects a header count larger than the payload can hold", () => {

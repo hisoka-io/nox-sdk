@@ -629,13 +629,6 @@ class Reader {
     return this.view.getUint8(this.pos++);
   }
 
-  u16(): number {
-    this.ensure(2);
-    const v = this.view.getUint16(this.pos, true);
-    this.pos += 2;
-    return v;
-  }
-
   u32(): number {
     this.ensure(4);
     const v = this.view.getUint32(this.pos, true);
@@ -962,45 +955,6 @@ function assertNever(value: never): never {
     `Unsupported service request: ${String(value)}`,
     NoxClientErrorCode.PacketBuildFailed,
   );
-}
-
-/**
- * Exit reply to a `ServiceRequest::HttpRequest`: nox-node's
- * `SerializableHttpResponse { status: u16, headers: HashMap<String, String>,
- * body: Vec<u8>, truncated: bool }` in bincode 1 (fixed-width little endian).
- */
-export interface HttpResponseWire {
-  /** HTTP status the exit observed, or the exit's own error status (e.g. 403 SSRF, 502 upstream). */
-  readonly status: number;
-  /**
-   * Response header pairs in wire order. The exit keeps headers in a map, so
-   * names are unique and their order carries no meaning.
-   */
-  readonly headers: [string, string][];
-  readonly body: Uint8Array;
-  /** True when the exit cut the body at its configured `max_response_bytes`. */
-  readonly truncated: boolean;
-}
-
-/** Decode an exit's `SerializableHttpResponse` (the bytes `httpRequest` returns). */
-export function decodeHttpResponse(bytes: Uint8Array): HttpResponseWire {
-  const r = new Reader(bytes, 0);
-  const status = r.u16();
-  const count = r.u64();
-  const headers: [string, string][] = [];
-  for (let i = 0n; i < count; i++) {
-    headers.push([r.string(), r.string()]);
-  }
-  const body = r.bytes();
-  const flag = r.u8();
-  if (flag > 1) {
-    throw new NoxClientError(
-      `SerializableHttpResponse.truncated has invalid bool byte ${flag}`,
-      NoxClientErrorCode.DecryptionFailed,
-    );
-  }
-  r.expectEnd("SerializableHttpResponse");
-  return { status, headers, body, truncated: flag === 1 };
 }
 
 export interface RpcResponse {
