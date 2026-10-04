@@ -3,16 +3,37 @@ import {
   NoxClientErrorCode,
   DEFAULTS,
   PAID_V2_CAPABILITY,
+  type HttpRequestOptions,
+  type KpsModeOptions,
   type NoxClientConfig,
   type NoxClientSettings,
   type NoxFetch,
+  type NoxLogLevel,
+  type NoxLogSink,
+  type NoxWasmBindings,
+  type NoxWasmProvider,
   type NoxWebSocketConstructor,
   type PathHop,
+  type PinnedSnapshot,
+  type RelayerNode,
   type Route,
   type SurbFormat,
   type TopologyNode,
   type TopologySnapshot,
 } from "./types.js";
+import { KpsHttpTransport, kpsFailurePhase } from "./kps/transport.js";
+import { kpsTransportSettingsFrom } from "./kps/fetch.js";
+import { isKpsAddress, kpsAddressLabel, kpsAddressOfEntry, kpsEntryEndpoint } from "./kps/address.js";
+import {
+  applyServedTopologies,
+  eligiblePinnedMembers,
+  kpsTopologyNodes,
+  pinnedKpsAddresses,
+  pinnedPowDifficulty,
+  verifyPinnedSnapshot,
+  type ServedTopology,
+  type WorkingSet,
+} from "./kps/pinned.js";
 import { seedCandidates } from "./seeder.js";
 import {
   fetchTopology,
@@ -22,6 +43,7 @@ import {
   parseNodes,
   selectLiveNodes,
   selectRoute,
+  hasHttpEntry,
   hasUsableIngress,
   layersForRole,
   routeSupportsSurbV2,
@@ -54,6 +76,12 @@ import {
   secureRandomIndex,
   secureRandomU64,
 } from "./utils.js";
+import {
+  KPS_CLIENT_DEFAULTS,
+  KPS_ANCHOR_STAGGER_MS,
+  KPS_SECOND_SOURCE_WAIT_MS,
+  KPS_ENTRY_SWITCH_AFTER_FAILURES,
+} from "./kps/constants.js";
 import {
   validateIssuedPaidQuote,
   validatePaidQuoteRequest,
@@ -130,6 +158,38 @@ interface PendingRequest {
   reject(err: NoxClientError): void;
   reassembler: Reassembler;
   createdAt: number;
+  /** Reply size cap from `HttpRequestOptions.maxResponseBytes`. */
+  maxResponseBytes?: number;
+}
+
+/** Per-request options threaded below the public methods. */
+interface SendExtras {
+  minSurbs?: number;
+  signal?: AbortSignal;
+  maxResponseBytes?: number;
+}
+
+/** Resolved KPS mode inputs (ARCHITECTURE §3.2 defaults applied). */
+interface ResolvedKpsOptions {
+  readonly pinned: PinnedSnapshot;
+  readonly entries: ReadonlySet<string> | undefined;
+  readonly topologySources: number;
+  readonly anchorParallelism: number;
+  readonly exchangeTimeoutMs: number;
+  readonly claimIntervalMs: number;
+  readonly clockSkewToleranceSeconds: number;
+}
+
+/** Live KPS mode state. */
+interface KpsState {
+  readonly options: ResolvedKpsOptions;
+  readonly transport: KpsHttpTransport;
+  /** Working set: pinned eligible members not removed by served topologies. */
+  members: RelayerNode[];
+  /** Entry endpoints with a reply claim in flight (single-flight, ARCHITECTURE §3.6). */
+  readonly claimsInFlight: Set<string>;
+  /** Consecutive transport failures on the pinned entry. */
+  pinnedEntryFailures: number;
 }
 
 export class NoxClient {
@@ -166,6 +226,10 @@ export class NoxClient {
   private _powDifficultyPinned = false;
   private _fetchImpl: NoxFetch = defaultFetch;
   private _webSocketImpl: NoxWebSocketConstructor | null = null;
+  /** Set in KPS mode only; classic mode never constructs any KPS state. */
+  private _kps: KpsState | undefined;
+  private _log: NoxLogSink | undefined;
+  private _wasmProvider: NoxWasmProvider | undefined;
 
   private readonly _config: NoxClientSettings;
 
@@ -256,9 +320,11 @@ export class NoxClient {
    * the next one from being tried.
    */
   static async connect(config: NoxClientConfig = {}): Promise<NoxClient> {
+    if (resolveMode(config) === "kps") return NoxClient._connectKps(config);
     const full = resolveSettings(config);
     validateTopologyVerificationConfig(full);
     const transport = resolveTransport(config);
+    if (config.wasm !== undefined) validateWasmProvider(config.wasm);
 
     const candidates = seedCandidates(full.seeds, !full.dangerouslySkipFingerprintCheck);
     const errors: NoxClientError[] = [];
@@ -295,12 +361,99 @@ export class NoxClient {
     client._powDifficultyPinned = powDifficultyPinned;
     client._fetchImpl = transport.fetch;
     client._webSocketImpl = transport.WebSocket;
+    client._wasmProvider = config.wasm;
+    client._log = config.log;
 
     await client._initWasm();
     client._startTopologyRefresh();
     client._startResponseStream();
 
     return client;
+  }
+
+  /**
+   * KPS mode (ARCHITECTURE §3.4): no seed, no RPC, no ambient fetch, no
+   * WebSocket. Verify the pinned snapshot, dial pinned anchors over KPS, accept
+   * their served topologies under the removals-only rule, then route over the
+   * working set with `kps:` entry endpoints. Fails closed: nothing here falls
+   * back to classic transport.
+   */
+  private static async _connectKps(config: NoxClientConfig): Promise<NoxClient> {
+    const options = resolveKpsOptions(config);
+    const settings = resolveKpsSettings(config, options.pinned);
+    const kpsConfig = config.kps as KpsModeOptions;
+    const log = config.log;
+    const bindings = await loadWasmBindings(config.wasm as NoxWasmProvider);
+    const transport = new KpsHttpTransport(kpsConfig.dial, kpsTransportSettingsFrom(kpsConfig), log);
+    try {
+      const boot = await gatherServedTopologies(transport, options, log);
+      const working = applyServedTopologies(options.pinned, boot.sources, Math.floor(Date.now() / 1000), {
+        clockSkewToleranceSeconds: options.clockSkewToleranceSeconds,
+        livenessMaxAgeSeconds: Math.ceil(settings.livenessMaxAgeMs / 1000),
+        ...(options.entries === undefined ? {} : { entryAddresses: options.entries }),
+      });
+      for (const { anchor, reason } of working.rejected) {
+        emitLog(log, "warn", "topology.rejected", { anchor: kpsAddressLabel(anchor), reason });
+      }
+      if (working.sourcesAccepted === 0) {
+        const tried = boot.failures.length + working.rejected.length;
+        throw new NoxClientError(
+          `No pinned KPS entry served an acceptable topology (${tried} anchor(s) tried: ${
+            [...boot.failures, ...working.rejected.map((entry) => `${kpsAddressLabel(entry.anchor)} rejected`)]
+              .join("; ")
+          })`,
+          NoxClientErrorCode.KpsUnavailable,
+        );
+      }
+      emitLog(log, "info", "topology.accepted", {
+        sources: working.sourcesAccepted,
+        members: working.members.length,
+        removed: working.removed.length,
+        ignoredAdditions: working.ignoredAdditions,
+      });
+      if (working.floorApplied) {
+        emitLog(log, "warn", "topology.floor", { removedWouldBe: options.pinned.members.length - working.members.length });
+      }
+      const rejectedAnchors = new Set(working.rejected.map((entry) => entry.anchor));
+      const accepted = boot.sources.filter((source) => !rejectedAnchors.has(source.anchor));
+      const nodes = kpsTopologyNodes(options.pinned, working.members, options.entries);
+      const powDifficultyPinned = config.powDifficulty !== undefined;
+      settings.powDifficulty = effectivePowDifficulty(
+        settings.powDifficulty,
+        powDifficultyPinned,
+        pinnedPowDifficulty(options.pinned, accepted.map((source) => source.snapshot)),
+      );
+      const firstAnchor = accepted[0]?.anchor;
+      const preferred = firstAnchor === undefined ? undefined : kpsEntryEndpoint(firstAnchor);
+      const entryUrl = preferred !== undefined && nodes.some((node) => node.address === preferred && isEntryCapable(node, isKpsEntryNode))
+        ? preferred
+        : pickEntryUrl(nodes, isKpsEntryNode);
+      const client = new NoxClient(nodes, entryUrl, "", settings, Date.now(), options.pinned.blockNumber);
+      client._powDifficultyPinned = powDifficultyPinned;
+      client._fetchImpl = transport.fetch;
+      client._webSocketImpl = null;
+      client._kps = {
+        options,
+        transport,
+        members: working.members,
+        claimsInFlight: new Set(),
+        pinnedEntryFailures: 0,
+      };
+      client._log = log;
+      client._wasmProvider = config.wasm;
+      client._wasm = bindings;
+      client._startTopologyRefresh();
+      client._startResponseStream();
+      emitLog(log, "info", "kps.connected", {
+        entry: kpsAddressLabel(kpsAddressOfEntry(entryUrl) ?? ""),
+        members: nodes.length,
+        powDifficulty: settings.powDifficulty,
+      });
+      return client;
+    } catch (error) {
+      await transport.close();
+      throw error;
+    }
   }
 
   /**
@@ -620,8 +773,9 @@ export class NoxClient {
     url: string,
     headers: [string, string][],
     body: Uint8Array,
-    opts?: { timeoutMs?: number; expectedResponseBytes?: number },
+    opts?: HttpRequestOptions,
   ): Promise<Uint8Array> {
+    const options = validateHttpRequestOptions(opts);
     const inner = encodeServiceRequest({
       tag: "HttpRequest",
       method,
@@ -629,17 +783,23 @@ export class NoxClient {
       headers,
       body,
     });
+    const opKey = options.opKey ?? "httpRequest";
+    const extras: SendExtras = {};
+    if (options.minSurbs !== undefined) extras.minSurbs = options.minSurbs;
+    if (options.signal !== undefined) extras.signal = options.signal;
+    if (options.maxResponseBytes !== undefined) extras.maxResponseBytes = options.maxResponseBytes;
 
     const response = await this._sendAnonymous(
       inner,
-      "httpRequest",
-      opts?.timeoutMs,
-      opts?.expectedResponseBytes,
+      opKey,
+      options.timeoutMs,
+      options.expectedResponseBytes,
       undefined,
       undefined,
-      isIdempotentHttpMethod(method) ? "route" : "none",
+      options.retry ?? (isIdempotentHttpMethod(method) ? "route" : "none"),
+      extras,
     );
-    this.adaptive.record("httpRequest", response.length);
+    this.adaptive.record(opKey, response.length);
     return response;
   }
 
@@ -683,6 +843,11 @@ export class NoxClient {
     }
     this.pending.clear();
     this.burstState.clear();
+    const kps = this._kps;
+    if (kps !== undefined) {
+      kps.claimsInFlight.clear();
+      void kps.transport.close();
+    }
   }
 
   private async _sendAnonymous(
@@ -693,6 +858,7 @@ export class NoxClient {
     surbCountOverride?: number,
     selectedExit?: TopologyNode,
     retry: RetryMode = "none",
+    extras?: SendExtras,
   ): Promise<Uint8Array> {
     const { response } = await this._sendAnonymousRouted(
       inner,
@@ -702,6 +868,7 @@ export class NoxClient {
       surbCountOverride,
       selectedExit,
       retry,
+      extras,
     );
     return response;
   }
@@ -714,6 +881,7 @@ export class NoxClient {
     surbCountOverride: number | undefined,
     selectedExit: TopologyNode | undefined,
     retry: RetryMode,
+    extras?: SendExtras,
   ): Promise<{ response: Uint8Array; exit: TopologyNode }> {
     let surbCount: number;
     if (expectedResponseBytes !== undefined && expectedResponseBytes > 0) {
@@ -726,12 +894,14 @@ export class NoxClient {
     } else {
       surbCount = this.adaptive.surbCount(opKey, this._config.surbsPerRequest, this._config.fecRatio);
     }
+    if (extras?.minSurbs !== undefined) surbCount = Math.max(surbCount, extras.minSurbs);
     return this._sendWithRetry(
       { tag: "AnonymousRequest", inner, replySurbs: [] },
       surbCount,
       timeoutMs,
       selectedExit,
       retry,
+      extras,
     );
   }
 
@@ -752,14 +922,20 @@ export class NoxClient {
     timeoutMs: number | undefined,
     selectedExit: TopologyNode | undefined,
     retry: RetryMode,
+    extras?: SendExtras,
   ): Promise<{ response: Uint8Array; exit: TopologyNode }> {
     this._requireWasm();
+    throwIfAborted(extras?.signal);
     const first = this._planRoute(selectedExit, this._avoidedNodeIds());
     try {
-      const response = await this._sendOnRoute(payload, surbCount, timeoutMs, first);
+      const response = await this._sendOnRoute(payload, surbCount, timeoutMs, first, extras);
       this._clearAvoided(first.route);
+      this._noteEntrySuccess(first.route.entry);
       return { response, exit: first.route.exit };
     } catch (error) {
+      if (this._kps !== undefined && isTransportFailure(error)) {
+        return this._retryAfterKpsTransportFailure(payload, surbCount, timeoutMs, selectedExit, retry, first, error, extras);
+      }
       if (!isResponseTimeout(error)) throw error;
       // With retryOnTimeout off, a timeout leaves route selection unchanged.
       if (this._config.retryOnTimeout === false) throw error;
@@ -788,14 +964,132 @@ export class NoxClient {
         throw error;
       }
       try {
-        const response = await this._sendOnRoute(payload, surbCount, timeoutMs, second);
+        const response = await this._sendOnRoute(payload, surbCount, timeoutMs, second, extras);
         this._clearAvoided(second.route);
+        this._noteEntrySuccess(second.route.entry);
         return { response, exit: second.route.exit };
       } catch (retryError) {
         if (isResponseTimeout(retryError)) this._avoidRoute(second.route);
         throw retryError;
       }
     }
+  }
+
+  /**
+   * KPS mode, after a packet submission failed (ARCHITECTURE §4.7): resend once
+   * through a different entry when the failure happened before the request
+   * was written (`dial` or `open`: certainly not sent, safe for every request),
+   * or whatever the phase for requests that may be resent (`retry` not
+   * `"none"`). Two failures in a row on the pinned entry move it.
+   */
+  private async _retryAfterKpsTransportFailure(
+    payload: RelayerPayload,
+    surbCount: number,
+    timeoutMs: number | undefined,
+    selectedExit: TopologyNode | undefined,
+    retry: RetryMode,
+    first: PlannedRoute,
+    error: unknown,
+    extras: SendExtras | undefined,
+  ): Promise<{ response: Uint8Array; exit: TopologyNode }> {
+    this._noteEntryTransportFailure(first.route.entry);
+    if (extras?.signal?.aborted === true) throw error;
+    const phase = kpsFailurePhase(error);
+    const notSent = phase === "dial" || phase === "open";
+    if (!notSent && retry === "none") throw error;
+    let second: PlannedRoute;
+    try {
+      second = this._planRouteThroughOtherEntry(first, selectedExit);
+    } catch {
+      throw error;
+    }
+    emitLog(this._log, "info", "kps.resend", { phase: phase ?? "unknown", reason: notSent ? "not-sent" : "idempotent" });
+    try {
+      const response = await this._sendOnRoute(payload, surbCount, timeoutMs, second, extras);
+      this._clearAvoided(second.route);
+      this._noteEntrySuccess(second.route.entry);
+      return { response, exit: second.route.exit };
+    } catch (retryError) {
+      if (isTransportFailure(retryError)) this._noteEntryTransportFailure(second.route.entry);
+      else if (isResponseTimeout(retryError) && this._config.retryOnTimeout !== false) this._avoidRoute(second.route);
+      throw retryError;
+    }
+  }
+
+  /** A fresh route through another KPS entry, preferring one with an open connection. */
+  private _planRouteThroughOtherEntry(failed: PlannedRoute, selectedExit: TopologyNode | undefined): PlannedRoute {
+    const avoid = this._avoidedNodeIds();
+    if (failed.version === 2) return this._planStrictV2(selectedExit, avoid, failed.route.entry.id);
+    const entry = this._pickOtherEntry(new Set([failed.route.entry.id, ...(selectedExit === undefined ? [] : [selectedExit.id])]));
+    return this._planRoute(selectedExit, avoid, entry);
+  }
+
+  /**
+   * An entry-capable node outside `exclude`: one with an open KPS connection
+   * if any, else one not cooling down after failed dials, else any.
+   */
+  private _pickOtherEntry(exclude: ReadonlySet<string>): TopologyNode {
+    const rule = this._entryRule();
+    const candidates = this._nodes.filter((node) => !exclude.has(node.id) && isEntryCapable(node, rule));
+    const transport = this._kps?.transport;
+    const tiers = transport === undefined
+      ? [candidates]
+      : [
+        candidates.filter((node) => transport.isConnected(kpsAddressOfEntry(node.address) ?? "")),
+        candidates.filter((node) => !transport.isCoolingDown(kpsAddressOfEntry(node.address) ?? "")),
+        candidates,
+      ];
+    for (const tier of tiers) {
+      if (tier.length > 0) return tier[secureRandomIndex(tier.length)]!;
+    }
+    throw new NoxClientError("No other entry is available", NoxClientErrorCode.NoNodesAvailable);
+  }
+
+  private _noteEntrySuccess(entry: TopologyNode): void {
+    const kps = this._kps;
+    if (kps !== undefined && entry.address === this._entryUrl) kps.pinnedEntryFailures = 0;
+  }
+
+  private _noteEntryTransportFailure(entry: TopologyNode): void {
+    const kps = this._kps;
+    if (kps === undefined || entry.address !== this._entryUrl) return;
+    kps.pinnedEntryFailures += 1;
+    if (kps.pinnedEntryFailures >= KPS_ENTRY_SWITCH_AFTER_FAILURES) this._switchPinnedEntry(entry);
+  }
+
+  /**
+   * Move the pinned entry away from `failed`. Requests already sent through
+   * it keep claiming their replies there (the node holds replies for 5 min).
+   */
+  private _switchPinnedEntry(failed: TopologyNode): void {
+    const kps = this._kps;
+    if (kps === undefined) return;
+    let next: TopologyNode;
+    try {
+      next = this._pickOtherEntry(new Set([failed.id]));
+    } catch {
+      return;
+    }
+    this._moveInFlightToAux(this._entryUrl);
+    emitLog(this._log, "warn", "entry.switch", {
+      from: kpsAddressLabel(kpsAddressOfEntry(this._entryUrl) ?? ""),
+      to: kpsAddressLabel(kpsAddressOfEntry(next.address) ?? ""),
+      failures: kps.pinnedEntryFailures,
+    });
+    this._entryUrl = next.address;
+    kps.pinnedEntryFailures = 0;
+  }
+
+  /** Keep claiming replies of requests sent through `entryUrl` after it stops being pinned. */
+  private _moveInFlightToAux(entryUrl: string): void {
+    for (const requestId of this.pending.keys()) {
+      if (this.replenishment.entryFor(requestId) === entryUrl) this._watchAuxEntry(entryUrl, requestId);
+    }
+  }
+
+  /** Entry rule of the current mode: HTTP(S) ingress (classic) or `kps:` endpoint (KPS). */
+  private _entryRule(): (node: TopologyNode) => boolean {
+    return this._kps === undefined ? hasHttpEntry : isKpsEntryNode;
   }
 
   /**
@@ -810,10 +1104,17 @@ export class NoxClient {
   private _planRoute(
     selectedExit: TopologyNode | undefined,
     avoid: ReadonlySet<string>,
+    entryOverride?: TopologyNode,
   ): PlannedRoute {
     const mode = this._config.surbFormat;
     if (mode === "v2") return this._planStrictV2(selectedExit, avoid, undefined);
-    const route = selectRoute(this._nodes, this._pinnedEntry(), selectedExit, avoid);
+    const route = selectRoute(
+      this._nodes,
+      entryOverride ?? this._pinnedEntry(),
+      selectedExit,
+      avoid,
+      this._entryRule(),
+    );
     const version: SurbVersion =
       mode === "auto" && wasmSupportsSurbV2(this._wasm) && routeSupportsSurbV2(route) ? 2 : 1;
     return { route, version };
@@ -851,7 +1152,7 @@ export class NoxClient {
       : undefined;
     let route: Route;
     try {
-      route = selectRoute(capable, entry, selectedExit, avoid);
+      route = selectRoute(capable, entry, selectedExit, avoid, this._entryRule());
     } catch (error) {
       throw new NoxClientError(
         "No route on which every hop advertises format v2 reply support",
@@ -890,8 +1191,11 @@ export class NoxClient {
     surbCount: number,
     timeoutMs: number | undefined,
     planned: PlannedRoute,
+    extras?: SendExtras,
   ): Promise<Uint8Array> {
     this._requireWasm();
+    const signal = extras?.signal;
+    throwIfAborted(signal);
     const { route, version } = planned;
     const forwardPath: PathHop[] = [
       { pubKeyHex: bytesToHex(route.entry.publicKey), address: route.entry.routingAddress },
@@ -953,8 +1257,13 @@ export class NoxClient {
 
     const effectiveTimeout = timeoutMs ?? this._config.timeoutMs;
     const responsePromise = new Promise<Uint8Array>((resolve, reject) => {
+      let onAbort: (() => void) | undefined;
+      const detachAbort = (): void => {
+        if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort);
+      };
       const timer = setTimeout(() => {
         if (this.pending.has(requestId)) {
+          detachAbort();
           this.pending.delete(requestId);
           this.burstState.delete(requestId);
           this.surbPool.cleanup(requestId);
@@ -968,21 +1277,44 @@ export class NoxClient {
         }
       }, effectiveTimeout);
 
-      this.pending.set(requestId, {
+      const pendingRequest: PendingRequest = {
         resolve: (data) => {
           clearTimeout(timer);
+          detachAbort();
           resolve(data);
         },
         reject: (err) => {
           clearTimeout(timer);
+          detachAbort();
           reject(err);
         },
         reassembler: new Reassembler(),
         createdAt: Date.now(),
-      });
+      };
+      if (extras?.maxResponseBytes !== undefined) pendingRequest.maxResponseBytes = extras.maxResponseBytes;
+      this.pending.set(requestId, pendingRequest);
+
+      if (signal !== undefined) {
+        // Abort frees the request at once; packets already sent may still be
+        // served by the exit, and their late reply is discarded.
+        onAbort = () => {
+          this._failPending(
+            requestId,
+            new NoxClientError("Request aborted by the caller", NoxClientErrorCode.Aborted, signal.reason),
+          );
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
     });
 
     this.replenishment.stashPath(requestId, forwardPath, { entryUrl, version });
+    if (signal?.aborted === true) {
+      this._failPending(
+        requestId,
+        new NoxClientError("Request aborted by the caller", NoxClientErrorCode.Aborted, signal.reason),
+      );
+      return responsePromise;
+    }
 
     const sendAll = Promise.all(
       packets.map((pkt) => postPacket(entryUrl, pkt, undefined, this.fetch)),
@@ -1005,6 +1337,17 @@ export class NoxClient {
     });
 
     return responsePromise;
+  }
+
+  /** Remove a pending request and its reply state, then reject it with `error`. */
+  private _failPending(requestId: bigint, error: NoxClientError): void {
+    const req = this.pending.get(requestId);
+    if (req === undefined) return;
+    this.pending.delete(requestId);
+    this.burstState.delete(requestId);
+    this.surbPool.cleanup(requestId);
+    this.replenishment.clearPath(requestId);
+    req.reject(error);
   }
 
   private _generateSurbs(
@@ -1048,7 +1391,7 @@ export class NoxClient {
       requests: new Set([requestId]),
       timer: setInterval(() => {
         void this._pollAuxEntry(entryUrl);
-      }, AUX_ENTRY_POLL_MS),
+      }, this._kps?.options.claimIntervalMs ?? AUX_ENTRY_POLL_MS),
     };
     this._auxEntries.set(entryUrl, watch);
   }
@@ -1066,12 +1409,8 @@ export class NoxClient {
     }
     const ids = [...watch.requests].flatMap((id) => this.surbPool.idsForRequest(id));
     if (ids.length === 0) return;
-    let items: import("./types.js").BatchResponseItem[];
-    try {
-      items = await claimResponses(entryUrl, ids, undefined, this.fetch);
-    } catch {
-      return;
-    }
+    const items = await this._claimSingleFlight(entryUrl, ids);
+    if (items === null) return;
     for (const item of items) this._handleResponseItem(item);
   }
 
@@ -1094,10 +1433,11 @@ export class NoxClient {
         this._checkBurstStalls();
       }, 1000);
     } else {
-      // Fallback to HTTP polling for environments without WebSocket (Node 18)
+      // HTTP polling: environments without WebSocket (Node 18), and KPS mode,
+      // which claims over KPS streams only (ARCHITECTURE §3.6).
       this.pollTimer = setInterval(() => {
         void this._pollOnce();
-      }, 200);
+      }, this._kps?.options.claimIntervalMs ?? AUX_ENTRY_POLL_MS);
     }
   }
 
@@ -1171,15 +1511,8 @@ export class NoxClient {
     const surbIds = this._pinnedEntrySurbIds();
     if (surbIds.length === 0) return;
 
-    let items: import("./types.js").BatchResponseItem[];
-    try {
-      items = await claimResponses(this._entryUrl, surbIds, undefined, this.fetch);
-    } catch (pollErr) {
-      if (this._debugPoll) {
-        this._debug(`[poll] fetch error: ${String(pollErr).slice(0, 120)}`);
-      }
-      return;
-    }
+    const items = await this._claimSingleFlight(this._entryUrl, surbIds);
+    if (items === null) return;
 
     if (this._debugPoll && items.length > 0) {
       this._debug(`[poll] got ${items.length} items, pending=${this.pending.size}`);
@@ -1188,6 +1521,30 @@ export class NoxClient {
     for (const item of items) this._handleResponseItem(item);
 
     this._checkBurstStalls();
+  }
+
+  /**
+   * Claim replies from one entry. In KPS mode at most one claim per entry is
+   * in flight: a tick that finds one running is skipped, so a slow claim never
+   * stacks streams (ARCHITECTURE §3.6). Returns `null` when skipped or failed.
+   */
+  private async _claimSingleFlight(
+    entryUrl: string,
+    surbIds: string[],
+  ): Promise<import("./types.js").BatchResponseItem[] | null> {
+    const inFlight = this._kps?.claimsInFlight;
+    if (inFlight?.has(entryUrl) === true) return null;
+    inFlight?.add(entryUrl);
+    try {
+      return await claimResponses(entryUrl, surbIds, undefined, this.fetch);
+    } catch (pollErr) {
+      if (this._debugPoll) {
+        this._debug(`[poll] fetch error: ${String(pollErr).slice(0, 120)}`);
+      }
+      return null;
+    } finally {
+      inFlight?.delete(entryUrl);
+    }
   }
 
   private _checkBurstStalls(): void {
@@ -1249,7 +1606,36 @@ export class NoxClient {
       }
     }
 
+    const limit = req.maxResponseBytes;
+    if (limit !== undefined) {
+      // A lower bound of the reply size: exact with FEC, else every fragment
+      // but the last at this fragment's size.
+      const declared = fragment.fec !== null
+        ? fragment.fec.originalDataLen
+        : (fragment.totalFragments - 1) * fragment.data.length;
+      if (declared > limit) {
+        this._failPending(
+          requestId,
+          new NoxClientError(
+            `Reply of at least ${declared} bytes exceeds maxResponseBytes ${limit}`,
+            NoxClientErrorCode.ResponseTooLarge,
+          ),
+        );
+        return;
+      }
+    }
+
     const result = req.reassembler.addFragment(fragment);
+    if (result !== null && limit !== undefined && result.length > limit) {
+      this._failPending(
+        requestId,
+        new NoxClientError(
+          `Reply of ${result.length} bytes exceeds maxResponseBytes ${limit}`,
+          NoxClientErrorCode.ResponseTooLarge,
+        ),
+      );
+      return;
+    }
     if (result !== null) {
       this.pending.delete(requestId);
       this.burstState.delete(requestId);
@@ -1369,6 +1755,7 @@ export class NoxClient {
    * `_applyNodeMembership`).
    */
   private async _refreshTopologyOnce(): Promise<void> {
+    if (this._kps !== undefined) return this._refreshKpsTopology(this._kps);
     const seeds = Array.from(
       new Set([
         this._seedUrl,
@@ -1401,6 +1788,101 @@ export class NoxClient {
         "Topology refresh found no reachable seed",
         NoxClientErrorCode.TopologyFetchFailed,
       );
+  }
+
+  /**
+   * KPS mode refresh (ARCHITECTURE §3.4 step 7): fetch `/topology` over KPS
+   * from the current entry and from random other KPS members, then rebuild the
+   * working set from the pinned snapshot (not from the previous working set,
+   * so recovered members return). Seeds and RPC are never used. A refresh that
+   * gets no acceptable document keeps the current set and records the error.
+   */
+  private async _refreshKpsTopology(kps: KpsState): Promise<void> {
+    const { options } = kps;
+    const anchors = this._kpsRefreshAnchors(kps);
+    const settled = await Promise.allSettled(
+      anchors.map(async (anchor) => ({
+        anchor,
+        snapshot: await fetchTopology(`kps:${anchor}`, options.exchangeTimeoutMs, this.fetch),
+      })),
+    );
+    if (this._kps !== kps || this.topologyTimer === null) return;
+    const served: ServedTopology[] = [];
+    for (const result of settled) {
+      if (result.status === "fulfilled") served.push(result.value);
+    }
+    if (served.length === 0) {
+      this._topologyRefreshError = new NoxClientError(
+        `KPS topology refresh: none of ${anchors.length} anchor(s) served a topology`,
+        NoxClientErrorCode.TopologyFetchFailed,
+      );
+      emitLog(this._log, "warn", "topology.refresh.failed", { anchors: anchors.length });
+      return;
+    }
+    let working: WorkingSet;
+    try {
+      working = applyServedTopologies(options.pinned, served, Math.floor(Date.now() / 1000), {
+        clockSkewToleranceSeconds: options.clockSkewToleranceSeconds,
+        livenessMaxAgeSeconds: Math.ceil(this._config.livenessMaxAgeMs / 1000),
+        previous: kps.members,
+        ...(options.entries === undefined ? {} : { entryAddresses: options.entries }),
+      });
+    } catch (error) {
+      this._topologyRefreshError = error instanceof NoxClientError
+        ? error
+        : new NoxClientError(String(error), NoxClientErrorCode.TopologyVerificationFailed, error);
+      if (this._topologyRefreshError.code === NoxClientErrorCode.TopologyStale) {
+        emitLog(this._log, "error", "topology.stale", { sources: served.length });
+      }
+      return;
+    }
+    for (const { anchor, reason } of working.rejected) {
+      emitLog(this._log, "warn", "topology.rejected", { anchor: kpsAddressLabel(anchor), reason });
+    }
+    if (working.sourcesAccepted === 0) {
+      this._topologyRefreshError = new NoxClientError(
+        `KPS topology refresh: ${working.rejected.length} served topolog(ies) rejected`,
+        NoxClientErrorCode.TopologyVerificationFailed,
+      );
+      return;
+    }
+    if (working.floorApplied) {
+      emitLog(this._log, "warn", "topology.floor", { sources: working.sourcesAccepted });
+    }
+    const rejected = new Set(working.rejected.map((entry) => entry.anchor));
+    this._config.powDifficulty = effectivePowDifficulty(
+      this._config.powDifficulty,
+      this._powDifficultyPinned,
+      pinnedPowDifficulty(
+        options.pinned,
+        served.filter((source) => !rejected.has(source.anchor)).map((source) => source.snapshot),
+      ),
+    );
+    kps.members = working.members;
+    this._setNodes(kpsTopologyNodes(options.pinned, working.members, options.entries));
+    emitLog(this._log, "debug", "topology.refreshed", {
+      sources: working.sourcesAccepted,
+      members: working.members.length,
+      removed: working.removed.length,
+    });
+  }
+
+  /** The current entry's KPS address first, then random other KPS-capable members of the working set. */
+  private _kpsRefreshAnchors(kps: KpsState): string[] {
+    const anchors: string[] = [];
+    const current = kpsAddressOfEntry(this._entryUrl);
+    if (current !== null) anchors.push(current);
+    const others = Array.from(
+      new Set(
+        this._nodes
+          .map((node) => kpsAddressOfEntry(node.address))
+          .filter((address): address is string => address !== null && address !== current),
+      ),
+    );
+    while (anchors.length < kps.options.topologySources && others.length > 0) {
+      anchors.push(others.splice(secureRandomIndex(others.length), 1)[0]!);
+    }
+    return anchors;
   }
 
   /**
@@ -1484,7 +1966,11 @@ export class NoxClient {
       (n) => n.address === this._entryUrl,
     );
     if (!currentStillPresent) {
-      this._entryUrl = pickEntryUrl(nodes);
+      if (this._kps !== undefined) {
+        this._moveInFlightToAux(this._entryUrl);
+        this._kps.pinnedEntryFailures = 0;
+      }
+      this._entryUrl = pickEntryUrl(nodes, this._entryRule());
       // Reconnect WS to new entry node
       if (this.responseWs !== null) {
         this.responseWs.close();
@@ -1575,7 +2061,7 @@ export class NoxClient {
     while (pool.length > 0) {
       const candidate = pool.splice(secureRandomIndex(pool.length), 1)[0]!;
       try {
-        return selectRoute(this._nodes, pinnedEntry, candidate, avoided).exit;
+        return selectRoute(this._nodes, pinnedEntry, candidate, avoided, this._entryRule()).exit;
       } catch (error) {
         lastError = error;
       }
@@ -1635,6 +2121,10 @@ export class NoxClient {
 
   private async _initWasm(): Promise<void> {
     if (this._wasm !== null) return;
+    if (this._wasmProvider !== undefined) {
+      this._wasm = await loadWasmBindings(this._wasmProvider);
+      return;
+    }
     try {
       const mod = await import("@hisoka-io/nox-wasm");
       const maybeInit = (mod as Record<string, unknown>)["default"];
@@ -1799,6 +2289,44 @@ function effectivePowDifficulty(
 function isResponseTimeout(error: unknown): boolean {
   return error instanceof NoxClientError &&
     error.code === NoxClientErrorCode.ResponseTimeout;
+}
+
+function isTransportFailure(error: unknown): boolean {
+  return error instanceof NoxClientError &&
+    error.code === NoxClientErrorCode.TransportFailed;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new NoxClientError("Request aborted by the caller", NoxClientErrorCode.Aborted, signal.reason);
+  }
+}
+
+/** Validate `HttpRequestOptions`. Throws `INVALID_CONFIG` naming the field. */
+function validateHttpRequestOptions(options: HttpRequestOptions | undefined): HttpRequestOptions {
+  if (options === undefined) return {};
+  if (typeof options !== "object" || options === null) {
+    throw new NoxClientError("httpRequest options must be an object", NoxClientErrorCode.InvalidConfig);
+  }
+  for (const field of ["timeoutMs", "expectedResponseBytes", "minSurbs", "maxResponseBytes"] as const) {
+    const value = options[field];
+    if (value !== undefined && (!Number.isSafeInteger(value) || value <= 0)) {
+      throw new NoxClientError(`httpRequest ${field} must be a positive safe integer`, NoxClientErrorCode.InvalidConfig);
+    }
+  }
+  if (options.opKey !== undefined && (typeof options.opKey !== "string" || options.opKey.length === 0)) {
+    throw new NoxClientError("httpRequest opKey must be a non-empty string", NoxClientErrorCode.InvalidConfig);
+  }
+  if (options.retry !== undefined && options.retry !== "none" && options.retry !== "route") {
+    throw new NoxClientError("httpRequest retry must be \"none\" or \"route\"", NoxClientErrorCode.InvalidConfig);
+  }
+  if (
+    options.signal !== undefined &&
+    (typeof options.signal !== "object" || options.signal === null || typeof options.signal.addEventListener !== "function")
+  ) {
+    throw new NoxClientError("httpRequest signal must be an AbortSignal", NoxClientErrorCode.InvalidConfig);
+  }
+  return options;
 }
 
 function isIdempotentHttpMethod(method: string): boolean {
@@ -1970,20 +2498,343 @@ function asTopologyLoadError(
   );
 }
 
-function pickEntryUrl(nodes: TopologyNode[]): string {
-  const pool = nodes.filter(
-    (node) =>
-      layersForRole(node.role).includes(0) &&
-      hasUsableIngress(node.address),
-  );
+function pickEntryUrl(
+  nodes: TopologyNode[],
+  isEntry: (node: TopologyNode) => boolean = hasHttpEntry,
+): string {
+  const pool = nodes.filter((node) => isEntryCapable(node, isEntry));
   if (pool.length === 0) {
     throw new NoxClientError(
-      "No layer-0 node has a usable HTTP(S) ingress URL",
+      isEntry === isKpsEntryNode
+        ? "No layer-0 node has a KPS entry endpoint (kps:<ip>:<port>:<certhash>)"
+        : "No layer-0 node has a usable HTTP(S) ingress URL",
       NoxClientErrorCode.NoNodesAvailable,
     );
   }
   const node = pool[secureRandomIndex(pool.length)]!;
   return node.address;
+}
+
+function isEntryCapable(node: TopologyNode, isEntry: (node: TopologyNode) => boolean): boolean {
+  return layersForRole(node.role).includes(0) && isEntry(node);
+}
+
+/** KPS entry rule: the node's endpoint is `kps:<ip>:<port>:<certhash>`. */
+function isKpsEntryNode(node: TopologyNode): boolean {
+  return kpsAddressOfEntry(node.address) !== null;
+}
+
+/** Fields that exist only in classic mode; KPS mode refuses them. */
+const CLASSIC_ONLY_FIELDS = ["seeds", "ethRpcUrl", "dangerouslySkipFingerprintCheck", "transport"] as const;
+
+/** Keys of `KpsModeOptions`. */
+const KPS_OPTION_KEYS = new Set([
+  "dial",
+  "pinned",
+  "entries",
+  "topologySources",
+  "anchorParallelism",
+  "dialTimeoutMs",
+  "openStreamTimeoutMs",
+  "exchangeTimeoutMs",
+  "claimIntervalMs",
+  "keepaliveMs",
+  "maxHeadBytes",
+  "maxBodyBytes",
+  "clockSkewToleranceSeconds",
+]);
+
+/** `mode`, and the classic/KPS field split (ARCHITECTURE §3.9). */
+function resolveMode(config: NoxClientConfig): "classic" | "kps" {
+  if (typeof config !== "object" || config === null) return "classic";
+  const mode: unknown = config.mode ?? "classic";
+  if (mode !== "classic" && mode !== "kps") {
+    throw new NoxClientError(`mode must be "classic" or "kps"`, NoxClientErrorCode.InvalidConfig);
+  }
+  if (config.log !== undefined && typeof config.log !== "function") {
+    throw new NoxClientError("log must be a function (level, event, fields)", NoxClientErrorCode.InvalidConfig);
+  }
+  if (mode === "classic" && config.kps !== undefined) {
+    throw new NoxClientError(
+      "kps options need mode: \"kps\"; classic mode never uses KPS",
+      NoxClientErrorCode.ModeViolation,
+    );
+  }
+  return mode;
+}
+
+/** Validate KPS mode inputs. Throws `MODE_VIOLATION`, `INVALID_CONFIG` or `TOPOLOGY_VERIFICATION_FAILED`. */
+function resolveKpsOptions(config: NoxClientConfig): ResolvedKpsOptions {
+  for (const field of CLASSIC_ONLY_FIELDS) {
+    if (config[field] !== undefined) {
+      throw new NoxClientError(
+        `${field} is not used in KPS mode: the client reaches only pinned members over KPS`,
+        NoxClientErrorCode.ModeViolation,
+      );
+    }
+  }
+  const kps: unknown = config.kps;
+  if (typeof kps !== "object" || kps === null) {
+    throw new NoxClientError("mode \"kps\" requires kps options { dial, pinned }", NoxClientErrorCode.InvalidConfig);
+  }
+  for (const key of Object.keys(kps)) {
+    if (!KPS_OPTION_KEYS.has(key)) {
+      throw new NoxClientError(`kps.${key} is not a KPS mode option`, NoxClientErrorCode.InvalidConfig);
+    }
+  }
+  const options = kps as KpsModeOptions;
+  if (typeof options.dial !== "function") {
+    throw new NoxClientError(
+      "kps.dial must be a function (address, opts) => Promise<KpsConn>",
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+  verifyPinnedSnapshot(options.pinned);
+  const pinned = options.pinned;
+  if (config.registryAddress !== undefined && config.registryAddress.toLowerCase() !== pinned.registry) {
+    throw new NoxClientError(
+      "registryAddress differs from the pinned snapshot's registry",
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+  if (config.wasm === undefined) {
+    throw new NoxClientError(
+      "KPS mode requires config.wasm (initialised @hisoka-io/nox-wasm bindings); it never loads WASM over the network",
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+  validateWasmProvider(config.wasm);
+  let entries: ReadonlySet<string> | undefined;
+  if (options.entries !== undefined) {
+    const published = new Set(pinnedKpsAddresses(pinned).values());
+    if (!Array.isArray(options.entries) || options.entries.length === 0) {
+      throw new NoxClientError("kps.entries must be a non-empty list of KPS addresses", NoxClientErrorCode.InvalidConfig);
+    }
+    const seen = new Set<string>();
+    for (const address of options.entries) {
+      if (typeof address !== "string" || !isKpsAddress(address)) {
+        throw new NoxClientError("kps.entries holds a malformed KPS address", NoxClientErrorCode.InvalidConfig);
+      }
+      if (!published.has(address)) {
+        throw new NoxClientError(
+          `kps.entries address ${kpsAddressLabel(address)} is not a pinned member's KPS address`,
+          NoxClientErrorCode.InvalidConfig,
+        );
+      }
+      if (seen.has(address)) {
+        throw new NoxClientError("kps.entries lists an address twice", NoxClientErrorCode.InvalidConfig);
+      }
+      seen.add(address);
+    }
+    entries = seen;
+  }
+  return {
+    pinned,
+    entries,
+    topologySources: boundedInteger(options.topologySources, KPS_CLIENT_DEFAULTS.topologySources, 1, 4, "kps.topologySources"),
+    anchorParallelism: boundedInteger(options.anchorParallelism, KPS_CLIENT_DEFAULTS.anchorParallelism, 1, 16, "kps.anchorParallelism"),
+    exchangeTimeoutMs: kpsTransportSettingsFrom(options).exchangeTimeoutMs,
+    claimIntervalMs: boundedInteger(options.claimIntervalMs, KPS_CLIENT_DEFAULTS.claimIntervalMs, 1, 60_000, "kps.claimIntervalMs"),
+    clockSkewToleranceSeconds: boundedInteger(
+      options.clockSkewToleranceSeconds,
+      KPS_CLIENT_DEFAULTS.clockSkewToleranceSeconds,
+      0,
+      86_400,
+      "kps.clockSkewToleranceSeconds",
+    ),
+  };
+}
+
+/** Tuning settings for KPS mode; the classic-only fields are fixed empty. */
+function resolveKpsSettings(config: NoxClientConfig, pinned: PinnedSnapshot): NoxClientSettings {
+  const settings = resolveSettings(config);
+  settings.seeds = [];
+  settings.ethRpcUrl = "";
+  settings.registryAddress = pinned.registry;
+  settings.dangerouslySkipFingerprintCheck = false;
+  if (!Number.isSafeInteger(settings.livenessMaxAgeMs) || settings.livenessMaxAgeMs <= 0) {
+    throw new NoxClientError("livenessMaxAgeMs must be a positive safe integer", NoxClientErrorCode.InvalidConfig);
+  }
+  if (!Number.isSafeInteger(settings.topologyRefreshMs) || settings.topologyRefreshMs <= 0) {
+    throw new NoxClientError("topologyRefreshMs must be a positive safe integer", NoxClientErrorCode.InvalidConfig);
+  }
+  return settings;
+}
+
+function boundedInteger(value: unknown, fallback: number, min: number, max: number, field: string): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min || value > max) {
+    throw new NoxClientError(`${field} must be an integer in ${min}..${max}`, NoxClientErrorCode.InvalidConfig);
+  }
+  return value;
+}
+
+/** Exports the client calls on the WASM bindings. */
+const REQUIRED_WASM_EXPORTS = [
+  "build_sphinx_packet",
+  "create_surb",
+  "decrypt_surb_response",
+  "JsPathHop",
+  "JsSurbRecovery",
+] as const;
+
+function validateWasmProvider(provider: unknown): void {
+  if (typeof provider !== "function" && (typeof provider !== "object" || provider === null)) {
+    throw new NoxClientError(
+      "wasm must be initialised @hisoka-io/nox-wasm bindings or a function returning them",
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+}
+
+/** Resolve a `NoxWasmProvider` and check the exports the client calls. */
+async function loadWasmBindings(provider: NoxWasmProvider): Promise<NoxWasmBindings> {
+  let bindings: unknown;
+  try {
+    bindings = typeof provider === "function" ? await provider() : provider;
+  } catch (error) {
+    throw new NoxClientError(
+      `WASM bindings could not be initialised: ${String(error)}`,
+      NoxClientErrorCode.WasmNotInitialized,
+      error,
+    );
+  }
+  if (typeof bindings !== "object" || bindings === null) {
+    throw new NoxClientError("The wasm provider returned no bindings object", NoxClientErrorCode.WasmNotInitialized);
+  }
+  const record = bindings as NoxWasmBindings;
+  const missing = REQUIRED_WASM_EXPORTS.filter((name) => typeof record[name] !== "function");
+  if (missing.length > 0) {
+    throw new NoxClientError(
+      `WASM bindings lack required exports: ${missing.join(", ")}`,
+      NoxClientErrorCode.WasmNotInitialized,
+    );
+  }
+  return record;
+}
+
+interface BootTopologies {
+  sources: ServedTopology[];
+  /** Short diagnostics for anchors that failed (label and code), never addresses in full. */
+  failures: string[];
+}
+
+/**
+ * Boot (ARCHITECTURE §3.4 step 3): dial shuffled KPS-capable eligible members
+ * (restricted by `entries`), at most `anchorParallelism` at a time and started
+ * `KPS_ANCHOR_STAGGER_MS` apart, and fetch `/topology` from each. Stop at
+ * `topologySources` documents, or `KPS_SECOND_SOURCE_WAIT_MS` after the
+ * first, or when every candidate has been tried.
+ */
+function gatherServedTopologies(
+  transport: KpsHttpTransport,
+  options: ResolvedKpsOptions,
+  log: NoxLogSink | undefined,
+): Promise<BootTopologies> {
+  const kpsByMember = pinnedKpsAddresses(options.pinned);
+  const candidates = eligiblePinnedMembers(options.pinned)
+    .flatMap((member) => {
+      const address = kpsByMember.get(member.address);
+      return address === undefined ? [] : [address];
+    })
+    .filter((address) => options.entries === undefined || options.entries.has(address));
+  for (let index = candidates.length - 1; index > 0; index--) {
+    const other = secureRandomIndex(index + 1);
+    [candidates[index], candidates[other]] = [candidates[other]!, candidates[index]!];
+  }
+  if (candidates.length === 0) {
+    return Promise.reject(
+      new NoxClientError(
+        "No eligible pinned member publishes a KPS address that this client may use as an entry",
+        NoxClientErrorCode.KpsUnavailable,
+      ),
+    );
+  }
+  return new Promise<BootTopologies>((resolve) => {
+    const sources: ServedTopology[] = [];
+    const failures: string[] = [];
+    const controller = new AbortController();
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    let next = 0;
+    let running = 0;
+    let done = false;
+    const finish = (): void => {
+      if (done) return;
+      done = true;
+      for (const timer of timers) clearTimeout(timer);
+      controller.abort(new NoxClientError("Boot found enough topology sources", NoxClientErrorCode.Aborted));
+      resolve({ sources, failures });
+    };
+    const fetchWithBootSignal: NoxFetch = (input, init) =>
+      transport.fetch(input, { ...init, signal: linkSignals(init?.signal ?? undefined, controller.signal) });
+    const launch = (): void => {
+      if (done || running >= options.anchorParallelism) return;
+      if (next >= candidates.length) {
+        if (running === 0) finish();
+        return;
+      }
+      const anchor = candidates[next++]!;
+      running += 1;
+      emitLog(log, "info", "anchor.dial", { anchor: kpsAddressLabel(anchor) });
+      fetchTopology(`kps:${anchor}`, options.exchangeTimeoutMs, fetchWithBootSignal)
+        .then(
+          (snapshot) => {
+            if (done) return;
+            sources.push({ anchor, snapshot });
+            if (sources.length >= options.topologySources) {
+              finish();
+            } else if (sources.length === 1) {
+              timers.push(setTimeout(finish, KPS_SECOND_SOURCE_WAIT_MS));
+            }
+          },
+          (error: unknown) => {
+            if (done) return;
+            const code = typeof error === "object" && error !== null ? String((error as { code?: unknown }).code) : "error";
+            failures.push(`${kpsAddressLabel(anchor)} ${code}`);
+            emitLog(log, "warn", "anchor.failed", { anchor: kpsAddressLabel(anchor), code });
+          },
+        )
+        .finally(() => {
+          running -= 1;
+          launch();
+        });
+    };
+    for (let index = 0; index < Math.min(options.anchorParallelism, candidates.length); index++) {
+      if (index === 0) launch();
+      else timers.push(setTimeout(launch, index * KPS_ANCHOR_STAGGER_MS));
+    }
+  });
+}
+
+/** A signal that aborts when either input aborts. */
+function linkSignals(first: AbortSignal | undefined, second: AbortSignal): AbortSignal {
+  if (first === undefined) return second;
+  const controller = new AbortController();
+  const abortFrom = (signal: AbortSignal) => (): void => {
+    if (!controller.signal.aborted) controller.abort(signal.reason);
+  };
+  if (first.aborted) controller.abort(first.reason);
+  else if (second.aborted) controller.abort(second.reason);
+  else {
+    first.addEventListener("abort", abortFrom(first), { once: true });
+    second.addEventListener("abort", abortFrom(second), { once: true });
+  }
+  return controller.signal;
+}
+
+/** Best-effort structured log; a throwing sink never affects the client. */
+function emitLog(
+  log: NoxLogSink | undefined,
+  level: NoxLogLevel,
+  event: string,
+  fields?: Readonly<Record<string, string | number | boolean>>,
+): void {
+  if (log === undefined) return;
+  try {
+    log(level, event, fields);
+  } catch {
+    // Diagnostics only.
+  }
 }
 
 
