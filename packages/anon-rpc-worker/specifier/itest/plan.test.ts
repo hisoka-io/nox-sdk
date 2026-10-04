@@ -17,7 +17,7 @@ import {
   type DeploymentPlan,
   type PlanRequest,
 } from "../tools/plan.ts";
-import { castCreateArgs, renderPlan } from "../tools/report.ts";
+import { castCreateArgs, formatEth, renderPlan } from "../tools/report.ts";
 import { DEFAULT_RESOLVER_POLICY } from "../tools/resolvers.ts";
 import { harnessProvider, hexToBigInt } from "../tools/rpc.ts";
 import { SAMPLE_HASH, SAMPLE_RESOLVERS } from "./sample.ts";
@@ -124,6 +124,10 @@ describe("planDeployment (dry run)", () => {
     expect(text).toContain("WorkerSpecifier: deploy + renounceOwnership: ");
     expect(text).toContain("WorkerSpecifier: deploy + transferOwnership: ");
     expect(text).toContain(`${deployer} holds 0.00000000 ETH`);
+    const deployGas = plan.variants[0]?.deploy.gasUsedOnFork ?? 0n;
+    expect(text).toContain(
+      `ImmutableWorkerSpecifier: deploy: 1 gwei ${formatEth(deployGas * 10n ** 9n)} · 4 gwei ${formatEth(deployGas * 4n * 10n ** 9n)} · 20 gwei ${formatEth(deployGas * 20n * 10n ** 9n)}`,
+    );
   });
 
   it("leaves the target chain untouched", async () => {
@@ -169,6 +173,20 @@ describe("planDeployment input checks", () => {
       typeof receipt === "object" && receipt !== null ? (receipt as Record<string, unknown>)["contractAddress"] : null;
     if (typeof deployed !== "string") throw new Error("cast send returned no contract address");
     await expect(planDeployment(request({ deployer: deployed }))).rejects.toThrow(/is a contract/);
+  });
+
+  it("without a deployer, measures from a fresh address rather than an anvil dev account", async () => {
+    const { deployer: _deployer, newOwner: _newOwner, ...rest } = request({ variants: ["reference"] });
+    const anonymous = await planDeployment(rest);
+    expect(anonymous.deployer).toBeNull();
+    const owner = anonymous.variants[0]?.inspection.owner;
+    expect(owner?.kind).toBe("eoa");
+    const accounts = await upstream.rpc.request("eth_accounts");
+    const devAccounts = (Array.isArray(accounts) ? accounts : []).map((a) => String(a).toLowerCase());
+    expect(devAccounts.length).toBeGreaterThan(0);
+    const address = owner !== undefined && "address" in owner ? owner.address.toLowerCase() : "";
+    expect(address).toMatch(/^0x[0-9a-f]{40}$/);
+    expect(devAccounts).not.toContain(address);
   });
 
   it("refuses a zero worker hash", async () => {

@@ -3,7 +3,7 @@
 // that was read. The fork deployment is read back through the reference harness, so the creation code in the
 // plan is proven to produce a specifier wallets can read, before anyone signs it.
 
-import { getAddress } from "ethers";
+import { getAddress, Wallet } from "ethers";
 import { startAnvil, type Anvil } from "./anvil.ts";
 import { checkAvailability, type AvailabilityResult } from "./availability.ts";
 import { CONTRACTS, loadArtifact, type Variant } from "./artifacts.ts";
@@ -33,6 +33,8 @@ export type PlanSettings = {
   rpcTimeoutMs: number;
   /** Body cap when fetching resolvers (the reference harness uses 64 MiB). */
   maxBundleBytes: number;
+  /** Gas prices (gwei) at which the report also prices each sequence, for budgeting beyond today's fees. */
+  scenarioGasPricesGwei: readonly bigint[];
 };
 
 export const DEFAULT_PLAN_SETTINGS: PlanSettings = {
@@ -43,6 +45,7 @@ export const DEFAULT_PLAN_SETTINGS: PlanSettings = {
   anvilStartTimeoutMs: 90_000,
   rpcTimeoutMs: 60_000,
   maxBundleBytes: MAX_BUNDLE_BYTES,
+  scenarioGasPricesGwei: [1n, 4n, 20n],
 };
 
 export type PlanRequest = {
@@ -119,6 +122,8 @@ export type DeploymentPlan = {
   deployer: { address: string; nonce: bigint; balance: bigint } | null;
   newOwner: string | null;
   variants: VariantPlan[];
+  /** Copied from the settings so the rendered report can price each sequence at these gas prices. */
+  scenarioGasPricesGwei: bigint[];
 };
 
 export class PlanError extends Error {
@@ -190,10 +195,12 @@ async function openFork(request: PlanRequest, blockNumber: bigint): Promise<Fork
       await anvil.rpc.request("anvil_setBalance", [sender, toQuantity(FORK_SENDER_BALANCE_WEI)]);
       return { anvil, sender };
     }
-    const accounts = await anvil.rpc.request("eth_accounts");
-    const first: unknown = Array.isArray(accounts) ? accounts[0] : undefined;
-    if (typeof first !== "string") throw new PlanError("the anvil fork exposes no unlocked account");
-    return { anvil, sender: getAddress(first) };
+    // No deployer given: a fresh random address (no code, no delegation, nonce 0 on the target chain) stands in,
+    // rather than anvil's well-known dev accounts, which carry real-world state on public chains.
+    const sender = Wallet.createRandom().address;
+    await anvil.rpc.request("anvil_impersonateAccount", [sender]);
+    await anvil.rpc.request("anvil_setBalance", [sender, toQuantity(FORK_SENDER_BALANCE_WEI)]);
+    return { anvil, sender };
   } catch (e) {
     await anvil.stop();
     throw e;
@@ -383,5 +390,6 @@ export async function planDeployment(request: PlanRequest): Promise<DeploymentPl
     deployer,
     newOwner: request.newOwner === undefined ? null : getAddress(request.newOwner),
     variants,
+    scenarioGasPricesGwei: [...request.settings.scenarioGasPricesGwei],
   };
 }

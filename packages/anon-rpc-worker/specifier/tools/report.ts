@@ -63,6 +63,22 @@ function variantBlock(plan: DeploymentPlan, v: VariantPlan, creationCodeFile: st
   return lines.join("\n");
 }
 
+type Sequence = { contract: string; what: string; txs: TxPlan[] };
+
+/** The transaction sequences a founder may sign for one variant: the deploy alone, then with each owner step. */
+export function sequencesOf(v: VariantPlan): Sequence[] {
+  const sequences: Sequence[] = [{ contract: v.contract, what: "deploy", txs: [v.deploy] }];
+  for (const kind of ["renounceOwnership", "transferOwnership"] as const) {
+    const followUp = v.followUps.find((t) => t.kind === kind);
+    if (followUp !== undefined) {
+      sequences.push({ contract: v.contract, what: `deploy + ${kind}`, txs: [v.deploy, followUp] });
+    }
+  }
+  return sequences;
+}
+
+const gasUsed = (txs: readonly TxPlan[]): bigint => txs.reduce((sum, t) => sum + t.gasUsedOnFork, 0n);
+
 export function renderPlan(plan: DeploymentPlan, files: Readonly<Record<string, string>>): string {
   const f = plan.fees;
   const out: string[] = [
@@ -83,22 +99,26 @@ export function renderPlan(plan: DeploymentPlan, files: Readonly<Record<string, 
   out.push(
     "ETH to hold in the deploying account (budget = gas limit x fee cap; expected = gas used x (base fee + tip)):",
   );
-  for (const v of plan.variants) {
-    const sequences: { what: string; txs: TxPlan[] }[] = [{ what: "deploy", txs: [v.deploy] }];
-    for (const kind of ["renounceOwnership", "transferOwnership"] as const) {
-      const followUp = v.followUps.find((t) => t.kind === kind);
-      if (followUp !== undefined) sequences.push({ what: `deploy + ${kind}`, txs: [v.deploy, followUp] });
-    }
-    for (const { what, txs } of sequences) {
-      const budget = txs.reduce((sum, t) => sum + t.budget, 0n);
-      const expected = txs.reduce((sum, t) => sum + t.costExpected, 0n);
-      const gas = txs.reduce((sum, t) => sum + t.gasUsedOnFork, 0n);
-      out.push(`  ${v.contract}: ${what}: ${gas} gas, expected ${formatEth(expected)}, budget ${formatEth(budget)}`);
-    }
+  const all = plan.variants.flatMap((v) => sequencesOf(v));
+  for (const { contract, what, txs } of all) {
+    const budget = txs.reduce((sum, t) => sum + t.budget, 0n);
+    const expected = txs.reduce((sum, t) => sum + t.costExpected, 0n);
+    out.push(
+      `  ${contract}: ${what}: ${gasUsed(txs)} gas, expected ${formatEth(expected)}, budget ${formatEth(budget)}`,
+    );
   }
   if (plan.variants.length > 1) {
     const budget = plan.variants.reduce((s, v) => s + v.deploy.budget, 0n);
     out.push(`  both deployments: budget ${formatEth(budget)}`);
+  }
+  if (plan.scenarioGasPricesGwei.length > 0) {
+    out.push("", "The same sequences if gas used is paid at a flat gas price (base fee + tip):");
+    for (const { contract, what, txs } of all) {
+      const prices = plan.scenarioGasPricesGwei.map(
+        (gwei) => `${gwei} gwei ${formatEth(gasUsed(txs) * gwei * WEI_PER_GWEI)}`,
+      );
+      out.push(`  ${contract}: ${what}: ${prices.join(" · ")}`);
+    }
   }
   if (plan.deployer !== null) {
     out.push(`  ${plan.deployer.address} holds ${formatEth(plan.deployer.balance)} at block ${f.blockNumber}`);
