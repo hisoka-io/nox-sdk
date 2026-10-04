@@ -190,6 +190,11 @@ export interface KpsModeOptions {
   pinned: PinnedSnapshot;
   /** Allowed entry KPS addresses; each must belong to a pinned member. Default: every KPS-capable member. */
   entries?: readonly string[];
+  /**
+   * Registry addresses of members to try last as boot anchors (for example a
+   * cache of members recent served topologies removed). Only reorders anchors.
+   */
+  deprioritize?: readonly string[];
   /** Served topologies wanted per refresh. Default 2, range 1..4. */
   topologySources?: number;
   /** Anchors dialled at once during boot. Default 3. */

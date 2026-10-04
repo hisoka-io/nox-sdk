@@ -173,6 +173,7 @@ interface SendExtras {
 interface ResolvedKpsOptions {
   readonly pinned: PinnedSnapshot;
   readonly entries: ReadonlySet<string> | undefined;
+  readonly deprioritize: ReadonlySet<string>;
   readonly topologySources: number;
   readonly anchorParallelism: number;
   readonly exchangeTimeoutMs: number;
@@ -2524,6 +2525,10 @@ function isKpsEntryNode(node: TopologyNode): boolean {
   return kpsAddressOfEntry(node.address) !== null;
 }
 
+/** Largest `kps.deprioritize` list (the registry snapshot holds at most 256 members). */
+const MAX_DEPRIORITIZED = 256;
+const MEMBER_ADDRESS_RE = /^0x[0-9a-f]{40}$/u;
+
 /** Fields that exist only in classic mode; KPS mode refuses them. */
 const CLASSIC_ONLY_FIELDS = ["seeds", "ethRpcUrl", "dangerouslySkipFingerprintCheck", "transport"] as const;
 
@@ -2532,6 +2537,7 @@ const KPS_OPTION_KEYS = new Set([
   "dial",
   "pinned",
   "entries",
+  "deprioritize",
   "topologySources",
   "anchorParallelism",
   "dialTimeoutMs",
@@ -2628,9 +2634,28 @@ function resolveKpsOptions(config: NoxClientConfig): ResolvedKpsOptions {
     }
     entries = seen;
   }
+  const deprioritize = new Set<string>();
+  if (options.deprioritize !== undefined) {
+    if (!Array.isArray(options.deprioritize) || options.deprioritize.length > MAX_DEPRIORITIZED) {
+      throw new NoxClientError(
+        `kps.deprioritize must be a list of at most ${MAX_DEPRIORITIZED} member addresses`,
+        NoxClientErrorCode.InvalidConfig,
+      );
+    }
+    for (const address of options.deprioritize) {
+      if (typeof address !== "string" || !MEMBER_ADDRESS_RE.test(address)) {
+        throw new NoxClientError(
+          "kps.deprioritize holds a value that is not a lowercase 0x member address",
+          NoxClientErrorCode.InvalidConfig,
+        );
+      }
+      deprioritize.add(address);
+    }
+  }
   return {
     pinned,
     entries,
+    deprioritize,
     topologySources: boundedInteger(options.topologySources, KPS_CLIENT_DEFAULTS.topologySources, 1, 4, "kps.topologySources"),
     anchorParallelism: boundedInteger(options.anchorParallelism, KPS_CLIENT_DEFAULTS.anchorParallelism, 1, 16, "kps.anchorParallelism"),
     exchangeTimeoutMs: kpsTransportSettingsFrom(options).exchangeTimeoutMs,
@@ -2732,16 +2757,21 @@ function gatherServedTopologies(
   log: NoxLogSink | undefined,
 ): Promise<BootTopologies> {
   const kpsByMember = pinnedKpsAddresses(options.pinned);
-  const candidates = eligiblePinnedMembers(options.pinned)
-    .flatMap((member) => {
-      const address = kpsByMember.get(member.address);
-      return address === undefined ? [] : [address];
-    })
-    .filter((address) => options.entries === undefined || options.entries.has(address));
-  for (let index = candidates.length - 1; index > 0; index--) {
+  const shuffled = eligiblePinnedMembers(options.pinned).flatMap((member) => {
+    const address = kpsByMember.get(member.address);
+    return address !== undefined && (options.entries === undefined || options.entries.has(address))
+      ? [{ member: member.address, address }]
+      : [];
+  });
+  for (let index = shuffled.length - 1; index > 0; index--) {
     const other = secureRandomIndex(index + 1);
-    [candidates[index], candidates[other]] = [candidates[other]!, candidates[index]!];
+    [shuffled[index], shuffled[other]] = [shuffled[other]!, shuffled[index]!];
   }
+  // Deprioritised members go last; the order within each group stays random.
+  const candidates = [
+    ...shuffled.filter((entry) => !options.deprioritize.has(entry.member)),
+    ...shuffled.filter((entry) => options.deprioritize.has(entry.member)),
+  ].map((entry) => entry.address);
   if (candidates.length === 0) {
     return Promise.reject(
       new NoxClientError(

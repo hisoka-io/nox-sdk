@@ -148,6 +148,19 @@ describe("KPS mode connect", () => {
     expect(entryNodes(client).map((node) => node.address).sort()).toEqual(only.map((a) => `kps:${a}`).sort());
   });
 
+  it("dials deprioritised members last as boot anchors", async () => {
+    for (let round = 0; round < 5; round++) {
+      const t = bed();
+      const others = t.pinned.members.slice(1).map((member) => member.address);
+      await connect(t.config({}, { deprioritize: others, anchorParallelism: 1 }));
+      expect(t.network.dials[0]).toBe(kpsAddressFor(1));
+    }
+    const t = bed();
+    await expect(connect(t.config({}, { deprioritize: ["0xABC"] }))).rejects.toMatchObject({
+      code: NoxClientErrorCode.InvalidConfig,
+    });
+  });
+
   it("ignores members a served topology adds and drops members every source omits", async () => {
     const t = bed();
     t.servedSpec = {
