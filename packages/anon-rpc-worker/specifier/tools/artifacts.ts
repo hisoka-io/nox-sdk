@@ -87,7 +87,7 @@ export function forgeBuild(root: string = PROJECT_ROOT): Promise<void> {
     child.stdout.on("data", (b: Buffer) => (output += b.toString("utf8")));
     child.stderr.on("data", (b: Buffer) => (output += b.toString("utf8")));
     child.once("error", (e) => reject(new ArtifactError(`cannot run forge (is Foundry installed?): ${e.message}`)));
-    child.once("exit", (code) =>
+    child.once("close", (code) =>
       code === 0 ? resolve() : reject(new ArtifactError(`forge build failed in ${root} (exit ${code}):\n${output}`)),
     );
   });

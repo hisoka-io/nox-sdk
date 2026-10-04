@@ -51,7 +51,8 @@ function cast(args: readonly string[]): Promise<string> {
     child.stdout.on("data", (b: Buffer) => (out += b.toString("utf8")));
     child.stderr.on("data", (b: Buffer) => (err += b.toString("utf8")));
     child.once("error", reject);
-    child.once("exit", (code) => (code === 0 ? resolve(out) : reject(new Error(`cast exited ${code}: ${err}`))));
+    // "close", not "exit": stdout may still hold data when the process exits.
+    child.once("close", (code) => (code === 0 ? resolve(out) : reject(new Error(`cast exited ${code}: ${err}`))));
   });
 }
 
