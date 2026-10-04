@@ -1,5 +1,5 @@
 // esbuild builds used by the test bed: the host page script (once per harness
-// version) and the KPS probe worker (a classic-script IIFE, the anon-rpc §4
+// version) and the test-only workers (classic-script IIFEs, the anon-rpc §4
 // artifact shape).
 
 import { readFileSync } from "node:fs";
@@ -50,11 +50,21 @@ export async function buildPageBundle(version: HarnessVersion, e2eRoot: string =
   return output.contents;
 }
 
-/** The probe worker bundle bytes (hash-pinned through a specifier like any worker). */
-export async function buildProbeWorker(e2eRoot: string = E2E_ROOT): Promise<Uint8Array> {
+/** Test-only workers under workers/, each bundled to a classic-script IIFE. */
+export const TEST_WORKERS = {
+  /** Exercises anonRpcWorker.kps (workers/kps-probe-worker.ts). */
+  "kps-probe": "kps-probe-worker.ts",
+  /** Negative control for the egress check (workers/leaky-worker.ts). */
+  leaky: "leaky-worker.ts",
+} as const;
+
+export type TestWorker = keyof typeof TEST_WORKERS;
+
+/** A test worker's bundle bytes (hash-pinned through a specifier like any worker). */
+export async function buildTestWorker(worker: TestWorker, e2eRoot: string = E2E_ROOT): Promise<Uint8Array> {
   const result = await build({
     absWorkingDir: e2eRoot,
-    entryPoints: [join(e2eRoot, "workers", "kps-probe-worker.ts")],
+    entryPoints: [join(e2eRoot, "workers", TEST_WORKERS[worker])],
     bundle: true,
     format: "iife",
     platform: "browser",
@@ -64,6 +74,11 @@ export async function buildProbeWorker(e2eRoot: string = E2E_ROOT): Promise<Uint
     tsconfig: join(e2eRoot, "workers", "tsconfig.json"),
   });
   const output = result.outputFiles[0];
-  if (output === undefined) throw new TestbedError("prerequisite", "esbuild produced no probe worker bundle");
+  if (output === undefined) throw new TestbedError("prerequisite", `esbuild produced no ${worker} worker bundle`);
   return output.contents;
+}
+
+/** The KPS probe worker bundle bytes. */
+export function buildProbeWorker(e2eRoot: string = E2E_ROOT): Promise<Uint8Array> {
+  return buildTestWorker("kps-probe", e2eRoot);
 }

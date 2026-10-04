@@ -10,7 +10,7 @@ import { HARNESS_VERSIONS } from "../../src/bundles.js";
 import { deploySpecifier } from "../../src/specifier.js";
 import { publishWorker } from "../../src/testbed.js";
 import { expect, test } from "./fixtures.js";
-import { RequestMonitor, rpcCall, rpcResult, rpcViaWorker } from "./helpers.js";
+import { rpcCall, rpcResult, rpcViaWorker } from "./helpers.js";
 
 /** workerHash() of the mainnet passthrough specifier (anon-rpc keccak branch 19/4f04bd...). */
 const PASSTHROUGH_MAINNET_HASH = "0x194f04bde4925f6bbb0bd8bdfceca7251125eaa0664ce3c0c25dce2a1545338d";
@@ -29,15 +29,14 @@ test.describe("reference harness with the upstream passthrough worker", () => {
       cfg,
       chains,
       resolver,
-      openHost,
+      guardedHost,
     }) => {
       const bundle = passthroughBundle(cfg.e2eRoot);
       const published = await publishWorker(chains, resolver, bundle);
       expect(published.workerHash).toBe(PASSTHROUGH_MAINNET_HASH);
       const resolverHitsBefore = resolver.server.requests.length;
 
-      const page = await openHost(version);
-      const monitor = new RequestMonitor(page.context());
+      const page = await guardedHost.open(version);
       const boot = await page.evaluate((request) => window.e2e.boot(request), {
         id: "passthrough",
         address: published.address,
@@ -74,11 +73,18 @@ test.describe("reference harness with the upstream passthrough worker", () => {
       );
       expect(Array.isArray(batch.json) ? batch.json.length : -1).toBe(2);
 
-      // Positive control for the "no ambient network" check used on the Nox
-      // worker: the passthrough worker fetches ambiently, so the monitor must
-      // see its requests to the upstream chain.
-      expect(monitor.matching([upstream]).length).toBeGreaterThanOrEqual(3);
-      monitor.stop();
+      // Negative control for the egress check used on the Nox worker: the
+      // passthrough worker fetches ambiently, so both the recording proxy and
+      // the CDP request events must flag its calls to the upstream chain, and
+      // nothing else (harness boot stays inside the allowlist).
+      const { monitor } = guardedHost;
+      const upstreamOrigin = new URL(upstream).origin;
+      const flagged = monitor.violations();
+      expect(flagged.length, monitor.describeViolations()).toBeGreaterThanOrEqual(6);
+      expect(flagged.every((event) => new URL(event.target).origin === upstreamOrigin), monitor.describeViolations()).toBe(true);
+      for (const layer of ["proxy", "cdp-request"] as const) {
+        expect(flagged.filter((event) => event.layer === layer).length, `${layer} layer`).toBeGreaterThanOrEqual(3);
+      }
 
       // Host abort reaches the worker: a call aborted before it settles rejects
       // with AbortError, and the worker keeps serving afterwards.

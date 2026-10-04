@@ -35,14 +35,30 @@ servers), solc 0.8.28 only to regenerate the vendored specifier artifact.
 
 | Spec | What it proves | Needs |
 |---|---|---|
-| `harness-passthrough.spec.ts` | The harness setup end to end with a known-good worker: the exact 1,704-byte passthrough bundle pinned by the mainnet passthrough specifier, deployed behind a real `WorkerSpecifier` on anvil, served by the local keccak resolver; JSON-RPC (single, batch), host abort, sandbox `allow-scripts`, tampered bytes refused. Harness 0.3.2 and 0.3.0. | anvil |
+| `harness-passthrough.spec.ts` | The harness setup end to end with a known-good worker: the exact 1,704-byte passthrough bundle pinned by the mainnet passthrough specifier, deployed behind a real `WorkerSpecifier` on anvil, served by the local keccak resolver; JSON-RPC (single, batch), host abort, sandbox `allow-scripts`, tampered bytes refused. Its ambient fetches double as a negative control: the egress check flags each of them on the proxy and CDP layers. Harness 0.3.2 and 0.3.0. | anvil |
+| `egress-guard.spec.ts` | Controls for the egress check. Negative: a hash-pinned leaky worker that, while getting ready, opens a WebSocket to an ingress-shaped `/api/v1/ws`, fetches `/topology` through `localhost` and calls a public RPC host; the check flags all three at boot, and the trap server confirms the WebSocket handshake really happened. Positive: the KPS probe worker completes KPS streams and the check reports an empty list. | anvil (KPS servers for the stream part) |
 | `kps-webrtc.spec.ts` | Browser WebRTC-KPS in this environment: the page dials with `@kpstreams/webrtc-client` and a hash-pinned probe worker dials through `anonRpcWorker.kps` (`dial` and `openStream`). Echo (32 B, 32 KiB, 512 KiB, 10 sequential and 4 parallel streams) against the Go and Rust reference servers; small-request/large-response (32 KiB to 16 MiB) against `tools/kps-bulk-server`. Loopback and the host's external IPv4, with Chromium's default WebRTC settings and with the flags the upstream anon-rpc e2e uses. | KPS servers |
 | `classic-sdk.spec.ts` | The existing SDK transport (HTTP ingress, seed topology, SURB replies) through the 10-node mesh: echo, then `eth_chainId`, `eth_getBalance`, a 3-call batch and a JSON-RPC error through an exit to the upstream anvil, compared with direct calls. | nox binaries, SDK dist |
 | `nox-kps-sidecar.spec.ts` | One nox-kps per mesh node, reached from a hash-pinned probe worker through `anonRpcWorker.kps` with KPS-HTTP/1: `/topology` matches the node's own topology, `/health` and `/metadata.json` answer, `/api/v1/ws` stays unexposed. Runs once `NOX_KPS_CMD` is set. | nox binaries, nox-kps |
-| `nox-worker.spec.ts` | The Nox worker through harness → KPS → nox-kps → mesh → exit → anvil: boot (`.ready`, sandbox), JSON-RPC parity with direct calls, a signed transaction landing on the upstream chain, browser makes no HTTP(S) request to the upstream or any mesh port, calls issued before `ready`, host abort, `bad-config`, a latency sample. Harness 0.3.2 and 0.3.0. Runs once `NOX_KPS_CMD` and a worker bundle are present. | everything above, nox-kps, worker bundle |
+| `nox-worker.spec.ts` | The Nox worker through harness → KPS → nox-kps → mesh → exit → anvil: boot (`.ready`, sandbox), JSON-RPC parity with direct calls, a signed transaction landing on the upstream chain, calls issued before `ready`, host abort, `bad-config`, a latency sample. Every test runs under the egress check below, from page load on. Harness 0.3.2 and 0.3.0. Runs once `NOX_KPS_CMD` and a worker bundle are present. | everything above, nox-kps, worker bundle |
 
 Reports land in `.run/reports/*.json` (latest) and in each run directory `.run/<timestamp>-<label>-<pid>/`
 (`logs/` for anvil, mesh, node, KPS server, page console; `testbed.json`; `reports/`).
+
+## Egress check
+
+The Nox worker must reach the network only through KPS. Each test that asserts this opens the host page in its own
+browser context, routed through a recording forward proxy (`src/egress-proxy.ts`). Playwright proxies loopback too
+(`<-loopback>`), so every HTTP(S) request and every WebSocket from the page, the sandboxed harness frame and the
+worker passes the proxy and is recorded, from before the first navigation. The proxy forwards loopback targets and
+refuses all others without resolving them. Playwright's context `request` events and page `websocket` events are recorded
+alongside.
+
+The allowlist (`src/egress.ts`) holds three origins: the host page, the bundle resolver and the specifier RPC. Any other
+HTTP(S) origin (including `localhost` aliases of a loopback port), every CONNECT tunnel to a host outside it, and every
+WebSocket is a violation, and the test fails with the list. `egress-guard.spec.ts` proves both directions on every
+run. WebRTC (the KPS transport itself) runs outside the HTTP stack; Chromium NetLog and packet capture, which cover
+that layer and DNS, are the next step for TST-562.
 
 ## Long-running bed
 
@@ -134,9 +150,9 @@ Two results, each pinned by a test that flips when it changes:
 ## Layout
 
 ```
-src/           test-bed library: config, processes, anvil, mesh, KPS servers, specifier, resolver, host page server, CLI
+src/           test-bed library: config, processes, anvil, mesh, KPS servers, specifier, resolver, host page server, egress proxy and allowlist, CLI
 page/          host page script (window.e2e), bundled per harness version
-workers/       hash-pinned KPS probe worker
+workers/       hash-pinned test workers: KPS probe, leaky worker (egress negative control)
 shared/        echo, bulk and KPS-HTTP/1 helpers used by the page and the probe worker
 tools/         kps-bulk-server (Go, built against ethereum/kps libs/go)
 contracts/     vendored reference WorkerSpecifier (MIT) and its compiled artifact

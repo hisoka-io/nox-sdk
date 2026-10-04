@@ -10,6 +10,7 @@ import { existsSync } from "node:fs";
 import type { Page } from "@playwright/test";
 import { HARNESS_VERSIONS } from "../../src/bundles.js";
 import { loadConfig } from "../../src/config.js";
+import { describeEvents } from "../../src/egress.js";
 import { expectHex, jsonRpc } from "../../src/jsonrpc.js";
 import { percentile, writeReport } from "../../src/report.js";
 import {
@@ -20,8 +21,8 @@ import {
   type PublishedWorker,
 } from "../../src/testbed.js";
 import { resolveWorkerBundle } from "../../src/worker-bundle.js";
-import { expect, test } from "./fixtures.js";
-import { RequestMonitor, rpcCall, rpcResult, rpcViaWorker } from "./helpers.js";
+import { expect, test, type GuardedHost } from "./fixtures.js";
+import { rpcCall, rpcResult, rpcViaWorker } from "./helpers.js";
 
 /** TST-560.02 bound for `.ready` at mix delay 0 (8 s at 50 ms is checked by the bench). */
 const READY_BOUND_MS = 5_000;
@@ -64,6 +65,15 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
     writeTestbedInfo(runPaths, { ...info, workers: { nox: published.worker } });
   });
 
+  /**
+   * TST-562 .03: from before the host page loads until now, the guarded
+   * context reached only the host page, the resolver and the specifier RPC.
+   * Any other HTTP(S) request or any WebSocket fails the test.
+   */
+  function expectKpsOnlyEgress(guarded: GuardedHost): void {
+    expect(guarded.monitor.violations(), guarded.monitor.describeViolations()).toEqual([]);
+  }
+
   function pin(): Published {
     if (published === undefined) throw new Error("worker was not published in beforeAll");
     return published;
@@ -84,17 +94,16 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
       cfg,
       runPaths,
       chains,
-      meshBed,
-      openHost,
+      guardedHost,
     }) => {
-      const page = await openHost(version);
+      // The egress monitor watches from before the page loads: boot-time
+      // traffic (topology, bootstrap) counts too.
+      const page = await guardedHost.open(version);
       const result = await boot(page, chains.specifier.url, cfg.worker.readyTimeoutMs, pin().config);
       expect(result.ok, JSON.stringify(result.error)).toBe(true);
       expect(result.sandbox).toBe("allow-scripts");
+      expectKpsOnlyEgress(guardedHost);
 
-      // From here on the worker may reach the network only through KPS: the
-      // browser context must not issue HTTP(S) to the upstream or any mesh port.
-      const monitor = new RequestMonitor(page.context());
       const upstream = chains.upstream;
       const timeout = cfg.worker.callTimeoutMs;
       const call = (body: unknown) => rpcViaWorker(page, WORKER_ID, upstream.url, body, timeout);
@@ -125,26 +134,21 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
       const receipt = (await jsonRpc(upstream.url, "eth_getTransactionReceipt", [txHash])) as { status?: string } | null;
       expect(receipt?.status).toBe("0x1");
 
-      const meshOrigins = meshBed.mesh.info.nodes.flatMap((node) => [
-        `http://127.0.0.1:${node.ingressPort}`,
-        `http://127.0.0.1:${node.metricsPort}`,
-      ]);
-      expect(monitor.matching([upstream.url, ...meshOrigins])).toEqual([]);
+      expectKpsOnlyEgress(guardedHost);
       writeReport(cfg, runPaths, `nox-worker-boot-${version}`, {
         readyMs: result.readyMs,
         bundle: pin().bundleSource,
         workerHash: pin().worker.workerHash,
         bytes: pin().worker.bytes,
-        requestsAfterReady: monitor.requests,
+        egress: describeEvents(guardedHost.monitor.events()),
       });
-      monitor.stop();
       if (version === "0.3.2") expect(result.readyMs).toBeLessThan(READY_BOUND_MS);
       await page.evaluate((id) => window.e2e.close(id), WORKER_ID);
     });
   }
 
-  test("calls issued before ready are served after it, in order", async ({ cfg, chains, openHost }) => {
-    const page = await openHost("0.3.2");
+  test("calls issued before ready are served after it, in order", async ({ cfg, chains, guardedHost }) => {
+    const page = await guardedHost.open("0.3.2");
     const started = await page.evaluate((request) => window.e2e.boot(request), {
       id: WORKER_ID,
       address: pin().worker.address,
@@ -166,10 +170,11 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
       expect(outcome.result.status, JSON.stringify(outcome.result.error)).toBe(200);
       expect((outcome.json as { id?: unknown }).id).toBe(100 + i);
     });
+    expectKpsOnlyEgress(guardedHost);
   });
 
-  test("a host abort rejects with AbortError and the worker keeps serving", async ({ cfg, chains, openHost }) => {
-    const page = await openHost("0.3.2");
+  test("a host abort rejects with AbortError and the worker keeps serving", async ({ cfg, chains, guardedHost }) => {
+    const page = await guardedHost.open("0.3.2");
     expect((await boot(page, chains.specifier.url, cfg.worker.readyTimeoutMs, pin().config)).ok).toBe(true);
     const aborted = await page.evaluate((request) => window.e2e.fetch(request), {
       id: WORKER_ID,
@@ -184,18 +189,20 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
     expect(aborted.error?.name).toBe("AbortError");
     const after = await rpcViaWorker(page, WORKER_ID, chains.upstream.url, rpcCall("eth_chainId"), cfg.worker.callTimeoutMs);
     expect(rpcResult(after.json)).toBe(`0x${chains.upstream.chainId.toString(16)}`);
+    expectKpsOnlyEgress(guardedHost);
   });
 
-  test("an invalid config rejects ready with the documented code", async ({ cfg, chains, openHost }) => {
-    const page = await openHost("0.3.2");
+  test("an invalid config rejects ready with the documented code", async ({ cfg, chains, guardedHost }) => {
+    const page = await guardedHost.open("0.3.2");
     const result = await boot(page, chains.specifier.url, BAD_CONFIG_BOUND_MS, { bogus: 1 });
     expect(result.ok).toBe(false);
     expect(result.error?.code, JSON.stringify(result.error)).toBe(cfg.worker.expectedBadConfigCode);
     expect(result.readyMs).toBeLessThan(BAD_CONFIG_BOUND_MS);
+    expectKpsOnlyEgress(guardedHost);
   });
 
-  test("sequential call latency (recorded, not gated)", async ({ cfg, runPaths, chains, openHost }) => {
-    const page = await openHost("0.3.2");
+  test("sequential call latency (recorded, not gated)", async ({ cfg, runPaths, chains, guardedHost }) => {
+    const page = await guardedHost.open("0.3.2");
     expect((await boot(page, chains.specifier.url, cfg.worker.readyTimeoutMs, pin().config)).ok).toBe(true);
     const samples: number[] = [];
     for (let i = 0; i < LATENCY_SAMPLES; i++) {
@@ -215,5 +222,6 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
       p50: percentile(samples, 50),
       p90: percentile(samples, 90),
     });
+    expectKpsOnlyEgress(guardedHost);
   });
 });

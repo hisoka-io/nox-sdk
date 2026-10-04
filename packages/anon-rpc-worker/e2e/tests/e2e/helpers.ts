@@ -1,9 +1,18 @@
-// Spec helpers: JSON-RPC through a booted worker, an HTTP request monitor for
+// Spec helpers: JSON-RPC through a booted worker, the egress monitor for
 // "no ambient network" assertions, and host network facts for the KPS probe.
 
 import { networkInterfaces } from "node:os";
-import type { BrowserContext, Page, Request } from "@playwright/test";
+import type { BrowserContext, Page, Request, WebSocket } from "@playwright/test";
 import type { FetchResult } from "../../page/api.js";
+import {
+  describeEvents,
+  violations,
+  type EgressEvent,
+  type EgressKind,
+  type EgressLayer,
+  type EgressPolicy,
+} from "../../src/egress.js";
+import type { EgressProxy } from "../../src/egress-proxy.js";
 
 export interface RpcOutcome {
   readonly result: FetchResult;
@@ -44,31 +53,69 @@ export function rpcResult(json: unknown): unknown {
   return typeof json === "object" && json !== null ? (json as { result?: unknown }).result : undefined;
 }
 
-/** Records every HTTP(S) request the browser context makes (pages, frames, workers). */
-export class RequestMonitor {
-  readonly #urls: string[] = [];
+/**
+ * The egress check (TST-562 .03): watches a guarded browser context from before
+ * its first page exists, on three layers, and reports everything outside the
+ * allowlist (host page, resolver, specifier RPC).
+ *   - proxy: the recording forward proxy every request of the context goes
+ *     through, loopback included: HTTP(S) and WebSockets from pages, sandboxed
+ *     frames and Web Workers.
+ *   - cdp-request: Playwright's context `request` events (HTTP(S) only).
+ *   - cdp-websocket: Playwright's page `websocket` events (page-level sockets).
+ * WebRTC traffic (the KPS transport) does not pass through either and is out of
+ * scope here; NetLog and packet capture cover it (TST-562 .01/.04).
+ */
+export class EgressMonitor {
+  readonly #events: EgressEvent[] = [];
+  readonly #started = Date.now();
+  readonly #pages = new Set<Page>();
   readonly #onRequest = (request: Request): void => {
-    this.#urls.push(`${request.method()} ${request.url()}`);
+    const url = request.url();
+    this.#record("cdp-request", /^wss?:/iu.test(url) ? "websocket" : "http", url, request.method());
+  };
+  readonly #onWebSocket = (socket: WebSocket): void => {
+    this.#record("cdp-websocket", "websocket", socket.url());
+  };
+  readonly #onPage = (page: Page): void => {
+    this.#pages.add(page);
+    page.on("websocket", this.#onWebSocket);
   };
 
-  constructor(private readonly context: BrowserContext) {
+  constructor(
+    private readonly context: BrowserContext,
+    private readonly proxy: EgressProxy,
+    readonly policy: EgressPolicy,
+  ) {
     context.on("request", this.#onRequest);
+    context.on("page", this.#onPage);
+    for (const page of context.pages()) this.#onPage(page);
   }
 
-  get requests(): readonly string[] {
-    return this.#urls;
+  #record(layer: EgressLayer, kind: EgressKind, target: string, method?: string): void {
+    this.#events.push({ layer, kind, target, atMs: Date.now() - this.#started, ...(method === undefined ? {} : { method }) });
   }
 
-  /** Requests whose URL starts with any of `prefixes`. */
-  matching(prefixes: readonly string[]): string[] {
-    return this.#urls.filter((entry) => {
-      const url = entry.slice(entry.indexOf(" ") + 1);
-      return prefixes.some((prefix) => url.startsWith(prefix));
-    });
+  /** Every observed event: proxy first, then the CDP layers. */
+  events(layer?: EgressLayer): EgressEvent[] {
+    const all = [...this.proxy.events, ...this.#events];
+    return layer === undefined ? all : all.filter((event) => event.layer === layer);
+  }
+
+  /** Events outside the allowlist; a KPS-only worker leaves this empty. */
+  violations(): EgressEvent[] {
+    return violations(this.policy, this.events());
+  }
+
+  /** Human-readable violations, for assertion messages. */
+  describeViolations(): string {
+    return describeEvents(this.violations()).join("\n");
   }
 
   stop(): void {
     this.context.off("request", this.#onRequest);
+    this.context.off("page", this.#onPage);
+    for (const page of this.#pages) page.off("websocket", this.#onWebSocket);
+    this.#pages.clear();
   }
 }
 

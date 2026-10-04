@@ -4,7 +4,8 @@
 #      KPS servers and the bulk-response server, the SDK (nox-wasm pkg-node +
 #      nox-client dist), Playwright's Chromium;
 #   2. runs typecheck and unit tests;
-#   3. runs every Playwright spec: harness passthrough, WebRTC-KPS probe,
+#   3. runs every Playwright spec: harness passthrough, egress-check controls,
+#      WebRTC-KPS probe,
 #      classic SDK path through the mesh, and the Nox worker spec (skipped
 #      until NOX_KPS_CMD and a worker bundle are available).
 #

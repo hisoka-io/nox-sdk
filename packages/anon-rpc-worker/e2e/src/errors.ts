@@ -21,7 +21,9 @@ export type TestbedErrorCode =
   /** A port the test bed needs is already bound. */
   | "port"
   /** A binary payload (bincode, KPS address) could not be decoded. */
-  | "decode";
+  | "decode"
+  /** The recording egress proxy or its allowlist was given unusable input. */
+  | "egress";
 
 export class TestbedError extends Error {
   readonly code: TestbedErrorCode;
