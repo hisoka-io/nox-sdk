@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import { kpsAddrFromMetadataUrl as sdkKpsAddrFromMetadataUrl } from "@hisoka-io/nox-client";
 import { kpsAddrFromMetadataUrl, parseKpsAddress } from "../scripts/lib/kps-address.mjs";
 
 function certhashOf(der: string): string {
@@ -31,6 +32,7 @@ describe("parseKpsAddress", () => {
     ["a short certhash", `3.239.73.249:15005:${CERTHASH.slice(0, 40)}`],
     ["a certhash with another multihash code", `3.239.73.249:15005:u${Buffer.concat([Buffer.from([0x13, 0x20]), Buffer.alloc(32)]).toString("base64url")}`],
     ["a padded certhash", `3.239.73.249:15005:${CERTHASH}=`],
+    ["an IPv6 zone ID", `[fe80::1%eth0]:15005:${CERTHASH}`],
   ])("rejects %s", (_label, value) => {
     expect(() => parseKpsAddress(value)).toThrow();
   });
@@ -57,5 +59,27 @@ describe("kpsAddrFromMetadataUrl", () => {
     const result = kpsAddrFromMetadataUrl(value);
     expect(result.endpoint).toBeNull();
     expect(result.reason).toMatch(reason);
+  });
+});
+
+describe("agreement with the SDK", () => {
+  // The snapshot tools and the worker read metadataUrl with two parsers (Node
+  // tooling and the bundled SDK); a value one accepts and the other refuses
+  // would make a member KPS-capable in one place only.
+  it.each([
+    `kps:3.239.73.249:15005:${CERTHASH}/metadata.json`,
+    `kps:[2001:db8::1]:15005:${CERTHASH}/metadata.json`,
+    `kps:[::ffff:1.2.3.4]:15005:${CERTHASH}/metadata.json`,
+    `kps:[fe80::1%eth0]:15005:${CERTHASH}/metadata.json`,
+    `kps:[1::2::3]:15005:${CERTHASH}/metadata.json`,
+    `kps:[1.2.3.4]:15005:${CERTHASH}/metadata.json`,
+    `kps:3.239.73.249:015005:${CERTHASH}/metadata.json`,
+    `kps:3.239.73.249:15005:${CERTHASH}/metadata.json?x=1`,
+    `kps:3.239.73.249:15005:${CERTHASH}`,
+    `kps:nox-4.hisoka.io:15005:${CERTHASH}/metadata.json`,
+    "https://nox-4.hisoka.io/metadata.json",
+    "",
+  ])("%s", (value) => {
+    expect(kpsAddrFromMetadataUrl(value).endpoint?.address ?? null).toBe(sdkKpsAddrFromMetadataUrl(value));
   });
 });

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  isIpv6Literal,
   isKpsAddress,
   kpsAddrFromMetadataUrl,
   kpsAddressLabel,
@@ -131,5 +132,20 @@ describe("entry endpoints and metadataUrl publication", () => {
     ]) {
       expect(kpsAddrFromMetadataUrl(value)).toBeNull();
     }
+  });
+});
+
+describe("isIpv6Literal", () => {
+  it("accepts RFC 4291 text forms", () => {
+    for (const value of ["::", "::1", "2001:db8::1", "2400:6180:10:200::cca4:4000", "1:2:3:4:5:6:7:8", "::ffff:1.2.3.4", "64:ff9b::192.0.2.33", "1:2:3:4:5:6:1.2.3.4"]) {
+      expect(isIpv6Literal(value), value).toBe(true);
+    }
+  });
+
+  it("refuses zone IDs and malformed literals", () => {
+    for (const value of ["fe80::1%eth0", "1::2::3", ":1", "1:", ":::", "1.2.3.4", "1.2.3.4::", "12345::", "1:2:3:4:5:6:7:8:9", "1:2:3:4:5:6:7", "g::1", "::1.2.3", ""]) {
+      expect(isIpv6Literal(value), value).toBe(false);
+    }
+    expect(isKpsAddress(`[fe80::1%eth0]:15005:${CERTHASH}`)).toBe(false);
   });
 });

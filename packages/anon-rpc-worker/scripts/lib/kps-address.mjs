@@ -48,6 +48,9 @@ export function parseKpsAddress(text) {
     const end = text.indexOf("]");
     if (end < 0 || text[end + 1] !== ":") throw new KpsAddressError("bracketed IPv6 host is not followed by ':'");
     ip = text.slice(1, end);
+    // node:net accepts zone IDs ("fe80::1%eth0"); a zone names a local
+    // interface and has no meaning in a published address.
+    if (ip.includes("%")) throw new KpsAddressError(`"${ip}" carries an IPv6 zone ID, which a published address cannot use`);
     if (!isIPv6(ip)) throw new KpsAddressError(`"${ip}" is not an IPv6 literal`);
     rest = text.slice(end + 2);
   } else {

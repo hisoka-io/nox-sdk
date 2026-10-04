@@ -34,7 +34,9 @@ const BASE64URL_ALPHABET =
 
 const IPV4_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])";
 const IPV4_RE = new RegExp(`^${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3}$`, "u");
-const IPV6_CHARS_RE = /^[0-9A-Fa-f:.]{2,45}$/u;
+const IPV6_GROUP_RE = /^[0-9A-Fa-f]{1,4}$/u;
+/** Longest IPv6 literal in text form (RFC 4291 §2.2 with an embedded IPv4 address). */
+const MAX_IPV6_LITERAL_LENGTH = 45;
 const PORT_RE = /^[1-9][0-9]{0,4}$/u;
 /** Origin-form target: visible ASCII except `#`, no space, no control characters. */
 const TARGET_RE = /^\/[\x21-\x22\x24-\x7e]*$/u;
@@ -58,8 +60,8 @@ export function parseKpsAddress(value: string): KpsAddressParts {
     host = value.slice(1, end);
     rest = value.slice(end + 2);
     ipv6 = true;
-    if (!IPV6_CHARS_RE.test(host) || !host.includes(":")) {
-      throw malformed(value, "bracketed host is not an IPv6 literal");
+    if (!isIpv6Literal(host)) {
+      throw malformed(value, "bracketed host is not an IPv6 literal (zone IDs are not allowed)");
     }
   } else {
     const colon = value.indexOf(":");
@@ -82,6 +84,37 @@ export function parseKpsAddress(value: string): KpsAddressParts {
   validateCerthash(certhash, value);
   const address = `${ipv6 ? `[${host}]` : host}:${port}:${certhash}`;
   return { address, host, port, certhash, ipv6 };
+}
+
+/**
+ * True for an IPv6 address in RFC 4291 §2.2 text form: eight groups of 1-4 hex
+ * digits, at most one `::`, and optionally a dotted-quad IPv4 address as the
+ * last 32 bits. No zone ID (`%eth0`): it names a local interface.
+ */
+export function isIpv6Literal(value: string): boolean {
+  if (value.length < 2 || value.length > MAX_IPV6_LITERAL_LENGTH) return false;
+  const halves = value.split("::");
+  if (halves.length > 2) return false;
+  const groupsOf = (part: string): string[] | null => (part === "" ? [] : part.split(":"));
+  const head = groupsOf(halves[0] ?? "");
+  const tail = halves.length === 2 ? groupsOf(halves[1] ?? "") : [];
+  if (head === null || tail === null) return false;
+  const all = [...head, ...tail];
+  let units = 0;
+  for (let index = 0; index < all.length; index++) {
+    const group = all[index] ?? "";
+    const last = index === all.length - 1;
+    // An embedded IPv4 address is the last 32 bits, never just before "::".
+    if (last && group.includes(".") && (halves.length === 1 || tail.length > 0)) {
+      if (!IPV4_RE.test(group)) return false;
+      units += 2;
+    } else if (IPV6_GROUP_RE.test(group)) {
+      units += 1;
+    } else {
+      return false;
+    }
+  }
+  return halves.length === 2 ? units <= 7 : units === 8;
 }
 
 /** True when `value` is a well-formed KPS address. */
