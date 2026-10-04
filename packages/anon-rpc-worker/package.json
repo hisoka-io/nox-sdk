@@ -13,20 +13,22 @@
   "files": [
     "dist/anon-rpc-worker.js",
     "dist/anon-rpc-worker.js.keccak256",
-    "dist/provenance.json",
-    "src"
+    "dist/anon-rpc-worker.provenance.json",
+    "snapshot",
+    "src",
+    "README.md"
   ],
   "scripts": {
-    "build": "pnpm --filter @hisoka-io/nox-client build && node scripts/verify-snapshot.mjs --offline && node scripts/build.mjs && node scripts/provenance.mjs",
-    "build:bundle": "node scripts/build.mjs",
+    "build": "bash scripts/build-worker.sh",
+    "build:release": "bash scripts/build-worker.sh --release",
+    "build:bundle": "node scripts/build.mjs && node scripts/provenance.mjs",
     "hash": "node scripts/hash.mjs dist/anon-rpc-worker.js",
-    "provenance": "node scripts/provenance.mjs",
-    "snapshot": "pnpm --filter @hisoka-io/nox-client build && node scripts/snapshot.mjs",
+    "snapshot": "pnpm --filter @hisoka-io/nox-client build && node scripts/make-snapshot.mjs",
     "verify:snapshot": "pnpm --filter @hisoka-io/nox-client build && node scripts/verify-snapshot.mjs",
     "verify:reproducible": "bash scripts/verify-reproducible.sh",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.scripts.json",
     "lint": "pnpm run typecheck",
-    "test": "pnpm run typecheck && vitest run"
+    "test": "pnpm --filter @hisoka-io/nox-client build && pnpm run typecheck && vitest run"
   },
   "devDependencies": {
     "@hisoka-io/nox-client": "workspace:*",

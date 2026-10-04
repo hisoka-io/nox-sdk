@@ -4,15 +4,11 @@ export default defineConfig({
   test: {
     environment: "node",
     include: ["tests/**/*.test.ts"],
+    // The build scripts load the SDK's built entry with Node's own resolver,
+    // exactly as they do on the command line; Vite must not transform it.
+    server: { deps: { external: [/packages\/nox-client\/dist\//u] } },
     // Bundle builds run esbuild and compile WASM; give them room on slow hosts.
     testTimeout: 60_000,
     hookTimeout: 60_000,
-    server: {
-      deps: {
-        // Load the built SDK with Node itself: its lazy import("@hisoka-io/nox-wasm")
-        // runs only in classic mode and must not be resolved at transform time.
-        external: [/packages\/nox-client\/dist\//u],
-      },
-    },
   },
 });
