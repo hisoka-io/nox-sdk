@@ -17,7 +17,7 @@ import {
   type DeploymentPlan,
   type PlanRequest,
 } from "../tools/plan.ts";
-import { castCreateArgs } from "../tools/report.ts";
+import { castCreateArgs, renderPlan } from "../tools/report.ts";
 import { DEFAULT_RESOLVER_POLICY } from "../tools/resolvers.ts";
 import { harnessProvider, hexToBigInt } from "../tools/rpc.ts";
 import { SAMPLE_HASH, SAMPLE_RESOLVERS } from "./sample.ts";
@@ -37,6 +37,7 @@ function request(overrides: Partial<PlanRequest> = {}): PlanRequest {
     deployer,
     newOwner,
     resolverPolicy: DEFAULT_RESOLVER_POLICY,
+    checkResolvers: false,
     settings: { ...DEFAULT_PLAN_SETTINGS, anvilStartTimeoutMs: 30_000, rpcTimeoutMs: 15_000 },
     ...overrides,
   };
@@ -111,8 +112,18 @@ describe("planDeployment (dry run)", () => {
       "setWorker (next version: new hash, same resolver hosts)",
       "renounceOwnership (freeze this version)",
     ]);
+    expect(reference?.followUps.map((f) => f.kind)).toEqual(["transferOwnership", "setWorker", "renounceOwnership"]);
     for (const f of reference?.followUps ?? []) expect(f.gasUsedOnFork).toBeGreaterThan(21_000n);
     expect(plan.variants[0]?.followUps).toEqual([]);
+  });
+
+  it("renders a dry-run report with every variant and the ETH summary", () => {
+    const text = renderPlan(plan, { immutable: "immutable.hex", reference: "reference.hex" });
+    expect(text).toMatch(/^DRY RUN: nothing was signed or sent to the target chain/);
+    expect(text).toContain("ImmutableWorkerSpecifier: deploy: ");
+    expect(text).toContain("WorkerSpecifier: deploy + renounceOwnership: ");
+    expect(text).toContain("WorkerSpecifier: deploy + transferOwnership: ");
+    expect(text).toContain(`${deployer} holds 0.00000000 ETH`);
   });
 
   it("leaves the target chain untouched", async () => {

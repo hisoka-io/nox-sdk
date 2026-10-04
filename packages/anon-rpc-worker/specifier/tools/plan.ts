@@ -5,6 +5,7 @@
 
 import { getAddress } from "ethers";
 import { startAnvil, type Anvil } from "./anvil.ts";
+import { checkAvailability, type AvailabilityResult } from "./availability.ts";
 import { CONTRACTS, loadArtifact, type Variant } from "./artifacts.ts";
 import {
   codeKeccak,
@@ -14,6 +15,7 @@ import {
   setWorkerCalldata,
   transferOwnershipCalldata,
 } from "./deployment.ts";
+import { MAX_BUNDLE_BYTES } from "./harness.ts";
 import { checkResolvers, type ResolverPolicy, type ResolverReport } from "./resolvers.ts";
 import { expectHex, hexToBigInt, readOnlyRpc, redactUrl, toQuantity, waitForReceipt, type RpcClient } from "./rpc.ts";
 import { inspectSpecifier, type KnownArtifacts, type SpecifierInspection } from "./specifier.ts";
@@ -29,6 +31,8 @@ export type PlanSettings = {
   maxFeeBaseFeeMultiplier: bigint;
   anvilStartTimeoutMs: number;
   rpcTimeoutMs: number;
+  /** Body cap when fetching resolvers (the reference harness uses 64 MiB). */
+  maxBundleBytes: number;
 };
 
 export const DEFAULT_PLAN_SETTINGS: PlanSettings = {
@@ -38,6 +42,7 @@ export const DEFAULT_PLAN_SETTINGS: PlanSettings = {
   maxFeeBaseFeeMultiplier: 2n,
   anvilStartTimeoutMs: 90_000,
   rpcTimeoutMs: 60_000,
+  maxBundleBytes: MAX_BUNDLE_BYTES,
 };
 
 export type PlanRequest = {
@@ -51,6 +56,8 @@ export type PlanRequest = {
   /** Reference variant only: the account (e.g. a Safe) that takes ownership after deployment. */
   newOwner?: string;
   resolverPolicy: ResolverPolicy;
+  /** Fetch every https: resolver through the harness and compare with the hash (read-only GETs). */
+  checkResolvers: boolean;
   settings: PlanSettings;
 };
 
@@ -67,7 +74,10 @@ export type FeeSnapshot = {
   maxFeePerGas: bigint;
 };
 
+export type TxKind = "deploy" | "transferOwnership" | "setWorker" | "renounceOwnership";
+
 export type TxPlan = {
+  kind: TxKind;
   label: string;
   /** null for a contract creation. */
   to: string | null;
@@ -104,6 +114,8 @@ export type DeploymentPlan = {
   workerHash: `0x${string}`;
   resolvers: string[];
   resolverReport: ResolverReport;
+  /** Per-resolver fetch results, when requested. */
+  availability: AvailabilityResult[] | null;
   deployer: { address: string; nonce: bigint; balance: bigint } | null;
   newOwner: string | null;
   variants: VariantPlan[];
@@ -192,6 +204,7 @@ async function measure(
   fork: Fork,
   fees: FeeSnapshot,
   settings: PlanSettings,
+  kind: TxKind,
   label: string,
   to: string | null,
   data: `0x${string}`,
@@ -211,6 +224,7 @@ async function measure(
   return {
     created,
     tx: {
+      kind,
       label,
       to,
       data,
@@ -253,6 +267,7 @@ async function planVariant(
     fork,
     fees,
     request.settings,
+    "deploy",
     `deploy ${artifact.contract}`,
     null,
     code,
@@ -271,22 +286,28 @@ async function planVariant(
   const followUps: TxPlan[] = [];
   if (variant === "reference") {
     const nextHash = codeKeccak(workerHash);
-    const ops: { label: string; data: `0x${string}` }[] = [
+    const ops: { kind: TxKind; label: string; data: `0x${string}` }[] = [
       {
+        kind: "setWorker",
         label: "setWorker (next version: new hash, same resolver hosts)",
         data: setWorkerCalldata(nextHash, retargetResolvers(request.resolvers, workerHash, nextHash)),
       },
-      { label: "renounceOwnership (freeze this version)", data: renounceOwnershipCalldata() },
+      {
+        kind: "renounceOwnership",
+        label: "renounceOwnership (freeze this version)",
+        data: renounceOwnershipCalldata(),
+      },
     ];
     if (request.newOwner !== undefined) {
       ops.unshift({
+        kind: "transferOwnership",
         label: `transferOwnership to ${getAddress(request.newOwner)}`,
         data: transferOwnershipCalldata(request.newOwner),
       });
     }
     for (const op of ops) {
       const id = await snapshot(fork);
-      followUps.push((await measure(fork, fees, request.settings, op.label, created, op.data)).tx);
+      followUps.push((await measure(fork, fees, request.settings, op.kind, op.label, created, op.data)).tx);
       await revert(fork, id);
     }
   }
@@ -309,6 +330,9 @@ export async function planDeployment(request: PlanRequest): Promise<DeploymentPl
     throw new PlanError(`resolver list is not publishable:\n  - ${resolverReport.errors.join("\n  - ")}`);
   }
   if (request.variants.length === 0) throw new PlanError("no variant requested");
+  const availability = request.checkResolvers
+    ? await checkAvailability(workerHash, request.resolvers, { maxBytes: request.settings.maxBundleBytes })
+    : null;
   const artifacts: KnownArtifacts = {
     reference: await loadArtifact("reference"),
     immutable: await loadArtifact("immutable"),
@@ -355,6 +379,7 @@ export async function planDeployment(request: PlanRequest): Promise<DeploymentPl
     workerHash,
     resolvers: [...request.resolvers],
     resolverReport,
+    availability,
     deployer,
     newOwner: request.newOwner === undefined ? null : getAddress(request.newOwner),
     variants,

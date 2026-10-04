@@ -1,5 +1,6 @@
 // Human-readable rendering of plans and inspections, and the signer commands a plan hands over.
 
+import type { AvailabilityResult } from "./availability.ts";
 import type { DeploymentPlan, TxPlan, VariantPlan } from "./plan.ts";
 import type { SpecifierInspection } from "./specifier.ts";
 
@@ -74,6 +75,7 @@ export function renderPlan(plan: DeploymentPlan, files: Readonly<Record<string, 
     ...plan.resolvers.map((r, i) => `  [${i}] ${r}`),
   ];
   for (const w of plan.resolverReport.warnings) out.push(`warning: ${w}`);
+  if (plan.availability !== null) out.push(...renderAvailability(plan.availability));
   out.push("");
   for (const v of plan.variants) {
     out.push(variantBlock(plan, v, files[v.variant] ?? "<not saved>"), "");
@@ -82,11 +84,17 @@ export function renderPlan(plan: DeploymentPlan, files: Readonly<Record<string, 
     "ETH to hold in the deploying account (budget = gas limit x fee cap; expected = gas used x (base fee + tip)):",
   );
   for (const v of plan.variants) {
-    const all = [v.deploy, ...v.followUps.filter((t) => t.label.startsWith("transferOwnership"))];
-    const budget = all.reduce((s, t) => s + t.budget, 0n);
-    const expected = all.reduce((s, t) => s + t.costExpected, 0n);
-    const what = all.length > 1 ? "deploy + transferOwnership" : "deploy";
-    out.push(`  ${v.contract}: ${what}: budget ${formatEth(budget)}, expected ${formatEth(expected)}`);
+    const sequences: { what: string; txs: TxPlan[] }[] = [{ what: "deploy", txs: [v.deploy] }];
+    for (const kind of ["renounceOwnership", "transferOwnership"] as const) {
+      const followUp = v.followUps.find((t) => t.kind === kind);
+      if (followUp !== undefined) sequences.push({ what: `deploy + ${kind}`, txs: [v.deploy, followUp] });
+    }
+    for (const { what, txs } of sequences) {
+      const budget = txs.reduce((sum, t) => sum + t.budget, 0n);
+      const expected = txs.reduce((sum, t) => sum + t.costExpected, 0n);
+      const gas = txs.reduce((sum, t) => sum + t.gasUsedOnFork, 0n);
+      out.push(`  ${v.contract}: ${what}: ${gas} gas, expected ${formatEth(expected)}, budget ${formatEth(budget)}`);
+    }
   }
   if (plan.variants.length > 1) {
     const budget = plan.variants.reduce((s, v) => s + v.deploy.budget, 0n);
@@ -118,4 +126,11 @@ export function renderInspection(s: SpecifierInspection): string {
   for (const e of s.resolverReport.errors) lines.push(`  resolver issue: ${e}`);
   for (const w of s.resolverReport.warnings) lines.push(`  resolver note: ${w}`);
   return lines.join("\n");
+}
+
+export function renderAvailability(results: readonly AvailabilityResult[]): string[] {
+  return [
+    "resolver fetch check (through the harness's fetchAndVerifyBundle):",
+    ...results.map((r, i) => `  [${i}] ${r.status.toUpperCase()}: ${r.detail}`),
+  ];
 }

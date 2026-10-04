@@ -23,7 +23,7 @@ import { DEFAULT_RESOLVER_POLICY } from "../tools/resolvers.ts";
 const USAGE = `usage: pnpm plan -- (--hash 0x… | --bundle <file>) --resolver <entry> [--resolver <entry> …]
                     [--resolvers-file <json array>] [--variant immutable|reference|both]
                     [--deployer 0x…] [--new-owner 0x…] [--rpc-url <read-only RPC>] [--out <dir>]
-                    [--allow-unknown-kinds] [--json] [--dry-run]
+                    [--check-resolvers] [--allow-unknown-kinds] [--json] [--dry-run]
 Dry run only: nothing is signed or sent to the target chain.`;
 
 class UsageError extends Error {}
@@ -43,6 +43,7 @@ async function main(): Promise<void> {
       "rpc-url": { type: "string" },
       out: { type: "string" },
       "allow-unknown-kinds": { type: "boolean", default: false },
+      "check-resolvers": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: true },
       broadcast: { type: "boolean", default: false },
@@ -100,6 +101,7 @@ async function main(): Promise<void> {
     ...(values.deployer === undefined ? {} : { deployer: values.deployer }),
     ...(values["new-owner"] === undefined ? {} : { newOwner: values["new-owner"] }),
     resolverPolicy: { ...DEFAULT_RESOLVER_POLICY, allowUnknownKinds: values["allow-unknown-kinds"] },
+    checkResolvers: values["check-resolvers"],
     settings: DEFAULT_PLAN_SETTINGS,
   });
 

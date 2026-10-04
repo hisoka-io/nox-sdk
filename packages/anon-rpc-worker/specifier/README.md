@@ -60,7 +60,8 @@ pnpm --filter @hisoka-io/anon-rpc-specifier plan -- \
   --bundle path/to/nox-anon-rpc-worker.js \
   --resolver "https://cdn.jsdelivr.net/npm/@hisoka-io/anon-rpc-worker@<version>/dist/<file>.js" \
   --resolver "kps:<ip>:<udp-port>:<certhash>/keccak/<hh>/<rest>" \
-  [--variant immutable|reference|both] [--deployer 0x…] [--new-owner 0x…] [--rpc-url <read-only RPC>]
+  [--variant immutable|reference|both] [--deployer 0x…] [--new-owner 0x…] [--rpc-url <read-only RPC>] \
+  [--check-resolvers]
 ```
 
 The planner checks every resolver entry, reads fees and the latest block from the RPC (default
@@ -69,7 +70,9 @@ variant there and reads it back through the harness. It prints the creation code
 the expected cost (gas used x (base fee + tip)), a budget (gas limit x a fee cap of twice the base fee plus tip),
 and, with `--deployer`, that account's balance and the address the specifier will have if the deployment is its
 next transaction. It writes `plan.json`, `plan.txt` and
-the creation code to `plans/<timestamp>/`.
+the creation code to `plans/<timestamp>/`. With `--check-resolvers` it first downloads every `https:` resolver
+through the harness's `fetchAndVerifyBundle` and reports whether each one serves the pinned bytes; `kps:` entries are
+checked from a browser harness or a KPS QUIC client.
 
 The planner has no broadcast mode: it never signs and never sends to the target chain. Deploying is one creation
 transaction signed by the deployer's own wallet, for example
@@ -84,11 +87,12 @@ fork on 2026-10-03 with three `kps:` and three `https:` resolvers (721 bytes): 1
 
 ```sh
 pnpm --filter @hisoka-io/anon-rpc-specifier inspect -- --known            # passthrough, tor-js, Nym PoC
-pnpm --filter @hisoka-io/anon-rpc-specifier inspect -- 0x… [--json]
+pnpm --filter @hisoka-io/anon-rpc-specifier inspect -- 0x… [--fetch] [--json]
 ```
 
 Read-only: shows what a harness reads, which contract the runtime code is, the owner and update policy, the
-state-changing opcodes present, and the resolver checks.
+state-changing opcodes present, and the resolver checks. `--fetch` also downloads every `https:` resolver through the
+harness and compares it with `workerHash()`.
 
 ## License
 

@@ -4,15 +4,19 @@
 //   pnpm inspect -- [--rpc-url <read-only RPC>] [--json] (--known | <address> [<address> …])
 //
 // --known inspects the specifiers the anon-rpc ecosystem has on Ethereum mainnet (passthrough, tor-js, Nym PoC).
+// --fetch also downloads every https: resolver through the harness and checks it against workerHash().
 
 import { parseArgs } from "node:util";
 import { forgeBuild, loadArtifact } from "../tools/artifacts.ts";
 import { DEFAULT_MAINNET_RPC_URL, KNOWN_MAINNET_SPECIFIERS } from "../tools/constants.ts";
-import { renderInspection, toJson } from "../tools/report.ts";
+import { checkAvailability, type AvailabilityResult } from "../tools/availability.ts";
+import { MAX_BUNDLE_BYTES } from "../tools/harness.ts";
+import { renderAvailability, renderInspection, toJson } from "../tools/report.ts";
 import { DEFAULT_RPC_OPTIONS, readOnlyRpc } from "../tools/rpc.ts";
 import { inspectSpecifier, type SpecifierInspection } from "../tools/specifier.ts";
 
-const USAGE = "usage: pnpm inspect -- [--rpc-url <read-only RPC>] [--json] (--known | <address> [<address> …])";
+const USAGE =
+  "usage: pnpm inspect -- [--rpc-url <read-only RPC>] [--fetch] [--json] (--known | <address> [<address> …])";
 
 async function main(): Promise<void> {
   const { values, positionals } = parseArgs({
@@ -21,6 +25,7 @@ async function main(): Promise<void> {
     options: {
       "rpc-url": { type: "string" },
       known: { type: "boolean", default: false },
+      fetch: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       help: { type: "boolean", default: false },
     },
@@ -47,11 +52,17 @@ async function main(): Promise<void> {
     DEFAULT_RPC_OPTIONS,
   );
 
-  const results: (SpecifierInspection & { label: string })[] = [];
+  const results: (SpecifierInspection & { label: string; availability: AvailabilityResult[] | null })[] = [];
   for (const target of targets) {
     const inspection = await inspectSpecifier(rpc, target.address, artifacts);
-    results.push({ label: target.label, ...inspection });
-    if (!values.json) console.log(`${target.label === "" ? "" : `${target.label}: `}${renderInspection(inspection)}\n`);
+    const availability = values.fetch
+      ? await checkAvailability(inspection.workerHash, inspection.resolvers, { maxBytes: MAX_BUNDLE_BYTES })
+      : null;
+    results.push({ label: target.label, ...inspection, availability });
+    if (!values.json) {
+      const lines = [renderInspection(inspection), ...(availability === null ? [] : renderAvailability(availability))];
+      console.log(`${target.label === "" ? "" : `${target.label}: `}${lines.join("\n  ")}\n`);
+    }
   }
   if (values.json) console.log(toJson(results));
 }
