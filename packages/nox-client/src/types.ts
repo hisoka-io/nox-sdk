@@ -55,7 +55,12 @@ export interface TopologySnapshot {
 
 export interface TopologyNode {
   id: string;
-  /** HTTP ingress URL (from `ingress_url ?? url`). */
+  /**
+   * Entry endpoint. Classic mode: the HTTP(S) ingress URL (`ingress_url`).
+   * KPS mode: `kps:<ip>:<port>:<certhash>` from the member's `metadataUrl`.
+   * Empty when the node cannot be an entry in the current mode; it can still
+   * be a mix or an exit, which route by multiaddr.
+   */
   address: string;
   /** P2P multiaddr for Sphinx routing info. */
   routingAddress: string;
@@ -102,8 +107,157 @@ export interface NoxTransport {
   WebSocket?: NoxWebSocketConstructor | null;
 }
 
+/** `"classic"`: seeds, chain-verified topology, HTTP(S) entries (the default). `"kps"`: see `KpsModeOptions`. */
+export type NoxTransportMode = "classic" | "kps";
+
+/** SPEC §12 error codes of the KPS transport (anon-rpc SPEC.md §12). */
+export type KpsErrorCode =
+  | "cancelled"
+  | "closed"
+  | "reset"
+  | "timeout"
+  | "network-error"
+  | "protocol-error"
+  | "unsupported"
+  | "too-large"
+  | "queue-full"
+  | "permission-denied"
+  | "internal-error";
+
+/** Structural subset of anon-rpc SPEC §10/§12 (`KpsReason`). */
+export interface KpsReason {
+  code?: string;
+  message?: string;
+}
+
+/** Structural subset of anon-rpc SPEC §10.2 `KpsStream` and `@kpstreams/core`. */
+export interface KpsStreamLike {
+  readonly readable: ReadableStream<Uint8Array>;
+  readonly writable: WritableStream<Uint8Array>;
+  closeWrite(): void | Promise<void>;
+  resetWrite(reason?: KpsReason): void | Promise<void>;
+  close(reason?: KpsReason): void | Promise<void>;
+  readonly closed: Promise<{ ok: boolean; reason?: KpsReason }>;
+}
+
+/** Structural subset of anon-rpc SPEC §10.1 `KpsConn`. */
+export interface KpsConnLike {
+  openStream(opts?: { signal?: AbortSignal }): Promise<KpsStreamLike>;
+  close(reason?: KpsReason): Promise<void>;
+  readonly closed: Promise<{ ok: boolean; reason?: KpsReason }>;
+}
+
+/**
+ * Dials a KPS address (`<ip>:<port>:<certhash>`). The dialer authenticates the
+ * peer against the certhash (anon-rpc SPEC §10). In a worker:
+ * `(address, opts) => anonRpcWorker.kps.dial(address, opts)`.
+ */
+export type KpsDial = (address: string, opts?: { signal?: AbortSignal }) => Promise<KpsConnLike>;
+
+/** One pinned member (`nox-anon-rpc-snapshot/1`). */
+export interface PinnedMember {
+  address: string;
+  sphinxKey: string;
+  url: string;
+  ingressUrl: string;
+  metadataUrl: string;
+  stake: string;
+  role: 1 | 2 | 3;
+  layer: 0 | 1 | 2;
+  status: 1 | 2;
+  frozen: boolean;
+  capabilities: string[];
+}
+
+/** Parsed `nox-snapshot.json` (format `nox-anon-rpc-snapshot/1`): NoxRegistry at one block. */
+export interface PinnedSnapshot {
+  format: "nox-anon-rpc-snapshot/1";
+  chainId: number;
+  registry: string;
+  blockNumber: number;
+  blockHash: string;
+  fingerprint: string;
+  relayerCount: number;
+  powDifficulty: number;
+  members: PinnedMember[];
+}
+
+/** KPS mode inputs. There is no seed, no RPC and no HTTP(S) entry in this mode. */
+export interface KpsModeOptions {
+  /** Dialer, e.g. `(a, o) => anonRpcWorker.kps.dial(a, o)`. */
+  dial: KpsDial;
+  /** The pinned registry snapshot; its members are the only nodes the client trusts. */
+  pinned: PinnedSnapshot;
+  /** Allowed entry KPS addresses; each must belong to a pinned member. Default: every KPS-capable member. */
+  entries?: readonly string[];
+  /** Served topologies wanted per refresh. Default 2, range 1..4. */
+  topologySources?: number;
+  /** Anchors dialled at once during boot. Default 3. */
+  anchorParallelism?: number;
+  /** Bound on one dial. Default 10 s. */
+  dialTimeoutMs?: number;
+  /** Bound on opening one stream; openStream can hang when a connection dies. Default 10 s. */
+  openStreamTimeoutMs?: number;
+  /** Bound on one HTTP exchange. Default 15 s. */
+  exchangeTimeoutMs?: number;
+  /** Reply claim interval. Default 200 ms. */
+  claimIntervalMs?: number;
+  /** `GET /health` on an idle open connection after this long. Default 60 s. */
+  keepaliveMs?: number;
+  /** Largest accepted response head. Default 16 KiB. */
+  maxHeadBytes?: number;
+  /** Largest accepted response body. Default 16 MiB. */
+  maxBodyBytes?: number;
+  /** Clock skew tolerated on served topology timestamps. Default 600 s. */
+  clockSkewToleranceSeconds?: number;
+}
+
+/** WebAssembly bindings with the exports of `@hisoka-io/nox-wasm`, already initialised. */
+export type NoxWasmBindings = Record<string, unknown>;
+
+/** Initialised bindings, or a function that returns them. */
+export type NoxWasmProvider = NoxWasmBindings | (() => NoxWasmBindings | Promise<NoxWasmBindings>);
+
+export type NoxLogLevel = "debug" | "info" | "warn" | "error";
+
+/**
+ * Structured diagnostics. Events carry identifiers and counts only: never
+ * URLs, bodies, keys or SURB IDs.
+ */
+export type NoxLogSink = (
+  level: NoxLogLevel,
+  event: string,
+  fields?: Readonly<Record<string, string | number | boolean>>,
+) => void;
+
+/** Options of `NoxClient.httpRequest`. */
+export interface HttpRequestOptions {
+  /** Response timeout per attempt. Default: the client's `timeoutMs`. */
+  timeoutMs?: number;
+  /** Expected reply size; sizes the reply blocks. */
+  expectedResponseBytes?: number;
+  /** Adaptive reply-block budget key. Default `"httpRequest"`. */
+  opKey?: string;
+  /** Floor on reply blocks. */
+  minSurbs?: number;
+  /** Resend policy. Default: `"route"` for GET, HEAD and OPTIONS, `"none"` otherwise. */
+  retry?: "none" | "route";
+  /** Abort: rejects with `ABORTED` and frees the request's reply blocks at once. */
+  signal?: AbortSignal;
+  /** Largest reply accepted; a larger one fails with `RESPONSE_TOO_LARGE`. */
+  maxResponseBytes?: number;
+}
+
 /** Configuration for `NoxClient.connect()`. */
 export interface NoxClientConfig {
+  /** Default `"classic"`. */
+  mode?: NoxTransportMode;
+  /** Required when `mode` is `"kps"`, rejected otherwise. */
+  kps?: KpsModeOptions;
+  /** Application-supplied WASM bindings; skips `import("@hisoka-io/nox-wasm")`. */
+  wasm?: NoxWasmProvider;
+  /** Structured diagnostics sink. */
+  log?: NoxLogSink;
   seeds?: string[];
   ethRpcUrl?: string;
   registryAddress?: string;
@@ -131,8 +285,13 @@ export interface NoxClientConfig {
   transport?: NoxTransport;
 }
 
-/** Resolved client settings: every `NoxClientConfig` field except `transport`. */
-export type NoxClientSettings = Required<Omit<NoxClientConfig, "transport">>;
+/**
+ * Resolved client settings: the `NoxClientConfig` tuning fields (every field
+ * except `transport`, `mode`, `kps`, `wasm` and `log`).
+ */
+export type NoxClientSettings = Required<
+  Omit<NoxClientConfig, "transport" | "mode" | "kps" | "wasm" | "log">
+>;
 
 /**
  * Transport defaults. `ethRpcUrl` and `registryAddress` are empty on purpose:
@@ -189,4 +348,14 @@ export enum NoxClientErrorCode {
   PaidExitUnavailable = "PAID_EXIT_UNAVAILABLE",
   /** `surbFormat: "v2"` and no route on which every hop advertises `surb_v2`. */
   SurbV2Unavailable = "SURB_V2_UNAVAILABLE",
+  /** KPS mode: no pinned KPS entry answered. */
+  KpsUnavailable = "KPS_UNAVAILABLE",
+  /** A non-`kps:` endpoint in KPS mode, or KPS options in classic mode. */
+  ModeViolation = "MODE_VIOLATION",
+  /** KPS mode: the pinned member set no longer forms a route. */
+  TopologyStale = "TOPOLOGY_STALE",
+  /** The caller aborted the request. */
+  Aborted = "ABORTED",
+  /** The reply exceeded the caller's `maxResponseBytes`. */
+  ResponseTooLarge = "RESPONSE_TOO_LARGE",
 }

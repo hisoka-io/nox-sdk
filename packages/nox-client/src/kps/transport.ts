@@ -1,14 +1,27 @@
 /**
- * `NoxFetch` over KPS: each request is one KPS-HTTP/1 exchange on its own
- * stream, and streams share one reused connection per KPS address.
+ * `fetch` over KPS (ARCHITECTURE §3.5): each request is one `nox-kps-http/1`
+ * exchange on its own stream, and streams share one reused connection per KPS
+ * address, dialled through the injected `KpsDial` (never the per-stream
+ * `openStream(addr)` shortcut, which hides a new connection per stream).
  *
- * Only `kps:<address><path>` locators are accepted. Anything else is refused
- * with `NoxKpsError("unsupported")`; this module never reaches an ambient
- * `fetch`, so a KPS client cannot fall back to HTTPS.
+ * Only `kps:<address><target>` endpoints are accepted; anything else fails with
+ * `MODE_VIOLATION`. This module never reaches an ambient `fetch`, so a KPS
+ * client cannot fall back to HTTPS.
  */
-import { NoxClientError, NoxClientErrorCode, type NoxFetch } from "../types.js";
-import { parseKpsLocator, canonicalKpsAddress, kpsAddressLabel } from "./address.js";
-import { NoxKpsError, describeError, kpsErrorCodeOf, type KpsErrorCode } from "./errors.js";
+import {
+  NoxClientError,
+  NoxClientErrorCode,
+  type KpsConnLike,
+  type KpsDial,
+  type KpsErrorCode,
+  type KpsReason,
+  type KpsStreamLike,
+  type NoxFetch,
+  type NoxLogSink,
+} from "../types.js";
+import { secureRandomUnit } from "../utils.js";
+import { kpsAddressLabel, parseKpsAddress, parseKpsEndpoint } from "./address.js";
+import { NoxKpsError, describeError, kpsErrorCodeOf } from "./errors.js";
 import {
   encodeKpsHttpRequest,
   readKpsHttpResponseBody,
@@ -16,58 +29,84 @@ import {
   type KpsHttpReadLimits,
   type KpsHttpResponseHead,
 } from "./http1.js";
-import type {
-  NoxKpsConnection,
-  NoxKpsDialer,
-  NoxKpsReason,
-  NoxKpsStream,
-  NoxKpsTransportEvent,
-  NoxKpsTransportSettings,
-} from "./types.js";
 
-/** Transport defaults (tor-js bounds `openStream` at 20 s; Nox exchanges are small). */
-export const KPS_TRANSPORT_DEFAULTS: Readonly<NoxKpsTransportSettings> = Object.freeze({
-  dialTimeoutMs: 15_000,
+/** Where an exchange failed. `dial` and `open` mean the request was certainly not sent. */
+export type KpsFailurePhase = "dial" | "open" | "write" | "read" | "parse";
+
+/** `cause` of a `TRANSPORT_FAILED` error raised by the KPS transport. */
+export interface KpsFailureCause {
+  readonly phase: KpsFailurePhase;
+  readonly kpsCode?: KpsErrorCode;
+  /** The underlying error, for diagnostics only. */
+  readonly error?: unknown;
+}
+
+/** Transport counters for logs and demos; never per request. */
+export interface KpsFetchStats {
+  dialsOk: number;
+  dialsFailed: number;
+  streamsOpened: number;
+  bytesIn: number;
+  bytesOut: number;
+  lastExchangeMs?: number;
+}
+
+/** Every tunable of the KPS transport. */
+export interface KpsTransportSettings {
+  dialTimeoutMs: number;
+  openStreamTimeoutMs: number;
+  exchangeTimeoutMs: number;
+  keepaliveMs: number;
+  maxHeadBytes: number;
+  maxBodyBytes: number;
+  /** Cooldown after the first failed dial; doubles per failure, with jitter. */
+  redialBaseMs: number;
+  redialMaxMs: number;
+  /** Idle connections kept open (with keepalives); extras close after `idleCloseMs`. */
+  idleConnectionsKept: number;
+  idleCloseMs: number;
+  /** Streams open at once per connection, below `nox-kps`'s 64 (ARCHITECTURE §2.6). */
+  maxStreamsPerConnection: number;
+  /** Period of the idle and keepalive sweep. */
+  maintenanceIntervalMs: number;
+}
+
+/** Defaults (ARCHITECTURE §3.2, §3.5). */
+export const KPS_TRANSPORT_DEFAULTS: Readonly<KpsTransportSettings> = Object.freeze({
+  dialTimeoutMs: 10_000,
   openStreamTimeoutMs: 10_000,
-  headTimeoutMs: 15_000,
-  exchangeTimeoutMs: 45_000,
+  exchangeTimeoutMs: 15_000,
+  keepaliveMs: 60_000,
   maxHeadBytes: 16 * 1024,
-  maxResponseBytes: 16 * 1024 * 1024,
-  maxConcurrentStreams: 32,
-  redialBaseMs: 1_000,
-  redialMaxMs: 30_000,
+  maxBodyBytes: 16 * 1024 * 1024,
+  redialBaseMs: 500,
+  redialMaxMs: 15_000,
+  idleConnectionsKept: 2,
+  idleCloseMs: 30_000,
+  maxStreamsPerConnection: 32,
+  maintenanceIntervalMs: 5_000,
 });
 
-/** Fill and validate transport settings. Throws `INVALID_CONFIG`. */
+/** Route `nox-kps` answers itself; used for keepalives (ARCHITECTURE §2.9). */
+export const KPS_HEALTH_TARGET = "/health";
+
+/** Validate and fill transport settings. Throws `INVALID_CONFIG` naming the field. */
 export function resolveKpsTransportSettings(
-  overrides: Partial<NoxKpsTransportSettings> | undefined,
-): NoxKpsTransportSettings {
-  if (overrides !== undefined && (typeof overrides !== "object" || overrides === null)) {
-    throw new NoxClientError("kps.transport must be an object", NoxClientErrorCode.InvalidConfig);
-  }
-  const settings: NoxKpsTransportSettings = { ...KPS_TRANSPORT_DEFAULTS };
-  for (const key of Object.keys(overrides ?? {})) {
+  overrides: Partial<KpsTransportSettings> | undefined,
+): KpsTransportSettings {
+  const settings: KpsTransportSettings = { ...KPS_TRANSPORT_DEFAULTS };
+  for (const [key, value] of Object.entries(overrides ?? {})) {
     if (!(key in KPS_TRANSPORT_DEFAULTS)) {
-      throw new NoxClientError(
-        `kps.transport.${key} is not a KPS transport setting`,
-        NoxClientErrorCode.InvalidConfig,
-      );
+      throw new NoxClientError(`${key} is not a KPS transport setting`, NoxClientErrorCode.InvalidConfig);
     }
-    const value = (overrides as Record<string, unknown>)[key];
     if (value === undefined) continue;
     if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
-      throw new NoxClientError(
-        `kps.transport.${key} must be a positive safe integer`,
-        NoxClientErrorCode.InvalidConfig,
-      );
+      throw new NoxClientError(`kps.${key} must be a positive safe integer`, NoxClientErrorCode.InvalidConfig);
     }
     (settings as unknown as Record<string, number>)[key] = value;
   }
   if (settings.redialMaxMs < settings.redialBaseMs) {
-    throw new NoxClientError(
-      "kps.transport.redialMaxMs must be at least redialBaseMs",
-      NoxClientErrorCode.InvalidConfig,
-    );
+    throw new NoxClientError("kps redialMaxMs must be at least redialBaseMs", NoxClientErrorCode.InvalidConfig);
   }
   return settings;
 }
@@ -81,13 +120,15 @@ interface PoolEntry {
   readonly address: string;
   readonly label: string;
   readonly certhash: string;
-  dial: Promise<NoxKpsConnection> | null;
-  conn: NoxKpsConnection | null;
+  dial: Promise<KpsConnLike> | null;
+  conn: KpsConnLike | null;
   readonly teardowns: Set<(error: NoxKpsError) => void>;
   active: number;
   readonly waiters: StreamWaiter[];
   failures: number;
   coolUntil: number;
+  lastActivity: number;
+  keepaliveInFlight: boolean;
 }
 
 const NULL_BODY_STATUSES: ReadonlySet<number> = new Set([204, 205, 304]);
@@ -95,60 +136,81 @@ const STANDARD_METHODS = ["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT", "PA
 
 /** KPS-HTTP/1 client with a connection pool keyed by KPS address. */
 export class KpsHttpTransport {
-  /** `fetch`-compatible entry point; bind-free, safe to pass around. */
+  /** `fetch`-compatible entry point; safe to pass around unbound. */
   readonly fetch: NoxFetch;
   private readonly pool = new Map<string, PoolEntry>();
   private readonly limits: KpsHttpReadLimits;
+  private readonly counters: KpsFetchStats = {
+    dialsOk: 0,
+    dialsFailed: 0,
+    streamsOpened: 0,
+    bytesIn: 0,
+    bytesOut: 0,
+  };
+  private maintenance: ReturnType<typeof setInterval> | null = null;
   private closed = false;
 
   constructor(
-    private readonly dialer: NoxKpsDialer,
-    private readonly settings: NoxKpsTransportSettings = { ...KPS_TRANSPORT_DEFAULTS },
-    private readonly onEvent?: (event: NoxKpsTransportEvent) => void,
+    private readonly dial: KpsDial,
+    private readonly settings: KpsTransportSettings = { ...KPS_TRANSPORT_DEFAULTS },
+    private readonly log?: NoxLogSink,
+    private readonly random: () => number = secureRandomUnit,
   ) {
-    if (typeof dialer !== "object" || dialer === null || typeof dialer.dial !== "function") {
+    if (typeof dial !== "function") {
       throw new NoxClientError(
-        "KPS mode requires a dialer with a dial(address) function (anonRpcWorker.kps fits)",
+        "KPS mode requires kps.dial, a function (address, opts) => Promise<KpsConn>",
         NoxClientErrorCode.InvalidConfig,
       );
     }
-    this.limits = {
-      maxHeadBytes: settings.maxHeadBytes,
-      maxBodyBytes: settings.maxResponseBytes,
-    };
+    this.limits = { maxHeadBytes: settings.maxHeadBytes, maxBodyBytes: settings.maxBodyBytes };
     this.fetch = (input, init) => this.request(input, init);
   }
 
-  /** Make sure a connection to `address` is up (dialing if needed). */
+  /** Make sure a connection to `address` is up, dialling it if needed. */
   async warm(address: string, signal?: AbortSignal): Promise<void> {
-    await this.connection(this.entry(canonicalKpsAddress(address)), signal);
+    const entry = this.entry(parseKpsAddress(address).address);
+    try {
+      await this.connection(entry, signal);
+    } catch (error) {
+      throw this.failure(entry, "dial", error, undefined, "/");
+    }
   }
 
-  /** True while `address` is in its post-failure dial cooldown. */
+  /** True while `address` is in its dial cooldown after a failure. */
   isCoolingDown(address: string): boolean {
-    const entry = this.pool.get(canonicalKpsAddress(address));
+    const entry = this.pool.get(address);
     return entry !== undefined && entry.conn === null && entry.coolUntil > Date.now();
   }
 
   /** True when a connection to `address` is established. */
   isConnected(address: string): boolean {
-    return this.pool.get(canonicalKpsAddress(address))?.conn != null;
+    return this.pool.get(address)?.conn != null;
+  }
+
+  stats(): KpsFetchStats {
+    return { ...this.counters };
   }
 
   /** Close every connection and fail every waiting or in-flight exchange. */
-  close(): void {
+  async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    if (this.maintenance !== null) {
+      clearInterval(this.maintenance);
+      this.maintenance = null;
+    }
     const error = new NoxKpsError("KPS transport closed", "closed");
+    const closing: Promise<void>[] = [];
     for (const entry of this.pool.values()) {
       for (const waiter of entry.waiters.splice(0)) waiter.fail(error);
       for (const teardown of [...entry.teardowns]) teardown(error);
       entry.teardowns.clear();
       const conn = entry.conn;
       entry.conn = null;
-      if (conn !== null) void conn.close({ code: "closed" }).catch(noop);
+      if (conn !== null) closing.push(safeClose(conn, { code: "closed" }));
     }
     this.pool.clear();
+    await Promise.all(closing);
   }
 
   private entry(address: string): PoolEntry {
@@ -165,6 +227,8 @@ export class KpsHttpTransport {
         waiters: [],
         failures: 0,
         coolUntil: 0,
+        lastActivity: Date.now(),
+        keepaliveInFlight: false,
       };
       this.pool.set(address, entry);
     }
@@ -172,20 +236,35 @@ export class KpsHttpTransport {
   }
 
   private async request(input: string, init?: RequestInit): Promise<Response> {
-    if (this.closed) throw new NoxKpsError("KPS transport closed", "closed");
-    const locator = parseKpsLocator(String(input));
+    const endpoint = parseKpsEndpoint(String(input));
+    if (endpoint === null) {
+      const text = String(input);
+      const colon = text.indexOf(":");
+      const scheme = colon > 0 && colon <= 16 ? text.slice(0, colon + 1) : "(none)";
+      throw new NoxClientError(
+        `KPS mode only carries kps:<ip>:<port>:<certhash>/<path> endpoints; refused an endpoint with scheme ${scheme}`,
+        NoxClientErrorCode.ModeViolation,
+      );
+    }
+    if (this.closed) {
+      throw new NoxClientError("KPS transport closed", NoxClientErrorCode.TransportFailed, {
+        phase: "dial",
+        kpsCode: "closed",
+      } satisfies KpsFailureCause);
+    }
     const method = normalizeMethod(init?.method);
+    const entry = this.entry(endpoint.addr);
     const requestBytes = encodeKpsHttpRequest({
       method,
-      path: locator.path,
-      certhash: locator.certhash,
-      headers: headerPairs(init?.headers),
+      path: endpoint.target,
+      certhash: entry.certhash,
+      headers: contentTypeOnly(init?.headers),
       body: requestBody(init?.body),
     });
-    const entry = this.entry(locator.address);
     const callerSignal = init?.signal ?? undefined;
-    if (callerSignal?.aborted === true) throw abortReason(callerSignal);
+    if (isAborted(callerSignal)) throw abortReason(callerSignal);
 
+    const started = Date.now();
     const exchange = new AbortController();
     const fail = (error: unknown): void => {
       if (!exchange.signal.aborted) exchange.abort(error);
@@ -196,27 +275,33 @@ export class KpsHttpTransport {
       () =>
         fail(
           new NoxKpsError(
-            `KPS exchange ${method} ${locator.path} via ${entry.label} timed out after ${this.settings.exchangeTimeoutMs} ms`,
+            `KPS exchange ${method} ${endpoint.target} via ${entry.label} timed out after ${this.settings.exchangeTimeoutMs} ms`,
             "timeout",
           ),
         ),
       this.settings.exchangeTimeoutMs,
     );
 
+    let phase: KpsFailurePhase = "dial";
     let acquired = false;
-    let stream: NoxKpsStream | null = null;
-    let streamClosed = false;
-    const closeStream = (reason?: NoxKpsReason): void => {
-      if (stream === null || streamClosed) return;
-      streamClosed = true;
-      void stream.close(reason).catch(noop);
+    let stream: KpsStreamLike | null = null;
+    let streamDone = false;
+    const finishStream = (abandon: boolean): void => {
+      if (stream === null || streamDone) return;
+      streamDone = true;
+      const opened = stream;
+      if (abandon) void Promise.resolve(opened.resetWrite({ code: "cancelled" })).catch(noop);
+      void Promise.resolve(opened.close(abandon ? { code: "cancelled" } : undefined)).catch(noop);
     };
     let removeTeardown = noop;
     try {
       const conn = await this.connection(entry, exchange.signal);
+      phase = "open";
       await this.acquire(entry, exchange.signal);
       acquired = true;
+      entry.lastActivity = Date.now();
       stream = await this.openStream(entry, conn, exchange.signal);
+      this.counters.streamsOpened += 1;
       const opened = stream;
       removeTeardown = this.addTeardown(entry, conn, fail);
       const writer = opened.writable.getWriter();
@@ -225,56 +310,71 @@ export class KpsHttpTransport {
         "abort",
         () => {
           void reader.cancel(exchange.signal.reason).catch(noop);
-          closeStream({ code: "cancelled" });
+          finishStream(true);
         },
         { once: true },
       );
+      phase = "write";
       await raceSignal(writer.write(requestBytes), exchange.signal);
+      this.counters.bytesOut += requestBytes.length;
       // Closing the writable is closeWrite (SPEC §10.2): the request ends at EOF.
       await raceSignal(writer.close(), exchange.signal);
-      const headTimer = setTimeout(
-        () =>
-          fail(
-            new NoxKpsError(
-              `KPS exchange ${method} ${locator.path} via ${entry.label}: no response head within ${this.settings.headTimeoutMs} ms`,
-              "timeout",
-            ),
-          ),
-        this.settings.headTimeoutMs,
-      );
-      let head: KpsHttpResponseHead;
-      let rest: Uint8Array;
-      try {
-        ({ head, rest } = await raceSignal(
-          readKpsHttpResponseHead(reader, this.limits),
-          exchange.signal,
-        ));
-      } finally {
-        clearTimeout(headTimer);
-      }
+      phase = "read";
+      const { head, rest } = await raceSignal(readKpsHttpResponseHead(reader, this.limits), exchange.signal);
       const body = await raceSignal(
         readKpsHttpResponseBody(reader, head, rest, method, this.limits),
         exchange.signal,
       );
+      this.counters.bytesIn += body.length;
+      this.counters.lastExchangeMs = Date.now() - started;
+      entry.lastActivity = Date.now();
+      finishStream(false);
       return toResponse(head, body);
     } catch (error) {
+      finishStream(true);
       if (isAborted(callerSignal)) throw abortReason(callerSignal);
-      const failure = asKpsError(
+      throw this.failure(
+        entry,
+        phase,
         exchange.signal.aborted ? exchange.signal.reason : error,
-        `KPS exchange ${method} ${locator.path} via ${entry.label} failed`,
+        method,
+        endpoint.target,
       );
-      this.emit({ type: "exchange-failed", entry: entry.label, code: failure.code, route: locator.path });
-      throw failure;
     } finally {
       clearTimeout(exchangeTimer);
       callerSignal?.removeEventListener("abort", onCallerAbort);
       removeTeardown();
-      closeStream();
       if (acquired) this.release(entry);
     }
   }
 
-  private connection(entry: PoolEntry, signal?: AbortSignal): Promise<NoxKpsConnection> {
+  /** A `TRANSPORT_FAILED` error naming the phase, logged without payloads. */
+  private failure(
+    entry: PoolEntry,
+    phase: KpsFailurePhase,
+    error: unknown,
+    method: string | undefined,
+    target: string,
+  ): NoxClientError {
+    if (error instanceof NoxClientError) return error;
+    const kpsCode = kpsErrorCodeOf(error, "network-error");
+    const finalPhase: KpsFailurePhase =
+      phase === "read" && (kpsCode === "protocol-error" || kpsCode === "too-large") ? "parse" : phase;
+    this.emit("warn", "kps.exchange.failed", {
+      entry: entry.label,
+      route: target,
+      phase: finalPhase,
+      code: kpsCode,
+    });
+    const what = method === undefined ? "KPS dial" : `KPS ${method} ${target}`;
+    return new NoxClientError(
+      `${what} via ${entry.label} failed during ${finalPhase} (${kpsCode}): ${describeError(error)}`,
+      NoxClientErrorCode.TransportFailed,
+      { phase: finalPhase, kpsCode, error } satisfies KpsFailureCause,
+    );
+  }
+
+  private connection(entry: PoolEntry, signal?: AbortSignal): Promise<KpsConnLike> {
     if (this.closed) return Promise.reject(new NoxKpsError("KPS transport closed", "closed"));
     if (entry.conn !== null) return Promise.resolve(entry.conn);
     if (entry.dial === null) {
@@ -292,27 +392,24 @@ export class KpsHttpTransport {
     return raceSignal(entry.dial, signal);
   }
 
-  private startDial(entry: PoolEntry): Promise<NoxKpsConnection> {
+  private startDial(entry: PoolEntry): Promise<KpsConnLike> {
     const started = Date.now();
     const controller = new AbortController();
     const timeoutMs = this.settings.dialTimeoutMs;
     const timer = setTimeout(
-      () =>
-        controller.abort(
-          new NoxKpsError(`KPS dial to ${entry.label} timed out after ${timeoutMs} ms`, "timeout"),
-        ),
+      () => controller.abort(new NoxKpsError(`KPS dial to ${entry.label} timed out after ${timeoutMs} ms`, "timeout")),
       timeoutMs,
     );
-    let pending: Promise<NoxKpsConnection>;
+    let pending: Promise<KpsConnLike>;
     try {
-      pending = Promise.resolve(this.dialer.dial(entry.address, { signal: controller.signal }));
+      pending = Promise.resolve(this.dial(entry.address, { signal: controller.signal }));
     } catch (error) {
       pending = Promise.reject(error);
     }
     // A dial that completes after its deadline (or after close) is closed, not leaked.
     pending.then(
       (late) => {
-        if (controller.signal.aborted || this.closed) void safeClose(late);
+        if (controller.signal.aborted || this.closed) void safeClose(late, { code: "cancelled" });
       },
       noop,
     );
@@ -320,7 +417,7 @@ export class KpsHttpTransport {
       (conn) => {
         clearTimeout(timer);
         if (this.closed) {
-          void safeClose(conn);
+          void safeClose(conn, { code: "closed" });
           throw new NoxKpsError("KPS transport closed", "closed");
         }
         assertConnection(conn);
@@ -328,57 +425,57 @@ export class KpsHttpTransport {
         entry.conn = conn;
         entry.failures = 0;
         entry.coolUntil = 0;
+        entry.lastActivity = Date.now();
+        this.counters.dialsOk += 1;
         const onClosed = (info: unknown): void => {
           if (entry.conn === conn) entry.conn = null;
           const clean = typeof info === "object" && info !== null && (info as { ok?: unknown }).ok === true;
-          this.emit({ type: "connection-closed", entry: entry.label, clean });
+          this.emit("info", "kps.conn.closed", { entry: entry.label, clean });
           const error = new NoxKpsError(`KPS connection to ${entry.label} closed`, "closed");
           for (const teardown of [...entry.teardowns]) teardown(error);
           entry.teardowns.clear();
         };
         conn.closed.then(onClosed, onClosed);
-        this.emit({ type: "dialed", entry: entry.label, elapsedMs: Date.now() - started });
+        this.emit("info", "kps.dial.ok", { entry: entry.label, ms: Date.now() - started });
+        this.startMaintenance();
         return conn;
       },
       (error: unknown) => {
         clearTimeout(timer);
         entry.dial = null;
         entry.failures += 1;
-        const backoff = Math.min(
+        this.counters.dialsFailed += 1;
+        const ceiling = Math.min(
           this.settings.redialBaseMs * 2 ** Math.min(entry.failures - 1, 30),
           this.settings.redialMaxMs,
         );
+        const backoff = Math.max(1, Math.round(ceiling * (0.5 + 0.5 * this.random())));
         entry.coolUntil = Date.now() + backoff;
-        const failure = asKpsError(error, `KPS dial to ${entry.label} failed`, "network-error");
-        this.emit({
-          type: "dial-failed",
+        const code = kpsErrorCodeOf(error, "network-error");
+        this.emit("warn", "kps.dial.failed", {
           entry: entry.label,
-          code: failure.code,
+          code,
           failures: entry.failures,
           retryInMs: backoff,
         });
-        throw failure;
+        throw error instanceof NoxKpsError
+          ? error
+          : new NoxKpsError(`KPS dial to ${entry.label} failed: ${describeError(error)}`, code, error);
       },
     );
   }
 
-  private async openStream(
-    entry: PoolEntry,
-    conn: NoxKpsConnection,
-    signal: AbortSignal,
-  ): Promise<NoxKpsStream> {
+  private async openStream(entry: PoolEntry, conn: KpsConnLike, signal: AbortSignal): Promise<KpsStreamLike> {
     const controller = new AbortController();
     const timeoutMs = this.settings.openStreamTimeoutMs;
     const timer = setTimeout(
       () =>
-        controller.abort(
-          new NoxKpsError(`KPS openStream to ${entry.label} timed out after ${timeoutMs} ms`, "timeout"),
-        ),
+        controller.abort(new NoxKpsError(`KPS openStream to ${entry.label} timed out after ${timeoutMs} ms`, "timeout")),
       timeoutMs,
     );
     const onAbort = (): void => controller.abort(signal.reason);
     signal.addEventListener("abort", onAbort, { once: true });
-    let pending: Promise<NoxKpsStream>;
+    let pending: Promise<KpsStreamLike>;
     try {
       pending = Promise.resolve(conn.openStream({ signal: controller.signal }));
     } catch (error) {
@@ -386,7 +483,7 @@ export class KpsHttpTransport {
     }
     pending.then(
       (late) => {
-        if (controller.signal.aborted) void late.close({ code: "cancelled" }).catch(noop);
+        if (controller.signal.aborted) void Promise.resolve(late.close({ code: "cancelled" })).catch(noop);
       },
       noop,
     );
@@ -396,10 +493,10 @@ export class KpsHttpTransport {
       return stream;
     } catch (error) {
       // A stream that cannot be opened within the bound means the connection
-      // is wedged (kps ISSUES #14); drop it so the next exchange re-dials.
+      // is wedged (kps ISSUES #14): evict it so the next exchange redials.
       if (!signal.aborted && controller.signal.aborted && entry.conn === conn) {
         entry.conn = null;
-        void safeClose(conn);
+        void safeClose(conn, { code: "timeout" });
       }
       throw error;
     } finally {
@@ -409,7 +506,7 @@ export class KpsHttpTransport {
   }
 
   private acquire(entry: PoolEntry, signal: AbortSignal): Promise<void> {
-    if (entry.active < this.settings.maxConcurrentStreams) {
+    if (entry.active < this.settings.maxStreamsPerConnection) {
       entry.active += 1;
       return Promise.resolve();
     }
@@ -437,13 +534,14 @@ export class KpsHttpTransport {
 
   private release(entry: PoolEntry): void {
     entry.active = Math.max(0, entry.active - 1);
+    entry.lastActivity = Date.now();
     const next = entry.waiters.shift();
     if (next !== undefined) next.grant();
   }
 
   private addTeardown(
     entry: PoolEntry,
-    conn: NoxKpsConnection,
+    conn: KpsConnLike,
     teardown: (error: NoxKpsError) => void,
   ): () => void {
     if (entry.conn !== conn) {
@@ -456,20 +554,75 @@ export class KpsHttpTransport {
     };
   }
 
-  private emit(event: NoxKpsTransportEvent): void {
-    if (this.onEvent === undefined) return;
+  private startMaintenance(): void {
+    if (this.maintenance !== null || this.closed) return;
+    this.maintenance = setInterval(() => this.maintain(), this.settings.maintenanceIntervalMs);
+  }
+
+  /**
+   * Keep at most `idleConnectionsKept` idle connections, most recently used
+   * first, closing the others once idle for `idleCloseMs`; send `GET /health`
+   * on kept connections idle for `keepaliveMs` (keeps NAT bindings and the
+   * `nox-kps` idle timer alive, ARCHITECTURE §3.5).
+   */
+  private maintain(): void {
+    if (this.closed) return;
+    const now = Date.now();
+    const idle = [...this.pool.values()]
+      .filter((entry) => entry.conn !== null && entry.active === 0 && entry.waiters.length === 0)
+      .sort((left, right) => right.lastActivity - left.lastActivity);
+    for (const [index, entry] of idle.entries()) {
+      const idleFor = now - entry.lastActivity;
+      const conn = entry.conn;
+      if (conn === null) continue;
+      if (index >= this.settings.idleConnectionsKept) {
+        if (idleFor >= this.settings.idleCloseMs) {
+          entry.conn = null;
+          this.emit("debug", "kps.conn.idle-close", { entry: entry.label, idleMs: idleFor });
+          void safeClose(conn, { code: "closed" });
+        }
+        continue;
+      }
+      if (idleFor >= this.settings.keepaliveMs && !entry.keepaliveInFlight) {
+        entry.keepaliveInFlight = true;
+        this.request(`kps:${entry.address}${KPS_HEALTH_TARGET}`, { method: "GET" })
+          .then(
+            (response) => {
+              void response.arrayBuffer().catch(noop);
+            },
+            () => {
+              this.emit("warn", "kps.keepalive.failed", { entry: entry.label });
+            },
+          )
+          .finally(() => {
+            entry.keepaliveInFlight = false;
+          });
+      }
+    }
+    if (![...this.pool.values()].some((entry) => entry.conn !== null) && this.maintenance !== null) {
+      clearInterval(this.maintenance);
+      this.maintenance = null;
+    }
+  }
+
+  private emit(
+    level: "debug" | "info" | "warn" | "error",
+    event: string,
+    fields: Readonly<Record<string, string | number | boolean>>,
+  ): void {
+    if (this.log === undefined) return;
     try {
-      this.onEvent(event);
+      this.log(level, event, fields);
     } catch {
-      // Diagnostics are best effort; a throwing hook never breaks transport.
+      // Diagnostics are best effort; a throwing sink never breaks transport.
     }
   }
 }
 
 /**
  * Resolve with `promise` or reject with `signal.reason` once the signal aborts,
- * whichever comes first. The losing promise's rejection is observed so it can
- * never surface as unhandled.
+ * whichever comes first. The losing promise's rejection is observed so it never
+ * surfaces as unhandled.
  */
 export function raceSignal<T>(promise: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
   promise.catch(noop);
@@ -491,12 +644,20 @@ export function raceSignal<T>(promise: Promise<T>, signal: AbortSignal | undefin
   });
 }
 
-function asKpsError(error: unknown, context: string, fallback: KpsErrorCode = "network-error"): NoxKpsError {
-  if (error instanceof NoxKpsError) return error;
-  return new NoxKpsError(`${context}: ${describeError(error)}`, kpsErrorCodeOf(error, fallback), error);
+/** The KPS failure phase recorded on an error or its causes, if any. */
+export function kpsFailurePhase(error: unknown): KpsFailurePhase | undefined {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && typeof current === "object" && current !== null; depth++) {
+    const phase = (current as { phase?: unknown }).phase;
+    if (phase === "dial" || phase === "open" || phase === "write" || phase === "read" || phase === "parse") {
+      return phase;
+    }
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
 }
 
-/** Read through a function so TypeScript does not keep a stale narrowing. */
+/** Read through a function so TypeScript keeps no stale narrowing. */
 function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
 }
@@ -526,22 +687,22 @@ function requestBody(body: RequestInit["body"]): Uint8Array | null {
   );
 }
 
-function headerPairs(headers: RequestInit["headers"]): [string, string][] {
+/** Only `Content-Type` is taken from the caller; `Host` and `Content-Length` are computed. */
+function contentTypeOnly(headers: RequestInit["headers"]): [string, string][] {
   if (headers === undefined) return [];
+  let value: string | null = null;
   if (typeof Headers !== "undefined" && headers instanceof Headers) {
-    const pairs: [string, string][] = [];
-    headers.forEach((value, name) => pairs.push([name, value]));
-    return pairs;
+    value = headers.get("content-type");
+  } else if (Array.isArray(headers)) {
+    for (const pair of headers) {
+      if (Array.isArray(pair) && String(pair[0]).toLowerCase() === "content-type") value = String(pair[1]);
+    }
+  } else {
+    for (const [name, entry] of Object.entries(headers as Record<string, string>)) {
+      if (name.toLowerCase() === "content-type") value = String(entry);
+    }
   }
-  if (Array.isArray(headers)) {
-    return headers.map((pair) => {
-      if (!Array.isArray(pair) || pair.length !== 2) {
-        throw new NoxKpsError("KPS transport header pairs must be [name, value]", "protocol-error");
-      }
-      return [String(pair[0]), String(pair[1])];
-    });
-  }
-  return Object.entries(headers as Record<string, string>).map(([name, value]) => [name, String(value)]);
+  return value === null ? [] : [["Content-Type", value]];
 }
 
 function toResponse(head: KpsHttpResponseHead, body: Uint8Array<ArrayBuffer>): Response {
@@ -560,8 +721,8 @@ function toResponse(head: KpsHttpResponseHead, body: Uint8Array<ArrayBuffer>): R
   }
 }
 
-function assertConnection(conn: unknown): asserts conn is NoxKpsConnection {
-  const candidate = conn as Partial<NoxKpsConnection> | null;
+function assertConnection(conn: unknown): asserts conn is KpsConnLike {
+  const candidate = conn as Partial<KpsConnLike> | null;
   if (
     typeof candidate !== "object" ||
     candidate === null ||
@@ -569,31 +730,32 @@ function assertConnection(conn: unknown): asserts conn is NoxKpsConnection {
     typeof candidate.close !== "function" ||
     typeof (candidate.closed as Promise<unknown> | undefined)?.then !== "function"
   ) {
-    throw new NoxKpsError(
-      "KPS dialer returned an object without openStream/close/closed",
-      "protocol-error",
-    );
+    throw new NoxKpsError("KPS dial returned an object without openStream/close/closed", "protocol-error");
   }
 }
 
-function assertStream(stream: unknown): asserts stream is NoxKpsStream {
-  const candidate = stream as Partial<NoxKpsStream> | null;
+function assertStream(stream: unknown): asserts stream is KpsStreamLike {
+  const candidate = stream as Partial<KpsStreamLike> | null;
   if (
     typeof candidate !== "object" ||
     candidate === null ||
     typeof candidate.readable?.getReader !== "function" ||
     typeof candidate.writable?.getWriter !== "function" ||
-    typeof candidate.close !== "function"
+    typeof candidate.close !== "function" ||
+    typeof candidate.resetWrite !== "function"
   ) {
-    throw new NoxKpsError("KPS openStream returned an object without readable/writable/close", "protocol-error");
+    throw new NoxKpsError(
+      "KPS openStream returned an object without readable/writable/resetWrite/close",
+      "protocol-error",
+    );
   }
 }
 
-async function safeClose(conn: unknown): Promise<void> {
+async function safeClose(conn: unknown, reason: KpsReason): Promise<void> {
   try {
     const close = (conn as { close?: unknown } | null)?.close;
     if (typeof close === "function") {
-      await (close as (reason?: unknown) => Promise<void>).call(conn, { code: "cancelled" });
+      await (close as (reason?: KpsReason) => Promise<void>).call(conn, reason);
     }
   } catch {
     // Closing a connection nobody uses is best effort.

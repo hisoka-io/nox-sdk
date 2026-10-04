@@ -1,15 +1,20 @@
 /**
- * KPS addresses (KPS SPEC §2-§3) and `kps:` locators (anon-rpc SPEC §4.1).
+ * KPS addresses (KPS SPEC §2-§3), `kps:` endpoints (anon-rpc SPEC §4.1) and
+ * the `metadataUrl` publication format (ARCHITECTURE §6).
  *
  * An address is `<ipv4>:<udp-port>:<certhash>` or `[<ipv6>]:<udp-port>:<certhash>`.
  * The certhash is multibase `u` (base64url, no padding) of the multihash
- * `0x12 0x20 || sha256(certificate DER)`. A locator is `kps:<address><path>`;
- * it is deliberately not a URL and is split at the first `/` after the prefix.
+ * `0x12 0x20 || sha256(certificate DER)`, 47 characters. An endpoint is
+ * `kps:<address><target>`; it is deliberately not a URL, is never fed to
+ * `new URL`, and is split at the first `/` after the prefix.
  */
 import { NoxKpsError } from "./errors.js";
 
-/** Prefix of a KPS locator. */
-export const KPS_LOCATOR_PREFIX = "kps:";
+/** Prefix of a KPS endpoint. */
+export const KPS_ENDPOINT_PREFIX = "kps:";
+
+/** Path every node publishes after its address in `metadataUrl`. */
+export const KPS_METADATA_PATH = "/metadata.json";
 
 /** A parsed KPS address. `address` is the canonical string form. */
 export interface KpsAddressParts {
@@ -18,12 +23,6 @@ export interface KpsAddressParts {
   readonly port: number;
   readonly certhash: string;
   readonly ipv6: boolean;
-}
-
-/** A parsed `kps:<address><path>` locator. */
-export interface KpsLocator extends KpsAddressParts {
-  /** Origin-form request target, starting with `/`. */
-  readonly path: string;
 }
 
 const MULTIHASH_SHA2_256 = 0x12;
@@ -37,8 +36,8 @@ const IPV4_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9][0-9]|[0-9])";
 const IPV4_RE = new RegExp(`^${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3}$`, "u");
 const IPV6_CHARS_RE = /^[0-9A-Fa-f:.]{2,45}$/u;
 const PORT_RE = /^[1-9][0-9]{0,4}$/u;
-/** Visible ASCII except `#`: no space, no control characters, no fragment. */
-const PATH_RE = /^\/[\x21-\x22\x24-\x7e]*$/u;
+/** Origin-form target: visible ASCII except `#`, no space, no control characters. */
+const TARGET_RE = /^\/[\x21-\x22\x24-\x7e]*$/u;
 
 /**
  * Parse and validate a KPS address. Throws `NoxKpsError("protocol-error")`
@@ -85,50 +84,10 @@ export function parseKpsAddress(value: string): KpsAddressParts {
   return { address, host, port, certhash, ipv6 };
 }
 
-/** Canonical form of a KPS address (validated). */
-export function canonicalKpsAddress(value: string): string {
-  return parseKpsAddress(value).address;
-}
-
-/**
- * Parse `kps:<address><path>`. The address ends at the first `/` (certhashes
- * and bracketed IPv6 hosts never contain one). Throws
- * `NoxKpsError("unsupported")` when `value` is not a `kps:` locator and
- * `NoxKpsError("protocol-error")` when it is malformed.
- */
-export function parseKpsLocator(value: string): KpsLocator {
-  if (typeof value !== "string" || !value.startsWith(KPS_LOCATOR_PREFIX)) {
-    throw new NoxKpsError(
-      "KPS transport only carries kps:<ip>:<port>:<certhash>/<path> locators; refusing a non-KPS target",
-      "unsupported",
-    );
-  }
-  const rest = value.slice(KPS_LOCATOR_PREFIX.length);
-  const slash = rest.indexOf("/");
-  if (slash <= 0) {
-    throw new NoxKpsError("KPS locator has no /<path> after the address", "protocol-error");
-  }
-  const parts = parseKpsAddress(rest.slice(0, slash));
-  const path = rest.slice(slash);
-  if (!PATH_RE.test(path)) {
-    throw new NoxKpsError(
-      "KPS locator path must be origin-form visible ASCII without spaces or a fragment",
-      "protocol-error",
-    );
-  }
-  return { ...parts, path };
-}
-
-/** `kps:<address>` entry locator for a validated address. */
-export function kpsEntryLocator(address: string): string {
-  return `${KPS_LOCATOR_PREFIX}${canonicalKpsAddress(address)}`;
-}
-
-/** True when `value` is a well-formed `kps:<address>` entry locator. */
-export function isKpsEntryLocator(value: string): boolean {
-  if (typeof value !== "string" || !value.startsWith(KPS_LOCATOR_PREFIX)) return false;
+/** True when `value` is a well-formed KPS address. */
+export function isKpsAddress(value: string): boolean {
   try {
-    parseKpsAddress(value.slice(KPS_LOCATOR_PREFIX.length));
+    parseKpsAddress(value);
     return true;
   } catch {
     return false;
@@ -136,20 +95,58 @@ export function isKpsEntryLocator(value: string): boolean {
 }
 
 /**
- * KPS address published in a registry `metadataUrl`: `kps:<address>` or
- * `kps:<address>/<path>`. Returns `undefined` for anything else (empty,
- * https, ...). Throws when the value claims `kps:` but is malformed, so a bad
- * publication is reported instead of silently ignored.
+ * Split `kps:<address><target>` at the first `/` after the prefix (anon-rpc
+ * SPEC §4.1). Returns `null` for anything that is not a well-formed KPS
+ * endpoint with an origin-form target.
  */
-export function kpsAddressFromMetadataUrl(metadataUrl: string | undefined): string | undefined {
-  if (metadataUrl === undefined || !metadataUrl.startsWith(KPS_LOCATOR_PREFIX)) return undefined;
-  const rest = metadataUrl.slice(KPS_LOCATOR_PREFIX.length);
+export function parseKpsEndpoint(value: string): { addr: string; target: string } | null {
+  if (typeof value !== "string" || !value.startsWith(KPS_ENDPOINT_PREFIX)) return null;
+  const rest = value.slice(KPS_ENDPOINT_PREFIX.length);
   const slash = rest.indexOf("/");
-  const address = slash < 0 ? rest : rest.slice(0, slash);
-  if (slash >= 0 && !PATH_RE.test(rest.slice(slash))) {
-    throw new NoxKpsError("metadataUrl kps: locator has an invalid path", "protocol-error");
+  if (slash <= 0) return null;
+  const target = rest.slice(slash);
+  if (!TARGET_RE.test(target)) return null;
+  try {
+    return { addr: parseKpsAddress(rest.slice(0, slash)).address, target };
+  } catch {
+    return null;
   }
-  return canonicalKpsAddress(address);
+}
+
+/** The entry endpoint `kps:<address>` of a validated address. */
+export function kpsEntryEndpoint(address: string): string {
+  return `${KPS_ENDPOINT_PREFIX}${parseKpsAddress(address).address}`;
+}
+
+/** The KPS address of an entry endpoint `kps:<address>`, or `null`. */
+export function kpsAddressOfEntry(endpoint: string): string | null {
+  if (typeof endpoint !== "string" || !endpoint.startsWith(KPS_ENDPOINT_PREFIX)) return null;
+  try {
+    return parseKpsAddress(endpoint.slice(KPS_ENDPOINT_PREFIX.length)).address;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * KPS address published in a registry `metadataUrl`:
+ * exactly `kps:<address>/metadata.json` (ARCHITECTURE §6). Anything else
+ * (empty, https, another path, a malformed address) means "this node has no
+ * KPS endpoint" and returns `null`.
+ */
+export function kpsAddrFromMetadataUrl(metadataUrl: string): string | null {
+  if (typeof metadataUrl !== "string" || !metadataUrl.startsWith(KPS_ENDPOINT_PREFIX)) return null;
+  const rest = metadataUrl.slice(KPS_ENDPOINT_PREFIX.length);
+  const slash = rest.indexOf("/");
+  if (slash <= 0 || rest.slice(slash) !== KPS_METADATA_PATH) return null;
+  try {
+    const parts = parseKpsAddress(rest.slice(0, slash));
+    // The published string must already be canonical, or two spellings would
+    // name one identity.
+    return parts.address === rest.slice(0, slash) ? parts.address : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Short, non-sensitive label for logs: the first characters of the certhash. */

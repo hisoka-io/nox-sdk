@@ -2,37 +2,53 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   KPS_TRANSPORT_DEFAULTS,
   KpsHttpTransport,
+  kpsFailurePhase,
   resolveKpsTransportSettings,
+  type KpsFailureCause,
+  type KpsTransportSettings,
 } from "../src/kps/transport.js";
-import { NoxKpsError } from "../src/kps/errors.js";
-import { NoxClientError, NoxClientErrorCode } from "../src/types.js";
-import type { NoxKpsTransportEvent, NoxKpsTransportSettings } from "../src/kps/types.js";
+import { createKpsFetch } from "../src/kps/fetch.js";
+import { NoxClientError, NoxClientErrorCode, type NoxLogLevel, type PinnedSnapshot } from "../src/types.js";
 import { FakeKpsNetwork, json, kpsAddressFor } from "./helpers/fake_kps.js";
 
 const A = kpsAddressFor(1);
 const B = kpsAddressFor(2);
 
+interface LoggedEvent {
+  level: NoxLogLevel;
+  event: string;
+  fields: Readonly<Record<string, string | number | boolean>> | undefined;
+}
+
 function transport(
   network: FakeKpsNetwork,
-  overrides: Partial<NoxKpsTransportSettings> = {},
-  events?: NoxKpsTransportEvent[],
+  overrides: Partial<KpsTransportSettings> = {},
+  events?: LoggedEvent[],
 ): KpsHttpTransport {
   return new KpsHttpTransport(
-    network.dialer,
+    network.dial,
     resolveKpsTransportSettings(overrides),
-    events === undefined ? undefined : (event) => events.push(event),
+    events === undefined ? undefined : (level, event, fields) => events.push({ level, event, fields }),
+    () => 1,
   );
 }
 
-async function expectKpsFailure(promise: Promise<unknown>, code: string): Promise<NoxKpsError> {
+async function expectTransportFailure(
+  promise: Promise<unknown>,
+  phase: KpsFailureCause["phase"],
+  kpsCode?: string,
+): Promise<NoxClientError> {
   try {
     await promise;
   } catch (error) {
-    expect(error).toBeInstanceOf(NoxKpsError);
-    expect((error as NoxKpsError).code).toBe(code);
-    return error as NoxKpsError;
+    expect(error).toBeInstanceOf(NoxClientError);
+    expect((error as NoxClientError).code).toBe(NoxClientErrorCode.TransportFailed);
+    const cause = (error as NoxClientError).cause as KpsFailureCause;
+    expect(cause.phase).toBe(phase);
+    if (kpsCode !== undefined) expect(cause.kpsCode).toBe(kpsCode);
+    return error as NoxClientError;
   }
-  throw new Error(`expected NoxKpsError(${code})`);
+  throw new Error(`expected TRANSPORT_FAILED during ${phase}`);
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -49,20 +65,25 @@ describe("KpsHttpTransport", () => {
     const packet = new Uint8Array(32_768).fill(7);
     const response = await kps.fetch(`kps:${A}/api/v1/packets`, {
       method: "POST",
-      headers: { "Content-Type": "application/octet-stream" },
+      headers: { "Content-Type": "application/octet-stream", "X-Ignored": "1" },
       body: packet,
     });
     expect(response).toBeInstanceOf(Response);
     expect(response.status).toBe(202);
-    expect(response.ok).toBe(true);
     expect(await response.text()).toBe("got 32768");
     const [request] = network.requests;
     expect(request?.method).toBe("POST");
     expect(request?.path).toBe("/api/v1/packets");
-    expect(request?.headers).toContainEqual(["host", A.slice(A.lastIndexOf(":") + 1)]);
-    expect(request?.headers).toContainEqual(["content-length", "32768"]);
+    // Exactly Host, Content-Type and Content-Length (ARCHITECTURE §3.5).
+    expect(request?.headers).toEqual([
+      ["host", A.slice(A.lastIndexOf(":") + 1)],
+      ["content-type", "application/octet-stream"],
+      ["content-length", "32768"],
+    ]);
     expect(request?.body).toEqual(packet);
-    kps.close();
+    expect(kps.stats()).toMatchObject({ dialsOk: 1, dialsFailed: 0, streamsOpened: 1 });
+    expect(kps.stats().bytesOut).toBeGreaterThan(32_768);
+    await kps.close();
   });
 
   it("reuses one connection and opens one stream per request", async () => {
@@ -70,18 +91,16 @@ describe("KpsHttpTransport", () => {
     network.route(undefined, () => json(200, []));
     const kps = transport(network);
     const results = await Promise.all(
-      Array.from({ length: 6 }, () =>
+      Array.from({ length: 100 }, () =>
         kps.fetch(`kps:${A}/api/v1/responses/claim`, { method: "POST", body: JSON.stringify({ surb_ids: [] }) })
       ),
     );
     expect(results.every((response) => response.status === 200)).toBe(true);
     expect(network.dials).toEqual([A]);
-    expect(network.streamsOpened).toBe(6);
-    await sleep(0);
-    expect(network.streamsClosed).toBe(6);
+    expect(network.streamsOpened).toBe(100);
     await kps.fetch(`kps:${B}/topology`);
     expect(network.dials).toEqual([A, B]);
-    kps.close();
+    await kps.close();
   });
 
   it("maps 204 to a null-body Response and keeps response headers", async () => {
@@ -92,31 +111,37 @@ describe("KpsHttpTransport", () => {
     expect(response.status).toBe(204);
     expect(response.headers.get("x-a")).toBe("1, 2");
     expect(await response.text()).toBe("");
-    kps.close();
+    await kps.close();
   });
 
-  it("refuses non-kps targets without dialing or touching the global fetch", async () => {
+  it("refuses non-kps endpoints with MODE_VIOLATION, without dialing or the global fetch", async () => {
     const network = new FakeKpsNetwork();
     const globalFetch = vi.spyOn(globalThis, "fetch");
     const kps = transport(network);
-    await expectKpsFailure(kps.fetch("https://nox-1.hisoka.io/api/v1/packets", { method: "POST" }), "unsupported");
-    await expectKpsFailure(kps.fetch("http://127.0.0.1:15002/topology"), "unsupported");
+    for (const input of ["https://nox-1.hisoka.io/api/v1/packets", "http://127.0.0.1:15002/topology", "kps:bad/x"]) {
+      const error = await kps.fetch(input, { method: "POST" }).then(
+        () => undefined,
+        (failure: unknown) => failure,
+      );
+      expect(error).toMatchObject({ code: NoxClientErrorCode.ModeViolation });
+      // The message names the scheme, never the full endpoint.
+      expect((error as Error).message).not.toContain("nox-1.hisoka.io");
+    }
     expect(network.dials).toEqual([]);
     expect(globalFetch).not.toHaveBeenCalled();
-    kps.close();
+    await kps.close();
   });
 
   it("refuses request bodies it cannot carry", async () => {
     const network = new FakeKpsNetwork();
     const kps = transport(network);
-    await expectKpsFailure(
-      kps.fetch(`kps:${A}/x`, { method: "POST", body: new Blob(["x"]) }),
-      "unsupported",
-    );
-    kps.close();
+    await expect(kps.fetch(`kps:${A}/x`, { method: "POST", body: new Blob(["x"]) })).rejects.toMatchObject({
+      code: "unsupported",
+    });
+    await kps.close();
   });
 
-  it("re-dials after the connection closes", async () => {
+  it("redials after the connection closes", async () => {
     const network = new FakeKpsNetwork();
     network.route(A, () => json(200, { ok: true }));
     const kps = transport(network);
@@ -126,63 +151,75 @@ describe("KpsHttpTransport", () => {
     expect(kps.isConnected(A)).toBe(false);
     await kps.fetch(`kps:${A}/topology`);
     expect(network.dials).toEqual([A, A]);
-    kps.close();
+    await kps.close();
   });
 
-  it("fails in-flight exchanges when their connection dies", async () => {
+  it("fails in-flight exchanges when their connection dies, without throwing on closed {ok:false}", async () => {
     const network = new FakeKpsNetwork();
     network.route(A, () => ({ hang: true }));
-    const kps = transport(network);
+    const events: LoggedEvent[] = [];
+    const kps = transport(network, {}, events);
     const pending = kps.fetch(`kps:${A}/api/v1/responses/claim`, { method: "POST", body: "{}" });
     await sleep(5);
     network.connections[0]!.kill();
-    await expectKpsFailure(pending, "closed");
-    kps.close();
+    await expectTransportFailure(pending, "read", "closed");
+    expect(events).toContainEqual(expect.objectContaining({ event: "kps.conn.closed", fields: expect.objectContaining({ clean: false }) }));
+    await kps.close();
   });
 
   it("shares one in-flight dial between concurrent callers", async () => {
     const network = new FakeKpsNetwork();
     network.route(A, () => json(200, {}));
-    const dial = vi.spyOn(network.dialer, "dial");
-    const kps = transport(network);
+    const dial = vi.fn(network.dial);
+    const kps = new KpsHttpTransport(dial, resolveKpsTransportSettings({}));
     await Promise.all([kps.warm(A), kps.warm(A), kps.fetch(`kps:${A}/topology`)]);
     expect(dial).toHaveBeenCalledTimes(1);
-    kps.close();
+    await kps.close();
   });
 
-  it("bounds the dial and cools the address down after a failure", async () => {
+  it("bounds the dial and cools the address down after a failure (phase dial)", async () => {
     const network = new FakeKpsNetwork();
     network.hangDial.add(A);
-    const events: NoxKpsTransportEvent[] = [];
+    const events: LoggedEvent[] = [];
     const kps = transport(network, { dialTimeoutMs: 30, redialBaseMs: 200, redialMaxMs: 400 }, events);
-    await expectKpsFailure(kps.warm(A), "timeout");
+    await expectTransportFailure(kps.warm(A), "dial", "timeout");
     expect(kps.isCoolingDown(A)).toBe(true);
     // During the cooldown the address fails fast without another dial.
-    const fast = await expectKpsFailure(kps.fetch(`kps:${A}/topology`), "network-error");
+    const fast = await expectTransportFailure(kps.fetch(`kps:${A}/topology`), "dial", "network-error");
     expect(fast.message).toMatch(/cooling down/u);
     expect(network.dials).toEqual([A]);
     expect(events).toContainEqual(
-      expect.objectContaining({ type: "dial-failed", code: "timeout", failures: 1, retryInMs: 200 }),
+      expect.objectContaining({
+        event: "kps.dial.failed",
+        fields: expect.objectContaining({ code: "timeout", failures: 1, retryInMs: 200 }),
+      }),
     );
-    kps.close();
+    expect(kps.stats().dialsFailed).toBe(1);
+    await kps.close();
   });
 
-  it("doubles the cooldown per consecutive failure up to the cap", async () => {
+  it("doubles the cooldown per failure up to the cap, with jitter in [0.5, 1]", async () => {
     const network = new FakeKpsNetwork();
     network.refuse.add(A);
-    const events: NoxKpsTransportEvent[] = [];
+    const events: LoggedEvent[] = [];
     const kps = transport(network, { redialBaseMs: 10, redialMaxMs: 25 }, events);
     for (let attempt = 0; attempt < 3; attempt++) {
-      await expectKpsFailure(kps.warm(A), "network-error");
+      await expectTransportFailure(kps.warm(A), "dial", "network-error");
       await sleep(30);
     }
-    const waits = events.flatMap((event) => (event.type === "dial-failed" ? [event.retryInMs] : []));
+    const waits = events.flatMap((entry) => (entry.event === "kps.dial.failed" ? [entry.fields?.["retryInMs"]] : []));
     expect(waits).toEqual([10, 20, 25]);
     network.refuse.delete(A);
     network.route(A, () => json(200, {}));
     await kps.fetch(`kps:${A}/topology`);
     expect(kps.isConnected(A)).toBe(true);
-    kps.close();
+    await kps.close();
+
+    const jittered = new KpsHttpTransport(network.dial, resolveKpsTransportSettings({ redialBaseMs: 100 }), undefined, () => 0);
+    network.refuse.add(B);
+    await expect(jittered.warm(B)).rejects.toBeInstanceOf(NoxClientError);
+    expect(jittered.isCoolingDown(B)).toBe(true);
+    await jittered.close();
   });
 
   it("closes a connection that finishes dialing after its deadline", async () => {
@@ -191,50 +228,42 @@ describe("KpsHttpTransport", () => {
     const late = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const original = network.dialer.dial;
-    vi.spyOn(network.dialer, "dial").mockImplementation(async (address, opts) => {
+    const dial = async (address: string, opts?: { signal?: AbortSignal }) => {
       await late;
-      return original(address, opts);
-    });
-    const kps = transport(network, { dialTimeoutMs: 20 });
-    await expectKpsFailure(kps.warm(A), "timeout");
+      return network.dial(address, opts);
+    };
+    const kps = new KpsHttpTransport(dial, resolveKpsTransportSettings({ dialTimeoutMs: 20 }));
+    await expectTransportFailure(kps.warm(A), "dial", "timeout");
     release();
     await sleep(5);
     expect(network.connections[0]?.open).toBe(false);
-    kps.close();
+    await kps.close();
   });
 
-  it("bounds openStream and drops a wedged connection", async () => {
+  it("bounds openStream (phase open) and evicts a wedged connection", async () => {
     const network = new FakeKpsNetwork();
     network.route(A, () => json(200, {}));
     const kps = transport(network, { openStreamTimeoutMs: 20 });
     await kps.warm(A);
     network.connections[0]!.hangOpenStream = true;
-    await expectKpsFailure(kps.fetch(`kps:${A}/topology`), "timeout");
+    await expectTransportFailure(kps.fetch(`kps:${A}/topology`), "open", "timeout");
     expect(network.connections[0]!.open).toBe(false);
     await kps.fetch(`kps:${A}/topology`);
     expect(network.dials).toEqual([A, A]);
-    kps.close();
+    await kps.close();
   });
 
-  it("bounds the wait for the response head", async () => {
+  it("bounds the whole exchange (phase read when the reply never comes)", async () => {
     const network = new FakeKpsNetwork();
     network.route(A, () => ({ hang: true }));
-    const kps = transport(network, { headTimeoutMs: 25 });
-    const error = await expectKpsFailure(kps.fetch(`kps:${A}/topology`), "timeout");
-    expect(error.message).toMatch(/no response head within 25 ms/u);
-    kps.close();
+    const kps = transport(network, { exchangeTimeoutMs: 25 });
+    const error = await expectTransportFailure(kps.fetch(`kps:${A}/topology`), "read", "timeout");
+    expect(error.message).toMatch(/timed out after 25 ms/u);
+    expect(kpsFailurePhase(error)).toBe("read");
+    await kps.close();
   });
 
-  it("bounds the whole exchange", async () => {
-    const network = new FakeKpsNetwork();
-    network.hangDial.add(A);
-    const kps = transport(network, { exchangeTimeoutMs: 20, dialTimeoutMs: 10_000 });
-    await expectKpsFailure(kps.fetch(`kps:${A}/topology`), "timeout");
-    kps.close();
-  });
-
-  it("rejects with the caller's abort reason and releases the stream", async () => {
+  it("rejects with the caller's abort reason and resets the stream", async () => {
     const network = new FakeKpsNetwork();
     network.route(A, () => ({ hang: true }));
     const kps = transport(network);
@@ -252,14 +281,14 @@ describe("KpsHttpTransport", () => {
     const already = new AbortController();
     already.abort(new Error("stop"));
     await expect(kps.fetch(`kps:${A}/topology`, { signal: already.signal })).rejects.toThrow("stop");
-    kps.close();
+    await kps.close();
   });
 
   it("caps concurrent streams per connection and queues the rest in order", async () => {
     const network = new FakeKpsNetwork();
     const gates: (() => void)[] = [];
     network.route(A, () => new Promise((resolve) => gates.push(() => resolve(json(200, {})))));
-    const kps = transport(network, { maxConcurrentStreams: 2 });
+    const kps = transport(network, { maxStreamsPerConnection: 2 });
     const all = Array.from({ length: 5 }, () => kps.fetch(`kps:${A}/topology`));
     await sleep(10);
     expect(network.streamsOpened).toBe(2);
@@ -269,27 +298,30 @@ describe("KpsHttpTransport", () => {
     }
     const responses = await Promise.all(all);
     expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200, 200]);
-    kps.close();
+    await kps.close();
   });
 
-  it("reports protocol violations from the peer", async () => {
+  it("reports peer protocol violations as phase parse", async () => {
     const network = new FakeKpsNetwork();
     network.route(A, () => ({ raw: "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n0\r\n\r\n" }));
-    const events: NoxKpsTransportEvent[] = [];
+    const events: LoggedEvent[] = [];
     const kps = transport(network, {}, events);
-    await expectKpsFailure(kps.fetch(`kps:${A}/topology`), "protocol-error");
+    await expectTransportFailure(kps.fetch(`kps:${A}/topology`), "parse", "protocol-error");
     expect(events).toContainEqual(
-      expect.objectContaining({ type: "exchange-failed", code: "protocol-error", route: "/topology" }),
+      expect.objectContaining({
+        event: "kps.exchange.failed",
+        fields: expect.objectContaining({ code: "protocol-error", route: "/topology", phase: "parse" }),
+      }),
     );
-    kps.close();
+    await kps.close();
   });
 
   it("caps response bodies", async () => {
     const network = new FakeKpsNetwork();
     network.route(A, () => ({ status: 200, body: "x".repeat(2048), contentLength: false }));
-    const kps = transport(network, { maxResponseBytes: 1024 });
-    await expectKpsFailure(kps.fetch(`kps:${A}/topology`), "too-large");
-    kps.close();
+    const kps = transport(network, { maxBodyBytes: 1024 });
+    await expectTransportFailure(kps.fetch(`kps:${A}/topology`), "parse", "too-large");
+    await kps.close();
   });
 
   it("fails waiting and new exchanges once closed", async () => {
@@ -298,20 +330,46 @@ describe("KpsHttpTransport", () => {
     const kps = transport(network);
     const pending = kps.fetch(`kps:${A}/topology`);
     await sleep(5);
-    kps.close();
-    await expectKpsFailure(pending, "closed");
-    await expectKpsFailure(kps.fetch(`kps:${A}/topology`), "closed");
+    await kps.close();
+    await expectTransportFailure(pending, "read", "closed");
+    await expectTransportFailure(kps.fetch(`kps:${A}/topology`), "dial", "closed");
     expect(network.connections[0]!.open).toBe(false);
   });
 
-  it("never lets a throwing event hook break an exchange", async () => {
+  it("never lets a throwing log sink break an exchange", async () => {
     const network = new FakeKpsNetwork();
     network.route(A, () => json(200, {}));
-    const kps = new KpsHttpTransport(network.dialer, resolveKpsTransportSettings({}), () => {
-      throw new Error("hook");
+    const kps = new KpsHttpTransport(network.dial, resolveKpsTransportSettings({}), () => {
+      throw new Error("sink");
     });
     expect((await kps.fetch(`kps:${A}/topology`)).status).toBe(200);
-    kps.close();
+    await kps.close();
+  });
+
+  it("sends keepalives on kept idle connections and closes extra idle ones", async () => {
+    const network = new FakeKpsNetwork();
+    network.route(undefined, (request) => json(200, { path: request.path }));
+    const C = kpsAddressFor(3);
+    const kps = transport(network, {
+      maintenanceIntervalMs: 10,
+      keepaliveMs: 30,
+      idleCloseMs: 30,
+      idleConnectionsKept: 2,
+    });
+    await kps.fetch(`kps:${C}/topology`);
+    await sleep(2);
+    await kps.fetch(`kps:${B}/topology`);
+    await sleep(2);
+    await kps.fetch(`kps:${A}/topology`);
+    await sleep(120);
+    // C is the least recently used of three idle connections: closed.
+    expect(kps.isConnected(C)).toBe(false);
+    expect(kps.isConnected(A)).toBe(true);
+    expect(kps.isConnected(B)).toBe(true);
+    const keepalives = network.requests.filter((request) => request.path === "/health");
+    expect(keepalives.length).toBeGreaterThan(0);
+    expect(new Set(keepalives.map((request) => request.address))).toEqual(new Set([A, B]));
+    await kps.close();
   });
 });
 
@@ -330,13 +388,30 @@ describe("resolveKpsTransportSettings", () => {
       { dialTimeoutMs: "5" },
       { redialBaseMs: 100, redialMaxMs: 50 },
     ]) {
-      expect(() => resolveKpsTransportSettings(bad as Partial<NoxKpsTransportSettings>)).toThrow(
+      expect(() => resolveKpsTransportSettings(bad as Partial<KpsTransportSettings>)).toThrow(
         expect.objectContaining({ code: NoxClientErrorCode.InvalidConfig }),
       );
     }
   });
 
-  it("requires a dialer with dial()", () => {
+  it("requires a dial function", () => {
     expect(() => new KpsHttpTransport({} as never)).toThrow(NoxClientError);
+  });
+});
+
+describe("createKpsFetch", () => {
+  it("is a callable fetch with close() and stats()", async () => {
+    const network = new FakeKpsNetwork();
+    network.route(A, () => json(200, { ok: true }));
+    const kpsFetch = createKpsFetch({
+      dial: network.dial,
+      pinned: {} as PinnedSnapshot,
+      exchangeTimeoutMs: 1_000,
+    });
+    const response = await kpsFetch(`kps:${A}/topology`);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(kpsFetch.stats()).toMatchObject({ dialsOk: 1, streamsOpened: 1 });
+    await kpsFetch.close();
+    await expect(kpsFetch(`kps:${A}/topology`)).rejects.toMatchObject({ code: NoxClientErrorCode.TransportFailed });
   });
 });

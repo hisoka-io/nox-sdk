@@ -1,19 +1,9 @@
 /**
- * Error vocabulary of the KPS transport (KPS SPEC §9.1, anon-rpc SPEC §12).
- * Callers branch on `code`; `message` is diagnostic only.
+ * Internal failure type of the KPS transport. `code` uses the SPEC §12
+ * vocabulary; `createKpsFetch` turns these into `NoxClientError`s whose
+ * `cause` names the phase that failed.
  */
-export type KpsErrorCode =
-  | "cancelled"
-  | "closed"
-  | "reset"
-  | "timeout"
-  | "network-error"
-  | "protocol-error"
-  | "unsupported"
-  | "too-large"
-  | "queue-full"
-  | "permission-denied"
-  | "internal-error";
+import type { KpsErrorCode } from "../types.js";
 
 const KPS_ERROR_CODES: ReadonlySet<string> = new Set<KpsErrorCode>([
   "cancelled",

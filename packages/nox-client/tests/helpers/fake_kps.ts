@@ -5,12 +5,9 @@
  * test runs exactly as it would against `anonRpcWorker.kps`.
  */
 import { createHash } from "node:crypto";
-import type {
-  NoxKpsCloseInfo,
-  NoxKpsConnection,
-  NoxKpsDialer,
-  NoxKpsStream,
-} from "../../src/kps/types.js";
+import type { KpsConnLike, KpsDial, KpsReason, KpsStreamLike } from "../../src/types.js";
+
+type CloseInfo = { ok: boolean; reason?: KpsReason };
 
 /** Deterministic, well-formed certhash for a label. */
 export function certhashFor(label: string): string {
@@ -67,9 +64,9 @@ function toBytes(value: Uint8Array | string | undefined): Uint8Array {
   return typeof value === "string" ? encoder.encode(value) : value;
 }
 
-export class FakeConnection implements NoxKpsConnection {
-  readonly closed: Promise<NoxKpsCloseInfo>;
-  private readonly settle: (info: NoxKpsCloseInfo) => void;
+export class FakeConnection implements KpsConnLike {
+  readonly closed: Promise<CloseInfo>;
+  private readonly settle: (info: CloseInfo) => void;
   private readonly abortStreams = new Set<(reason: unknown) => void>();
   open = true;
   streamsOpened = 0;
@@ -80,15 +77,15 @@ export class FakeConnection implements NoxKpsConnection {
     readonly address: string,
     private readonly network: FakeKpsNetwork,
   ) {
-    const done = deferred<NoxKpsCloseInfo>();
+    const done = deferred<CloseInfo>();
     this.closed = done.promise;
     this.settle = done.resolve;
   }
 
-  async openStream(opts?: { signal?: AbortSignal }): Promise<NoxKpsStream> {
+  async openStream(opts?: { signal?: AbortSignal }): Promise<KpsStreamLike> {
     if (!this.open) throw Object.assign(new Error("connection closed"), { code: "closed" });
     if (this.hangOpenStream) {
-      return new Promise<NoxKpsStream>((_resolve, reject) => {
+      return new Promise<KpsStreamLike>((_resolve, reject) => {
         opts?.signal?.addEventListener("abort", () => reject(opts.signal?.reason), { once: true });
       });
     }
@@ -96,14 +93,14 @@ export class FakeConnection implements NoxKpsConnection {
     this.network.streamsOpened += 1;
     const clientToServer = new TransformStream<Uint8Array, Uint8Array>();
     const serverToClient = new TransformStream<Uint8Array, Uint8Array>();
-    const streamClosed = deferred<NoxKpsCloseInfo>();
+    const streamClosed = deferred<CloseInfo>();
     const serverWriter = serverToClient.writable.getWriter();
     const abort = (reason: unknown): void => {
       void serverWriter.abort(reason).catch(() => {});
       streamClosed.resolve({ ok: false, reason: { code: "reset" } });
     };
     this.abortStreams.add(abort);
-    const stream: NoxKpsStream = {
+    const stream: KpsStreamLike = {
       readable: serverToClient.readable,
       writable: clientToServer.writable,
       closeWrite: async () => {
@@ -135,7 +132,7 @@ export class FakeConnection implements NoxKpsConnection {
     this.shutdown({ ok: false, reason: { code: "network-error", message: "peer gone" } });
   }
 
-  private shutdown(info: NoxKpsCloseInfo): void {
+  private shutdown(info: CloseInfo): void {
     if (!this.open) return;
     this.open = false;
     for (const abort of [...this.abortStreams]) abort(new Error("connection closed"));
@@ -157,21 +154,20 @@ export class FakeKpsNetwork {
   private readonly handlers = new Map<string, FakeHandler>();
   private fallback: FakeHandler | undefined;
 
-  readonly dialer: NoxKpsDialer = {
-    dial: async (address, opts) => {
-      this.dials.push(address);
-      if (this.hangDial.has(address)) {
-        return new Promise<NoxKpsConnection>((_resolve, reject) => {
-          opts?.signal?.addEventListener("abort", () => reject(opts.signal?.reason), { once: true });
-        });
-      }
-      if (this.refuse.has(address)) {
-        throw Object.assign(new Error(`dial ${address} refused`), { code: "network-error" });
-      }
-      const conn = new FakeConnection(address, this);
-      this.connections.push(conn);
-      return conn;
-    },
+  /** Dialer typed like `(a, o) => anonRpcWorker.kps.dial(a, o)`. */
+  readonly dial: KpsDial = async (address, opts) => {
+    this.dials.push(address);
+    if (this.hangDial.has(address)) {
+      return new Promise<KpsConnLike>((_resolve, reject) => {
+        opts?.signal?.addEventListener("abort", () => reject(opts.signal?.reason), { once: true });
+      });
+    }
+    if (this.refuse.has(address)) {
+      throw Object.assign(new Error(`dial ${address} refused`), { code: "network-error" });
+    }
+    const conn = new FakeConnection(address, this);
+    this.connections.push(conn);
+    return conn;
   };
 
   /** Answer requests to `address` (or every address when omitted). */
