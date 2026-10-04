@@ -1,0 +1,43 @@
+{
+  "node_count": 3,
+  "entry_url": "http://127.0.0.1:27002",
+  "anvil_rpc_url": "http://127.0.0.1:28545",
+  "nodes": [
+    {
+      "id": 0,
+      "p2p_port": 27000,
+      "metrics_port": 27001,
+      "ingress_port": 27002,
+      "sphinx_public_key": "f4ff98441b81b8483542854c6c1d403cb783795192377b8789bd6296d4464c31",
+      "peer_id": "12D3KooWPj9F1mKbnmhgecC1DXhvsD9xp8vMNkLqWa6sz3rd8qGt",
+      "p2p_multiaddr": "/ip4/127.0.0.1/tcp/27000/p2p/12D3KooWPj9F1mKbnmhgecC1DXhvsD9xp8vMNkLqWa6sz3rd8qGt",
+      "layer": 0,
+      "role": 1,
+      "legacy": false
+    },
+    {
+      "id": 1,
+      "p2p_port": 27010,
+      "metrics_port": 27011,
+      "ingress_port": 27012,
+      "sphinx_public_key": "366a5db086cb79118f25b7646a0b17041875f874feebe8c088ba6f618fc27228",
+      "peer_id": "12D3KooWCyMBbrb7LrZbWW4VQWoXbenPLPJUQLdHm3dDT52NHmDj",
+      "p2p_multiaddr": "/ip4/127.0.0.1/tcp/27010/p2p/12D3KooWCyMBbrb7LrZbWW4VQWoXbenPLPJUQLdHm3dDT52NHmDj",
+      "layer": 1,
+      "role": 1,
+      "legacy": false
+    },
+    {
+      "id": 2,
+      "p2p_port": 27020,
+      "metrics_port": 27021,
+      "ingress_port": 27022,
+      "sphinx_public_key": "b0fdcb2cc42e3422dc6a6eef621914cc28af658a809c98f2b446441a6f3fd413",
+      "peer_id": "12D3KooWRAAzhG2GHoq8bTHuDkRz8AYa9Ant2eQKW5oo42uZAhZG",
+      "p2p_multiaddr": "/ip4/127.0.0.1/tcp/27020/p2p/12D3KooWRAAzhG2GHoq8bTHuDkRz8AYa9Ant2eQKW5oo42uZAhZG",
+      "layer": 2,
+      "role": 1,
+      "legacy": false
+    }
+  ]
+}

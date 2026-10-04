@@ -1,0 +1,14 @@
+# nox-kps config for one bed L mesh node, rendered per node by the test bed
+# (src/kps-server.ts renderTemplate; NOX_KPS_CONFIG_TEMPLATE points here).
+# Keys follow ARCHITECTURE §2.10; loopback advertise needs allow_private_advertise.
+listen = "{listen}"
+advertise = ["{advertise_ip}"]
+allow_private_advertise = true
+key_file = "{key_file}"
+node_address = "{node_address}"
+upstream_ingress = "127.0.0.1:{ingress_port}"
+upstream_topology = "127.0.0.1:{topology_port}"
+keccak_dir = "{bundle_dir}"
+admin_listen = "127.0.0.1:{admin_port}"
+log_level = "info"
+summary_interval_secs = 0

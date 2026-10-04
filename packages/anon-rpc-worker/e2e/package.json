@@ -1,0 +1,37 @@
+{
+  "name": "@hisoka-io/anon-rpc-worker-e2e",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local end-to-end test bed for the Nox anon-rpc worker: a local Nox mesh, anvil chains, the reference anon-rpc browser harness under headless Chromium, and a WebRTC-KPS probe.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json && tsc -p page/tsconfig.json && tsc -p workers/tsconfig.json",
+    "test": "vitest run",
+    "e2e": "playwright test",
+    "e2e:all": "bash scripts/run-all.sh",
+    "testbed": "tsx src/cli/testbed.ts",
+    "build:kps-servers": "bash scripts/build-kps-servers.sh",
+    "compile:specifier": "bash scripts/compile-specifier.sh"
+  },
+  "devDependencies": {
+    "@anon-rpc/browser-harness": "0.3.2",
+    "@anon-rpc/browser-harness-0.3.0": "npm:@anon-rpc/browser-harness@0.3.0",
+    "@kpstreams/webrtc-client": "0.2.1",
+    "@noble/hashes": "1.8.0",
+    "@playwright/test": "1.63.0",
+    "@types/node": "20.19.37",
+    "esbuild": "0.27.3",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3",
+    "vitest": "1.6.1"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
