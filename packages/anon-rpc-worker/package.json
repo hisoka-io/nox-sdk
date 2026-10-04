@@ -1,0 +1,46 @@
+{
+  "name": "@hisoka-io/anon-rpc-worker",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Nox mixnet worker for the anon-rpc standard, built as one reproducible classic-script bundle with a pinned NoxRegistry snapshot",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/hisoka-io/nox-sdk",
+    "directory": "packages/anon-rpc-worker"
+  },
+  "type": "module",
+  "files": [
+    "dist/anon-rpc-worker.js",
+    "dist/anon-rpc-worker.js.keccak256",
+    "dist/anon-rpc-worker.provenance.json",
+    "snapshot",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bash scripts/build-worker.sh",
+    "build:release": "bash scripts/build-worker.sh --release",
+    "build:bundle": "node scripts/build.mjs && node scripts/provenance.mjs",
+    "hash": "node scripts/hash.mjs dist/anon-rpc-worker.js",
+    "snapshot": "pnpm --filter @hisoka-io/nox-client build && node scripts/make-snapshot.mjs",
+    "verify:snapshot": "pnpm --filter @hisoka-io/nox-client build && node scripts/verify-snapshot.mjs",
+    "verify:reproducible": "bash scripts/verify-reproducible.sh",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.scripts.json",
+    "lint": "pnpm run typecheck",
+    "test": "pnpm --filter @hisoka-io/nox-client build && pnpm run typecheck && vitest run"
+  },
+  "devDependencies": {
+    "@hisoka-io/nox-client": "workspace:*",
+    "@hisoka-io/nox-wasm": "workspace:*",
+    "@noble/hashes": "1.3.2",
+    "@types/node": "20.19.37",
+    "esbuild": "0.27.3",
+    "ethers": "6.16.0",
+    "typescript": "5.9.3",
+    "vitest": "1.6.1"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

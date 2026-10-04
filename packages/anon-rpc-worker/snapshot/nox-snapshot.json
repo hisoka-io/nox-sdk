@@ -1,0 +1,165 @@
+{
+  "blockHash": "0x602a6bd6b0215f8f4a6446aeaaa8d02a6b744f4f2e57a12bd7df522a59055f6f",
+  "blockNumber": 315527209,
+  "chainId": 421614,
+  "fingerprint": "14ca3b69d6defe50fe55b6d332e6c9734db74f460ce5a8ac280c651724147c75",
+  "format": "nox-anon-rpc-snapshot/1",
+  "members": [
+    {
+      "address": "0x03a42846c18b99c453a49d7fce69f336f865c48b",
+      "capabilities": [
+        "paid_v2",
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-7.hisoka.io",
+      "layer": 2,
+      "metadataUrl": "",
+      "role": 2,
+      "sphinxKey": "8e45d54ad4a2c0ef37cdaae8e96ebaa4340349d992842f71e7040c083de35159",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/3.226.251.110/tcp/15000/p2p/12D3KooWBSxJfPWDy62QV9dLFszXsGXmZZbPhWUcTxVFLMm4V58u"
+    },
+    {
+      "address": "0x074a13b271b73eb5c0c44e2037d035e7eef4a462",
+      "capabilities": [
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-8.hisoka.io",
+      "layer": 0,
+      "metadataUrl": "",
+      "role": 1,
+      "sphinxKey": "75be9d18699ff203954de69d4c01d910e0145a857247a8a97ed03c4c96f8a218",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/34.237.170.1/tcp/15000/p2p/12D3KooWHRrstZES9nWvSuCDwDwxSYw6LaPS17wDG5LSrE3auZqf"
+    },
+    {
+      "address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+      "capabilities": [
+        "paid_v2",
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-10.hisoka.io",
+      "layer": 2,
+      "metadataUrl": "",
+      "role": 2,
+      "sphinxKey": "fb1c36ec544ec521bb2bebb23d8112af312d3e0355112f79d7a6c64fa451dc58",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/13.223.188.90/tcp/15000/p2p/12D3KooWA1HTTJqhbz2kpc7VMzv5DQaTvoLTcw8sAsq1ox6Zy5is"
+    },
+    {
+      "address": "0x3e98ee4572741fd932e031ac60e79f7c012758be",
+      "capabilities": [
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-3.hisoka.io",
+      "layer": 1,
+      "metadataUrl": "",
+      "role": 1,
+      "sphinxKey": "c186c5b41f4b091031d09d02a746aca08881b9fbd971b84df075dfa49945ff07",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/34.204.201.90/tcp/15000/p2p/12D3KooWPvjTZWYfWmgqSU6jJUHpx1pZLGP2UjUZ5Pj8XE7Fpi6Z"
+    },
+    {
+      "address": "0x6774ca4baf6fff84f02898a3dee4299ed1f5ab4e",
+      "capabilities": [
+        "paid_v2",
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-6.hisoka.io",
+      "layer": 2,
+      "metadataUrl": "",
+      "role": 2,
+      "sphinxKey": "14ddde0c03fe50557da24b08792ba70c005c088bd930c33ce43fdae2b1e30438",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/98.92.70.228/tcp/15000/p2p/12D3KooWDMVywxDi57fgiNtBzFvkxC91iBpe477bzeGYX34SFoMZ"
+    },
+    {
+      "address": "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9",
+      "capabilities": [
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-1.hisoka.io",
+      "layer": 0,
+      "metadataUrl": "",
+      "role": 1,
+      "sphinxKey": "fa2271baee00cf2530e77d53a87e7805e2b2e09fffbd64fa14fed4aff308c54e",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/3.236.170.102/tcp/15000/p2p/12D3KooWQreA53yq2jzkPNsDkADdJ8Nf3kKvGH4tUKqyJ8aMo2h3"
+    },
+    {
+      "address": "0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463",
+      "capabilities": [
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-4.hisoka.io",
+      "layer": 1,
+      "metadataUrl": "",
+      "role": 1,
+      "sphinxKey": "9fc0ccb9988e44a8fc9f3f7113922cbd4adf285782b6bbfb68bee29b12c5877a",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/3.239.73.249/tcp/15000/p2p/12D3KooWB39are1EBChmFgr9jZCsfc4mAwSX76bFMWsJvVdMdyVN"
+    },
+    {
+      "address": "0x8c9fb3e9fe537067c8430480f80a4a5b9a12be1a",
+      "capabilities": [
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-2.hisoka.io",
+      "layer": 1,
+      "metadataUrl": "",
+      "role": 1,
+      "sphinxKey": "5f08041dd05df4d1ad1018d67e51d2061aaf2f5cf40b7fb040cc8515836bf453",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/18.214.97.24/tcp/15000/p2p/12D3KooWEe1c5hFTjuzxvmjFtwHpTvFWwUrYbkdnSAdVr1TUTLQd"
+    },
+    {
+      "address": "0xbeb31ac0c57b3765cb855fa02081eadb9edb2426",
+      "capabilities": [
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-9.hisoka.io",
+      "layer": 0,
+      "metadataUrl": "",
+      "role": 1,
+      "sphinxKey": "03ab8c7779654df276a55224afe4b918e07aae490834017e89c66367b4339733",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/3.238.86.161/tcp/15000/p2p/12D3KooWMqmA6KmoH1jASRE26bJ87CN5HmToCx1TTo5ws8U941XK"
+    },
+    {
+      "address": "0xf8681a0acb60effcd9c169226e6f9c1ae9dd7894",
+      "capabilities": [
+        "surb_v2"
+      ],
+      "frozen": false,
+      "ingressUrl": "https://nox-5.hisoka.io",
+      "layer": 1,
+      "metadataUrl": "",
+      "role": 1,
+      "sphinxKey": "af535083ca6d0f7e64a1470595578706b11ff5b1652faeb572a2f52664107909",
+      "stake": "0",
+      "status": 1,
+      "url": "/ip4/3.86.75.6/tcp/15000/p2p/12D3KooWB6Mejp3nYca42nvcangrDoNCzgqUPEPRnjqYL3eshkqX"
+    }
+  ],
+  "powDifficulty": 1,
+  "registry": "0xf7bff88a1412054a001dc4b8acbddad6f9b26cb6",
+  "relayerCount": 10
+}
