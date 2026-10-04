@@ -19,8 +19,10 @@ Both implement `IWorkerSpecifier` (`src/IWorkerSpecifier.sol`, selectors `0x3898
 same `WorkerUpdated(bytes32,string[])` event, so harnesses, explorers and log-based tools treat them alike.
 
 `ImmutableWorkerSpecifier` stores the hash in its runtime code and the resolver list in storage that only the
-constructor writes. Its runtime code contains no instruction that writes storage, emits a log, calls out, creates a
-contract or self-destructs; `test/ImmutableWorkerSpecifier.t.sol` checks this opcode by opcode. The constructor
+constructor writes. Its runtime code contains no instruction that writes storage (SSTORE, TSTORE), emits a log,
+sends a call that can change state (CALL, CALLCODE, DELEGATECALL), creates a contract or self-destructs;
+`test/ImmutableWorkerSpecifier.t.sol` checks this opcode by opcode. Read-only STATICCALL is outside that list (the
+compiled runtime code has none today). The constructor
 rejects a zero hash, an empty resolver list and empty entries, since an immutable specifier keeps whatever it is
 given.
 
@@ -68,7 +70,9 @@ pnpm --filter @hisoka-io/anon-rpc-specifier plan -- \
 ```
 
 The planner checks every resolver entry, reads fees and the latest block from the RPC (default
-`https://ethereum-rpc.publicnode.com`, or `MAINNET_RPC_URL`), forks that block into a local anvil, deploys each
+`https://ethereum-rpc.publicnode.com`, or `MAINNET_RPC_URL`; the endpoint operator sees which specifier and deployer
+are read, so set `MAINNET_RPC_URL` to an endpoint you trust for real deployments), forks that block into a local
+anvil, deploys each
 variant there and reads it back through the harness. It prints the creation code, `eth_estimateGas`, the gas used,
 the expected cost (gas used x (base fee + tip)), the balance to hold (gas limit x a fee cap of twice the base fee
 plus tip), and, with `--deployer`, that account's balance and the address the specifier will have if the deployment is its
@@ -79,8 +83,9 @@ checked from a browser harness or a KPS QUIC client.
 
 The planner has no broadcast mode: it never signs and never sends to the target chain. Deploying is one creation
 transaction signed by the deployer's own wallet, for example
-`cast send --rpc-url "$MAINNET_RPC_URL" --ledger --gas-limit <planned limit> --create "$(cat <file>)"`, as the plan
-prints it.
+`cast send --rpc-url "$MAINNET_RPC_URL" --ledger --from <deployer> --gas-limit <planned limit> --create "$(cat <file>)"`,
+as the plan prints it. A fork URL that carries an API key reaches anvil through `ETH_RPC_URL`, never its command
+line.
 
 ### Funding the deploying account
 

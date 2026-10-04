@@ -42,6 +42,17 @@ describe("checkResolver: kinds", () => {
     expect(errorsOf(` ${SAMPLE_KPS_IPV4}`)).toEqual([expect.stringMatching(/whitespace/)]);
   });
 
+  it("requires lowercase schemes, as harnesses match them case-sensitively", () => {
+    for (const entry of [
+      "HTTPS://cdn.jsdelivr.net/npm/x@1.0.0/w.js",
+      "Https://unpkg.com/x@1.0.0/w.js",
+      "KPS:1.2.3.4:15005:x/w",
+    ]) {
+      const check = checkResolver(entry, undefined);
+      expect(check.errors.join(" "), entry).toMatch(/must be lowercase/u);
+    }
+  });
+
   it("treats unknown kinds as errors unless explicitly allowed", () => {
     expect(errorsOf("ipfs://bafyexample")).toEqual([expect.stringMatching(/unrecognized kind/)]);
     const allowed = checkResolver("ipfs://bafyexample", SAMPLE_HASH, {

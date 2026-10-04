@@ -134,7 +134,19 @@ export function checkResolver(
     check.errors.push("contains whitespace, control or non-ASCII characters");
     return check;
   }
-  const scheme = entry.slice(0, entry.indexOf(":") + 1).toLowerCase();
+  const scheme = entry.slice(0, entry.indexOf(":") + 1);
+  const lowered = scheme.toLowerCase();
+  if (
+    scheme !== lowered &&
+    (lowered === "https:" || lowered === "http:" || lowered === "kps:" || lowered === "blob:")
+  ) {
+    // The harness dispatches on /^(https?|blob):/ and the "kps:" prefix, case-sensitively: wallets would skip
+    // this entry, and an immutable specifier would keep it forever.
+    check.errors.push(
+      `scheme "${scheme}" must be lowercase "${lowered}": harnesses match resolver kinds case-sensitively`,
+    );
+    return check;
+  }
   if (scheme === "https:") {
     check.kind = "https";
     checkHttps(entry, workerHash, check);

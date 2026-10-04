@@ -147,7 +147,7 @@ describe("planDeployment (dry run)", () => {
     const signer = Array.isArray(accounts) && typeof accounts[0] === "string" ? accounts[0] : "";
     for (const v of plan.variants) {
       const code = creationCode(await loadArtifact(v.variant), plan.workerHash, plan.resolvers);
-      const args = castCreateArgs(upstream.url, ["--unlocked", "--from", signer], v.deploy, code);
+      const args = castCreateArgs(upstream.url, ["--unlocked"], v.deploy, code, signer);
       const receipt: unknown = JSON.parse(await cast([...args.slice(0, 1), "--json", ...args.slice(1)]));
       const address =
         typeof receipt === "object" && receipt !== null
@@ -170,7 +170,7 @@ describe("funding the printed signer command", () => {
     await upstream.rpc.request("anvil_impersonateAccount", [sender]);
     await upstream.rpc.request("anvil_setBalance", [sender, `0x${balance.toString(16)}`]);
     const code = creationCode(await loadArtifact(v.variant), plan.workerHash, plan.resolvers);
-    return cast(castCreateArgs(upstream.url, ["--unlocked", "--from", sender], v.deploy, code));
+    return cast(castCreateArgs(upstream.url, ["--unlocked"], v.deploy, code, sender));
   }
 
   it("needs the hold amount, not the paid amount, when the base fee rises before signing", async () => {

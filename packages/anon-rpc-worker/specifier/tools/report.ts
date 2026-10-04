@@ -28,12 +28,30 @@ export type SignerArgs = readonly string[];
 
 /**
  * `cast send --create` arguments for a planned creation transaction. The signer flags come from the caller (e.g.
- * `--ledger`); the gas limit is the planned one; fees are left to cast at signing time, since they move. cast then
- * signs a fee cap of twice the base fee plus the tip, so the account must hold gas limit x that cap (see
- * `scenarioCost`).
+ * `--ledger`); `--from` names the planned sender, so cast refuses when the hardware wallet would sign from another
+ * account (another derivation index lands the contract at another address and nonce); the gas limit is the planned
+ * one; fees are left to cast at signing time, since they move. cast then signs a fee cap of twice the base fee plus
+ * the tip, so the account must hold gas limit x that cap (see `scenarioCost`).
  */
-export function castCreateArgs(rpcUrl: string, signer: SignerArgs, tx: TxPlan, creationCode: string): string[] {
-  return ["send", "--rpc-url", rpcUrl, ...signer, "--gas-limit", tx.gasLimit.toString(), "--create", creationCode];
+export function castCreateArgs(
+  rpcUrl: string,
+  signer: SignerArgs,
+  tx: TxPlan,
+  creationCode: string,
+  from: string,
+): string[] {
+  return [
+    "send",
+    "--rpc-url",
+    rpcUrl,
+    ...signer,
+    "--from",
+    from,
+    "--gas-limit",
+    tx.gasLimit.toString(),
+    "--create",
+    creationCode,
+  ];
 }
 
 function txLine(tx: TxPlan): string {

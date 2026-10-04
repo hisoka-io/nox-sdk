@@ -18,13 +18,15 @@ describe("report formatting", () => {
     });
   });
 
-  it("builds a cast create command with the planned gas limit and the caller's signer flags", () => {
+  it("builds a cast create command with the planned gas limit, sender and the caller's signer flags", () => {
     const tx = { gasLimit: 1_238_788n } as TxPlan;
-    expect(castCreateArgs("$RPC", ["--ledger"], tx, "0x6080")).toEqual([
+    expect(castCreateArgs("$RPC", ["--ledger"], tx, "0x6080", "0x00000000000000000000000000000000000000d1")).toEqual([
       "send",
       "--rpc-url",
       "$RPC",
       "--ledger",
+      "--from",
+      "0x00000000000000000000000000000000000000d1",
       "--gas-limit",
       "1238788",
       "--create",

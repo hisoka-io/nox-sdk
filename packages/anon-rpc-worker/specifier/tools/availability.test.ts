@@ -34,6 +34,15 @@ describe("checkAvailability", () => {
     expect(allHttpsMatch(results.slice(0, 2))).toBe(true);
   });
 
+  it("counts only kps: entries as acceptably unchecked", async () => {
+    const results = await checkAvailability(SAMPLE_HASH, [SAMPLE_KPS_IPV4, "HTTPS://good.example/w.js"], {
+      maxBytes: 1024,
+    });
+    expect(results.map((r) => r.status)).toEqual(["not-checked", "not-checked"]);
+    expect(allHttpsMatch(results)).toBe(false);
+    expect(allHttpsMatch(results.slice(0, 1))).toBe(true);
+  });
+
   it("applies the body cap", async () => {
     vi.stubGlobal(
       "fetch",

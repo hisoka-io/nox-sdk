@@ -116,7 +116,8 @@ async function main(): Promise<void> {
     const file = `${outDir}/${v.variant}.creation-code.hex`;
     await writeFile(file, `${code}\n`);
     files[v.variant] = file;
-    const args = castCreateArgs('"$MAINNET_RPC_URL"', ["--ledger"], v.deploy, `"$(cat ${file})"`);
+    const from = plan.deployer === null ? '"$DEPLOYER"' : plan.deployer.address;
+    const args = castCreateArgs('"$MAINNET_RPC_URL"', ["--ledger"], v.deploy, `"$(cat ${file})"`, from);
     commands.push(`  # ${v.contract}\n  cast ${args.join(" ")}`);
     commands.push(
       `  # then, with the deployed address:\n  forge verify-contract <address> src/${artifact.contract}.sol:${artifact.contract} --rpc-url "$MAINNET_RPC_URL" --guess-constructor-args --watch --verifier sourcify`,
@@ -131,13 +132,14 @@ async function main(): Promise<void> {
     return;
   }
   console.log(text);
+  const deployerHint = plan.deployer === null ? "; set DEPLOYER or plan with --deployer" : "";
   console.log(`\nfiles: ${outDir}/plan.json, plan.txt, <variant>.creation-code.hex`);
   for (const v of plan.variants) {
     console.log(`\n${v.contract} creation code (${v.deploy.dataBytes} bytes, keccak256 ${v.creationCodeKeccak}):`);
     console.log(v.deploy.data);
   }
   console.log(
-    `\nTo deploy, the founder signs ONE creation transaction from the deploying account (swap --ledger for --trezor or --account <keystore> as needed). This tool never signs or sends:\n${commands.join("\n")}`,
+    `\nTo deploy, the founder signs ONE creation transaction from the deploying account (swap --ledger for --trezor or --account <keystore> as needed; --from makes cast refuse a different signing account${deployerHint}). This tool never signs or sends:\n${commands.join("\n")}`,
   );
   console.log(
     `\ncast picks the fee cap when it signs: ${plan.fees.maxFeeBaseFeeMultiplier} x the base fee at that moment + the tip. The node accepts the transaction only if the account already holds gas limit x that cap, so fund the "hold" amount for the expected base fee (scenarios above), not the "paid" amount.`,

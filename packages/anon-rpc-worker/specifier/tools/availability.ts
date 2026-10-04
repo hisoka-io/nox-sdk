@@ -48,6 +48,10 @@ export async function checkAvailability(
   return results;
 }
 
+/**
+ * True when every https: entry serves the pinned bytes. Only kps: entries may stay unchecked (Node has no KPS
+ * client); any other unchecked entry is one no wallet would use, so it fails the check.
+ */
 export function allHttpsMatch(results: readonly AvailabilityResult[]): boolean {
-  return results.every((r) => r.status === "match" || r.status === "not-checked");
+  return results.every((r) => r.status === "match" || (r.status === "not-checked" && r.entry.startsWith("kps:")));
 }
