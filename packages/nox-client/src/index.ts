@@ -127,6 +127,7 @@ export {
   DISCOVERY_POLICY_DEFAULTS,
   DISCOVERY_POLICY_RANGES,
   DISCOVERY_LIMITS,
+  DISCOVERY_MAX_BATCH_CALLS,
 } from "./kps/constants.js";
 export { verifyBootstrap, checkAnchorList, checkRpcUrls, isAllowedRpcUrl, rpcProviderKey } from "./kps/bootstrap.js";
 export {
@@ -137,6 +138,8 @@ export {
   parseFinalizedBlock,
   registryReadPlan,
   planBody,
+  planBodies,
+  mergeBatchReplies,
   parseRegistryAnswer,
   answersAgree,
   closeMembership,

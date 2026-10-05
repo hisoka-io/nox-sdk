@@ -31,6 +31,7 @@ import { rpcProviderKey } from "./bootstrap.js";
 import {
   DISCOVERY_CLOCK_SKEW_SECONDS,
   DISCOVERY_LOG_SCAN,
+  DISCOVERY_MAX_BATCH_CALLS,
   DISCOVERY_PAIRING_BUDGET,
   DISCOVERY_REPLY_BYTES,
 } from "./constants.js";
@@ -189,9 +190,39 @@ export function registryReadPlan(registry: string, block: FinalizedBlock, candid
   return { registry, block, candidates: sorted, calls };
 }
 
-/** The JSON-RPC batch body of a plan. */
+/** The JSON-RPC batch body of a plan (every call in one request). */
 export function planBody(plan: RegistryReadPlan): string {
   return JSON.stringify(plan.calls.map((call) => ({ jsonrpc: "2.0", id: call.id, method: call.method, params: call.params })));
+}
+
+/** The plan as JSON-RPC batch bodies of at most `maxCalls` calls each, in call order. */
+export function planBodies(plan: RegistryReadPlan, maxCalls: number = DISCOVERY_MAX_BATCH_CALLS): string[] {
+  const bodies: string[] = [];
+  for (let start = 0; start < plan.calls.length; start += maxCalls) {
+    bodies.push(JSON.stringify(plan.calls.slice(start, start + maxCalls).map((call) => ({
+      jsonrpc: "2.0",
+      id: call.id,
+      method: call.method,
+      params: call.params,
+    }))));
+  }
+  return bodies;
+}
+
+/** One JSON array text from the batch replies of `planBodies`; a reply that is not an array stays as it is so parsing fails. */
+export function mergeBatchReplies(texts: readonly string[]): string {
+  const items: unknown[] = [];
+  for (const text of texts) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      return text;
+    }
+    if (!Array.isArray(parsed)) return text;
+    items.push(...parsed);
+  }
+  return JSON.stringify(items);
 }
 
 /** Reply bytes a plan's answer needs at most, for reply block sizing. */
@@ -434,8 +465,13 @@ export async function runChainCheck(context: ChainCheckContext): Promise<ChainCh
     let logScan = false;
     for (;;) {
       const plan = registryReadPlan(context.bootstrap.registry, block, candidates);
-      const read = await readAll(context, pairs, planBody(plan), expectedReplyBytes(plan.candidates.length), (text) =>
-        parseRegistryAnswer(plan, text)
+      const bodies = planBodies(plan);
+      const read = await readAll(
+        context,
+        pairs,
+        bodies,
+        expectedReplyBytes(Math.ceil(plan.candidates.length / bodies.length)),
+        (text) => parseRegistryAnswer(plan, text),
       );
       if (read.kind === "failed") {
         read.failed.forEach(blame);
@@ -462,7 +498,7 @@ export async function runChainCheck(context: ChainCheckContext): Promise<ChainCh
       } catch (error) {
         return { kind: "incomplete", detail: describe(error) };
       }
-      const logs = await readAll(context, pairs, scan.body, 65_536, (text) => parseRegistrationLogs(text, scan.chunks));
+      const logs = await readAll(context, pairs, [scan.body], 65_536, (text) => parseRegistrationLogs(text, scan.chunks));
       if (logs.kind === "failed") {
         return { kind: "incomplete", detail: `registration log scan: ${logs.detail}` };
       }
@@ -587,15 +623,23 @@ function isEligible(profile: ChainProfile): boolean {
     profile.url.length > 0;
 }
 
+/**
+ * Send `bodies` through every pair (pairs in parallel, the bodies of one pair
+ * one after another) and parse each pair's merged reply.
+ */
 async function readAll<T>(
   context: ChainCheckContext,
   pairs: readonly ReadPair[],
-  body: string,
+  bodies: readonly string[],
   expectedBytes: number,
   parse: (text: string) => T,
 ): Promise<{ kind: "ok"; values: T[] } | { kind: "failed"; failed: ReadPair[]; detail: string }> {
   const settled = await Promise.allSettled(
-    pairs.map(async (pair) => parse(await context.send(pair.exit, pair.provider, body, expectedBytes))),
+    pairs.map(async (pair) => {
+      const replies: string[] = [];
+      for (const body of bodies) replies.push(await context.send(pair.exit, pair.provider, body, expectedBytes));
+      return parse(bodies.length === 1 ? replies[0]! : mergeBatchReplies(replies));
+    }),
   );
   const failed: ReadPair[] = [];
   const reasons: string[] = [];

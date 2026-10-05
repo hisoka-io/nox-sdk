@@ -110,5 +110,12 @@ export const DISCOVERY_REPLY_BYTES = Object.freeze({ base: 8_192, perMember: 2_0
  */
 export const DISCOVERY_LOG_SCAN = Object.freeze({ chunkBlocks: 2_000_000, maxChunks: 8 });
 
+/**
+ * Most JSON-RPC calls in one request of a chain check. Public providers cap
+ * batches (Tenderly's gateway answers 429 above 20 calls), so a larger read
+ * goes out as several requests, one after another, all pinned to one block.
+ */
+export const DISCOVERY_MAX_BATCH_CALLS = 20;
+
 /** Clock skew tolerated on a finalized block's timestamp. */
 export const DISCOVERY_CLOCK_SKEW_SECONDS = 600;

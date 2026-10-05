@@ -60,6 +60,8 @@ export class FakeRegistryChain {
   failMethod: string | undefined;
   /** Leave relayerCount at this value regardless of members (hidden member tests). */
   countOverride: number | undefined;
+  /** Largest batch answered; a larger one gets one JSON-RPC error object (as Tenderly's gateway answers 429). */
+  maxBatch: number | undefined;
 
   constructor(
     pinned: PinnedSnapshot,
@@ -130,6 +132,9 @@ export class FakeRegistryChain {
   /** Answer one JSON-RPC body (object or batch). */
   answer(body: string): string {
     const parsed = JSON.parse(body) as RpcRequest | RpcRequest[];
+    if (Array.isArray(parsed) && this.maxBatch !== undefined && parsed.length > this.maxBatch) {
+      return JSON.stringify({ jsonrpc: "2.0", id: 1, error: { code: -32005, message: "rate limit exceeded" } });
+    }
     if (Array.isArray(parsed)) return JSON.stringify(parsed.map((request) => this.one(request)));
     return JSON.stringify(this.one(parsed));
   }

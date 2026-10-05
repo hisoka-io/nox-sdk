@@ -15,6 +15,8 @@ import {
   parseFinalizedBlock,
   parseRegistrationLogs,
   parseRegistryAnswer,
+  mergeBatchReplies,
+  planBodies,
   planBody,
   registrationLogsBody,
   registryReadPlan,
@@ -151,6 +153,17 @@ describe("registry read plan and parsing", () => {
     expect(() => parseRegistryAnswer(plan, chain.answer(planBody(plan)))).toThrow(/another block/u);
   });
 
+  it("splits a plan into batches of at most 20 calls and merges the replies in order", () => {
+    const chain = new FakeRegistryChain(pinned);
+    const plan = registryReadPlan(pinned.registry, blockOf(chain), pinned.members.map((m) => m.address));
+    const bodies = planBodies(plan);
+    expect(bodies.map((body) => (JSON.parse(body) as unknown[]).length)).toEqual([20, 1]);
+    const merged = mergeBatchReplies(bodies.map((body) => chain.answer(body)));
+    expect(parseRegistryAnswer(plan, merged).canonical).toBe(parseRegistryAnswer(plan, chain.answer(planBody(plan))).canonical);
+    expect(mergeBatchReplies(['[{"id":1}]', '{"error":"limit"}'])).toBe('{"error":"limit"}');
+    expect(() => parseRegistryAnswer(plan, mergeBatchReplies(['[]', "<html>"]))).toThrow(/not JSON/u);
+  });
+
   it("agrees only on byte-identical values", () => {
     const chain = new FakeRegistryChain(pinned);
     const plan = registryReadPlan(pinned.registry, blockOf(chain), pinned.members.map((m) => m.address));
@@ -233,8 +246,18 @@ describe("runChainCheck", () => {
     expect(new Set(outcome.pairs.map((pair) => pair.provider)).size).toBe(2);
     expect(outcome.membership.registered).toHaveLength(8);
     expect(outcome.attempts).toBe(1);
-    // One finalized-block call, then one batch per pair.
-    expect(ctx.sent).toHaveLength(3);
+    // One finalized-block call, then the 21-call read in two batches (20 + 1) per pair.
+    expect(ctx.sent).toHaveLength(5);
+  });
+
+  it("keeps every request within a 20-call batch cap, so capped providers still answer", async () => {
+    const chain = new FakeRegistryChain(pinned);
+    chain.maxBatch = 20;
+    for (const index of [9, 10, 11, 12, 13]) chain.put(newMember(index), PINNED_BLOCK - 5);
+    const candidates = [...chain.members.keys()];
+    const outcome = await runChainCheck(context(chain, { candidates }));
+    expect(outcome.kind).toBe("verified");
+    if (outcome.kind === "verified") expect(outcome.membership.registered).toHaveLength(13);
   });
 
   it("discards disagreeing answers, never merges them, and tries another pairing", async () => {
