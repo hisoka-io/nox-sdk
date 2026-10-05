@@ -65,9 +65,7 @@ fi
 
 RUST_SYSROOT="$(rustc --print sysroot)"
 RUSTC_COMMIT="$(rustc -vV | sed -ne 's/^commit-hash: //p')"
-# The checkout path is remapped too: panic locations of workspace crates
-# otherwise carry it, and two checkouts at different paths gave different WASM.
-export RUSTFLAGS="--remap-path-prefix=$REPO_DIR=/nox-sdk --remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo-home --remap-path-prefix=$RUST_SYSROOT/lib/rustlib/src/rust=/rustc/$RUSTC_COMMIT"
+export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo-home --remap-path-prefix=$RUST_SYSROOT/lib/rustlib/src/rust=/rustc/$RUSTC_COMMIT"
 export NOX_WORKSPACE_ROOT="$REPO_DIR"
 export RUSTC_WRAPPER="$SCRIPTS_DIR/reproducible-rustc.sh"
 unset CARGO_BUILD_RUSTC_WRAPPER CARGO_ENCODED_RUSTFLAGS
