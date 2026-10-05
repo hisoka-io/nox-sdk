@@ -22,7 +22,6 @@ import type { Page } from "@playwright/test";
 import { mineBlocks } from "../../src/anvil.js";
 import { loadConfig } from "../../src/config.js";
 import { describeEvents } from "../../src/egress.js";
-import { expectHex, jsonRpc } from "../../src/jsonrpc.js";
 import {
   forceUnregister,
   registerMember,
@@ -94,10 +93,6 @@ test.describe.serial("S1: identity from chain, location at run time", () => {
     return member;
   }
 
-  async function blockNumber(url: string): Promise<number> {
-    return Number.parseInt(expectHex(await jsonRpc(url, "eth_blockNumber"), "eth_blockNumber"), 16);
-  }
-
   test.beforeAll(async ({ cfg, runPaths, chains, resolver, meshBed }) => {
     const registry = meshBed.registry;
     if (registry === undefined) throw new Error("the bed has no local NoxRegistry");
@@ -105,13 +100,15 @@ test.describe.serial("S1: identity from chain, location at run time", () => {
     const nodes = meshBed.mesh.info.nodes;
     const parked = nodes.map((node) => node.id).filter((id) => id !== MOVER && id !== ANCHOR && id !== LATE);
     for (const id of parked) await updateMetadataUrl(upstream, registry.address, nodes[id]!.address, "");
-    await forceUnregister(upstream, registry, nodes[LATE]!.address);
+    // Nodes report the block of the last registry change they applied, not the chain head.
+    const lastChange = await forceUnregister(upstream, registry, nodes[LATE]!.address);
     await mineBlocks(upstream, FINALITY_BLOCKS);
-    const snapshotBlock = await blockNumber(upstream);
+    // The snapshot block must not be after the block nodes serve, or every served document is refused.
+    const snapshotBlock = lastChange;
     const parkedAddresses = new Set(parked.map((id) => nodes[id]!.address.toLowerCase()));
     await waitForServedState(
       nodes.filter((node) => node.id !== LATE).map((node) => node.topologyUrl),
-      snapshotBlock,
+      lastChange,
       cfg.mesh.registrySyncTimeoutMs,
       (served) => !served.has(nodes[LATE]!.address.toLowerCase()) &&
         [...parkedAddresses].every((address) => served.get(address)?.metadataUrl === ""),
@@ -126,6 +123,8 @@ test.describe.serial("S1: identity from chain, location at run time", () => {
       ...info,
       mesh: {
         ...info.mesh,
+        // The late node is not in this bundle's snapshot: that is the point of test 2.
+        nodes: info.mesh.nodes.filter((node) => node.id !== LATE),
         registry: { ...info.mesh.registry, registeredBlock: snapshotBlock },
         discovery: { ...info.mesh.discovery, anchors: [anchor] },
       },
@@ -159,12 +158,13 @@ test.describe.serial("S1: identity from chain, location at run time", () => {
         await meshBed.startSidecar(node.id, "original");
       }
     }
+    let lastChange = 0;
     for (const id of [...current.parked, ...(current.moved ? [MOVER] : [])]) {
-      await updateMetadataUrl(upstream, registry.address, nodes[id]!.address, memberOf(registry, meshBed, id).metadataUrl);
+      lastChange = await updateMetadataUrl(upstream, registry.address, nodes[id]!.address, memberOf(registry, meshBed, id).metadataUrl);
     }
-    if (!current.lateRegistered) await registerMember(upstream, registry, memberOf(registry, meshBed, LATE));
+    if (!current.lateRegistered) lastChange = await registerMember(upstream, registry, memberOf(registry, meshBed, LATE));
     await mineBlocks(upstream, FINALITY_BLOCKS);
-    await waitForServedRegistry(nodes.map((node) => node.topologyUrl), registry.members, await blockNumber(upstream), cfg.mesh.registrySyncTimeoutMs);
+    await waitForServedRegistry(nodes.map((node) => node.topologyUrl), registry.members, lastChange, cfg.mesh.registrySyncTimeoutMs);
   });
 
   function expectKpsOnlyEgress(guarded: GuardedHost): void {
