@@ -30,12 +30,13 @@ import { kpsAddrFromMetadataUrl } from "./address.js";
 import { rpcProviderKey } from "./bootstrap.js";
 import {
   DISCOVERY_CLOCK_SKEW_SECONDS,
+  DISCOVERY_LIMITS,
   DISCOVERY_LOG_SCAN,
   DISCOVERY_MAX_BATCH_CALLS,
   DISCOVERY_PAIRING_BUDGET,
   DISCOVERY_REPLY_BYTES,
 } from "./constants.js";
-import { eligiblePinnedMembers, type MemberRecord } from "./pinned.js";
+import { eligiblePinnedMembers, type MemberRecord, type ServedTopology } from "./pinned.js";
 
 /** EIP-1967 implementation slot: `bytes32(uint256(keccak256("eip1967.proxy.implementation")) - 1)`. */
 export const EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
@@ -160,9 +161,69 @@ export function parseFinalizedBlock(text: string): FinalizedBlock {
   return parseBlock(reply["result"], "finalized block");
 }
 
+/** Inputs of `rankChainCandidates`. */
+export interface CandidateSources {
+  /** Addresses the client already trusts: snapshot members, the current membership, the last verified set. */
+  readonly core: Iterable<string>;
+  /** Accepted served documents; each lists node addresses under the anchor that served it. */
+  readonly served: readonly ServedTopology[];
+  /** Different anchors that must list an address before it ranks above single-source addresses. */
+  readonly minSources: number;
+  /** Most candidates returned (`DISCOVERY_LIMITS.maxCandidates`). */
+  readonly max: number;
+  /** Uniform index in [0, n), used to order the tier that gets truncated. */
+  randomIndex(n: number): number;
+}
+
+/**
+ * The chain check's candidate addresses, bounded to `max` (PROPOSAL §2.2
+ * step 4, threat table "one anchor floods the providers"). Ranked: the core
+ * set first, then addresses that at least `minSources` different anchors
+ * list, then addresses only one anchor lists. Within a tier that does not fit,
+ * addresses are taken in random order, so an anchor cannot choose addresses
+ * that always win the cut. A genuine member left out makes the set fail to
+ * close, and the registration log scan then completes it from the chain.
+ */
+export function rankChainCandidates(sources: CandidateSources): string[] {
+  const core = new Set([...sources.core].map((address) => address.toLowerCase()));
+  const listedBy = new Map<string, Set<string>>();
+  for (const source of sources.served) {
+    for (const node of source.snapshot.nodes) {
+      const address = node.address.toLowerCase();
+      if (core.has(address)) continue;
+      const anchors = listedBy.get(address) ?? new Set<string>();
+      anchors.add(source.anchor);
+      listedBy.set(address, anchors);
+    }
+  }
+  const multi: string[] = [];
+  const single: string[] = [];
+  for (const [address, anchors] of [...listedBy.entries()].sort(([left], [right]) => (left < right ? -1 : 1))) {
+    (anchors.size >= sources.minSources ? multi : single).push(address);
+  }
+  const out: string[] = [];
+  for (const tier of [[...core].sort(), multi, single]) {
+    const room = sources.max - out.length;
+    if (room <= 0) break;
+    if (tier.length <= room) {
+      out.push(...tier);
+      continue;
+    }
+    const pool = [...tier];
+    for (let taken = 0; taken < room; taken++) out.push(pool.splice(sources.randomIndex(pool.length), 1)[0]!);
+  }
+  return out;
+}
+
 /** The registry read: block header, chain id, implementation slot, count, fingerprint, then per candidate profile and role. */
 export function registryReadPlan(registry: string, block: FinalizedBlock, candidates: Iterable<string>): RegistryReadPlan {
   const sorted = [...new Set([...candidates].map((address) => address.toLowerCase()))].sort();
+  if (sorted.length > DISCOVERY_LIMITS.maxCandidates) {
+    throw new DiscoveryError(
+      "incomplete",
+      `${sorted.length} candidate members exceed the bound of ${DISCOVERY_LIMITS.maxCandidates} one registry read covers`,
+    );
+  }
   for (const address of sorted) {
     if (!ADDRESS_RE.test(address)) throw new DiscoveryError("partial", `candidate ${address.slice(0, 48)} is not an address`);
   }
@@ -381,8 +442,13 @@ export interface ChainCheckContext {
   readonly quorum: number;
   /** Exit node IDs available for the reads (members not on probation). */
   readonly exits: readonly string[];
-  /** Candidate member addresses: snapshot, served documents, last verified set. */
+  /**
+   * Candidate member addresses, ranked (`rankChainCandidates`): at most
+   * `DISCOVERY_LIMITS.maxCandidates` are read.
+   */
   readonly candidates: readonly string[];
+  /** Snapshot members, the current membership and the last verified set: kept on a registration log scan. */
+  readonly core: readonly string[];
   /** Lowest acceptable block number: the snapshot block, or the last verified block. */
   readonly minBlock: number;
   /** First block of the registration log scan: the snapshot block (members outside it registered later). */
@@ -461,7 +527,7 @@ export async function runChainCheck(context: ChainCheckContext): Promise<ChainCh
       lastFailure = `finalized block: ${describe(error)}`;
       continue;
     }
-    let candidates = [...context.candidates];
+    let candidates = context.candidates.slice(0, DISCOVERY_LIMITS.maxCandidates);
     let logScan = false;
     for (;;) {
       const plan = registryReadPlan(context.bootstrap.registry, block, candidates);
@@ -509,7 +575,17 @@ export async function runChainCheck(context: ChainCheckContext): Promise<ChainCh
         break;
       }
       logScan = true;
-      candidates = [...new Set([...candidates, ...logs.values[0]!.addresses])];
+      // Every member is in the core set or registered after the snapshot block,
+      // so the core set plus the logged registrations covers the registry and
+      // served-only addresses can go. Over the bound, the set cannot close.
+      const completed = [...new Set([...context.core, ...logs.values[0]!.addresses].map((address) => address.toLowerCase()))];
+      if (completed.length > DISCOVERY_LIMITS.maxCandidates) {
+        return {
+          kind: "incomplete",
+          detail: `the registration logs name ${completed.length} members, more than the bound of ${DISCOVERY_LIMITS.maxCandidates}`,
+        };
+      }
+      candidates = completed;
     }
   }
   return disagreements > 0

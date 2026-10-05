@@ -51,6 +51,7 @@ import {
 import { checkAnchorList, checkRpcUrls, verifyBootstrap } from "./kps/bootstrap.js";
 import {
   membershipFromChain,
+  rankChainCandidates,
   runChainCheck,
   discoveryOutcomeError,
   type ChainCheckOutcome,
@@ -194,6 +195,8 @@ interface SendExtras {
   minSurbs?: number;
   signal?: AbortSignal;
   maxResponseBytes?: number;
+  /** Entry for the first route instead of the pinned one (a chain-check read whose exit is the pinned entry). */
+  entry?: TopologyNode;
 }
 
 /** Resolved run-time discovery inputs (PROPOSAL §2.2, §2.5). */
@@ -1028,7 +1031,7 @@ export class NoxClient {
   ): Promise<{ response: Uint8Array; exit: TopologyNode }> {
     this._requireWasm();
     throwIfAborted(extras?.signal);
-    const first = this._planRoute(selectedExit, this._avoidedNodeIds());
+    const first = this._planRoute(selectedExit, this._avoidedNodeIds(), extras?.entry);
     try {
       const response = await this._sendOnRoute(payload, surbCount, timeoutMs, first, extras);
       this._clearAvoided(first.route);
@@ -1128,7 +1131,8 @@ export class NoxClient {
 
   /**
    * An entry-capable node outside `exclude`: one with an open KPS connection
-   * if any, else one not cooling down after failed dials, else any.
+   * if any, else one not cooling down after failed dials, else any; settled
+   * members before members on probation within each of those tiers.
    */
   private _pickOtherEntry(exclude: ReadonlySet<string>): TopologyNode {
     const rule = this._entryRule();
@@ -1142,7 +1146,9 @@ export class NoxClient {
         candidates,
       ];
     for (const tier of tiers) {
-      if (tier.length > 0) return tier[secureRandomIndex(tier.length)]!;
+      // Within a tier, settled members first: a new entry on probation spends the route's probation budget.
+      const pool = preferSettled(tier);
+      if (pool.length > 0) return pool[secureRandomIndex(pool.length)]!;
     }
     throw new NoxClientError("No other entry is available", NoxClientErrorCode.NoNodesAvailable);
   }
@@ -1286,7 +1292,8 @@ export class NoxClient {
           NoxClientErrorCode.SurbV2Unavailable,
         );
       }
-      retryExit = candidates[secureRandomIndex(candidates.length)];
+      const pool = failed.entry.probation === true ? preferSettled(candidates) : candidates;
+      retryExit = pool[secureRandomIndex(pool.length)];
     }
     return this._planStrictV2(retryExit, avoid, failed.entry.id);
   }
@@ -2100,20 +2107,31 @@ export class NoxClient {
   private async _chainCheckOnce(kps: KpsState, reason: string): Promise<boolean> {
     const discovery = kps.options.discovery!;
     const pinned = kps.options.pinned;
-    const exits = this._nodes.filter((node) => (node.role === 2 || node.role === 3) && node.probation !== true);
-    const candidates = new Set<string>(pinned.members.map((member) => member.address));
-    for (const member of kps.membership) candidates.add(member.address);
-    for (const address of kps.verified?.registered ?? []) candidates.add(address);
-    for (const source of kps.lastServed) {
-      for (const node of source.snapshot.nodes) candidates.add(node.address.toLowerCase());
-    }
+    const settledExits = this._nodes.filter((node) => (node.role === 2 || node.role === 3) && node.probation !== true);
+    // A route cannot use the pinned entry as its exit too: leave it out while enough other exits remain.
+    const pinnedId = this._pinnedEntry()?.id;
+    const otherExits = settledExits.filter((node) => node.id !== pinnedId);
+    const exits = otherExits.length >= discovery.quorum ? otherExits : settledExits;
+    const core = [...new Set([
+      ...pinned.members.map((member) => member.address),
+      ...kps.membership.map((member) => member.address),
+      ...(kps.verified?.registered ?? []),
+    ].map((address) => address.toLowerCase()))];
+    const candidates = rankChainCandidates({
+      core,
+      served: kps.lastServed,
+      minSources: discovery.bootstrap.policy.minRemovalSources,
+      max: DISCOVERY_LIMITS.maxCandidates,
+      randomIndex: (n) => secureRandomIndex(n),
+    });
     const started = Date.now();
     const outcome = await runChainCheck({
       bootstrap: discovery.bootstrap,
       providers: discovery.providers,
       quorum: discovery.quorum,
       exits: exits.map((node) => node.id),
-      candidates: [...candidates],
+      candidates,
+      core,
       minBlock: Math.max(pinned.blockNumber, kps.verified?.blockNumber ?? 0),
       logsFromBlock: pinned.blockNumber,
       nowUnix: Math.floor(Date.now() / 1000),
@@ -2254,7 +2272,9 @@ export class NoxClient {
       headers: [["content-type", "application/json"], ["accept", "application/json"]],
       body: new TextEncoder().encode(body),
     });
-    const reply = await this._sendAnonymous(inner, "discovery", undefined, expectedBytes, undefined, exit, "none");
+    // The pinned entry cannot also be the exit of a route: such a read enters through another entry.
+    const extras = exit.id === this._pinnedEntry()?.id ? { entry: this._pickOtherEntry(new Set([exit.id])) } : undefined;
+    const reply = await this._sendAnonymous(inner, "discovery", undefined, expectedBytes, undefined, exit, "none", extras);
     const decoded = decodeHttpResponse(reply);
     if (decoded.status !== 200 || decoded.truncated) {
       throw new NoxClientError(
@@ -2442,9 +2462,15 @@ export class NoxClient {
     const preferred = capable.filter((node) => !avoided.has(node.id));
     const pool = preferred.length > 0 ? [...preferred] : [...capable];
     const pinnedEntry = this._pinnedEntry();
+    // With the pinned entry on probation, settled exits are tried first, so
+    // the route stays within the probation budget (selectRoute refuses a
+    // second probation hop while a settled exit exists).
+    const settledFirst = pinnedEntry?.probation === true;
     let lastError: unknown = null;
     while (pool.length > 0) {
-      const candidate = pool.splice(secureRandomIndex(pool.length), 1)[0]!;
+      const tier = settledFirst ? preferSettled(pool) : pool;
+      const candidate = tier[secureRandomIndex(tier.length)]!;
+      pool.splice(pool.indexOf(candidate), 1);
       try {
         return selectRoute(this._nodes, pinnedEntry, candidate, avoided, this._entryRule(), this._maxProbation()).exit;
       } catch (error) {
@@ -2887,7 +2913,8 @@ function pickEntryUrl(
   nodes: TopologyNode[],
   isEntry: (node: TopologyNode) => boolean = hasHttpEntry,
 ): string {
-  const pool = nodes.filter((node) => isEntryCapable(node, isEntry));
+  const capable = nodes.filter((node) => isEntryCapable(node, isEntry));
+  const pool = preferSettled(capable);
   if (pool.length === 0) {
     throw new NoxClientError(
       isEntry === isKpsEntryNode
@@ -2898,6 +2925,12 @@ function pickEntryUrl(
   }
   const node = pool[secureRandomIndex(pool.length)]!;
   return node.address;
+}
+
+/** The members not on probation, or every candidate when all are on probation. */
+function preferSettled<T extends TopologyNode>(candidates: readonly T[]): T[] {
+  const settled = candidates.filter((node) => node.probation !== true);
+  return settled.length > 0 ? settled : [...candidates];
 }
 
 function isEntryCapable(node: TopologyNode, isEntry: (node: TopologyNode) => boolean): boolean {
@@ -3340,7 +3373,10 @@ async function fetchAnchorNode(address: string, timeoutMs: number, fetchImpl: No
   }
   const node = typeof value === "object" && value !== null ? (value as { node?: unknown }).node : undefined;
   if (typeof node !== "string" || !/^0x[0-9a-fA-F]{40}$/u.test(node)) {
-    throw new NoxClientError("anchor metadata names no node address", NoxClientErrorCode.TopologyVerificationFailed);
+    throw new NoxClientError(
+      "anchor metadata names no node address: a gateway or bridge nox-kps must set node_address to its member's registered address",
+      NoxClientErrorCode.TopologyVerificationFailed,
+    );
   }
   return node.toLowerCase();
 }

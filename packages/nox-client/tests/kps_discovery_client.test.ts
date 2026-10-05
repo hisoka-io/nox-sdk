@@ -20,7 +20,7 @@ import {
   type VerifiedDiscovery,
 } from "../src/types.js";
 import { FakeRegistryChain } from "./helpers/fake_chain.js";
-import { FakeKpsNetwork, json, kpsAddressFor, type FakeHandler } from "./helpers/fake_kps.js";
+import { FakeKpsNetwork, certhashFor, json, kpsAddressFor, type FakeHandler } from "./helpers/fake_kps.js";
 import { FakeMixnet, encodeExitHttpResponse, fakeWasmBindings } from "./helpers/fake_mixnet.js";
 import {
   FIXTURE_PROVIDERS,
@@ -264,6 +264,35 @@ describe("KPS discovery: anchors", () => {
     expect(new Set(t.network.dials)).toEqual(new Set([bridgeA, bridgeB]));
   });
 
+  it("bridges with their own identity (certhash, port, IP) work when their /metadata.json names the member", async () => {
+    // As run-nox's kps-bridge profile runs them: a second nox-kps with its own key on an unpublished IP.
+    const t = bed();
+    const bridgeA = `198.51.100.1:15007:${certhashFor("bridge-1")}`;
+    const bridgeB = `198.51.100.6:15007:${certhashFor("bridge-6")}`;
+    t.nodeAt.set(bridgeA, memberAddress(1));
+    t.nodeAt.set(bridgeB, memberAddress(6));
+    const client = await connect(t.config({ bridges: [bridgeA, bridgeB] }));
+    expect(new Set(t.network.dials)).toEqual(new Set([bridgeA, bridgeB]));
+    expect(entryOf(client, memberAddress(1))).toBe(`kps:${bridgeA}`);
+    expect(entryOf(client, memberAddress(6))).toBe(`kps:${bridgeB}`);
+    await waitForLog(t, "discovery.verified");
+    expect(new Set(t.network.dials)).toEqual(new Set([bridgeA, bridgeB]));
+  });
+
+  it("refuses a bridge whose /metadata.json names no node, with an error that says what to set", async () => {
+    const t = bed();
+    const bare = `198.51.100.1:15007:${certhashFor("bridge-bare")}`;
+    const named = `198.51.100.6:15007:${certhashFor("bridge-named")}`;
+    t.nodeAt.set(named, memberAddress(6));
+    t.network.route(bare, (request) =>
+      request.path === "/metadata.json" ? json(200, { protocol: "nox-kps-http/1", node: null }) : t.mixnet.handler(request));
+    const client = await connect(t.config({ bridges: [bare, named] }));
+    expect(client.nodes.some((node) => node.address === `kps:${bare}`)).toBe(false);
+    expect(entryOf(client, memberAddress(6))).toBe(`kps:${named}`);
+    const failed = t.logs.find((entry) => entry.event === "anchor.failed");
+    expect(failed?.fields?.["code"]).toBe(NoxClientErrorCode.TopologyVerificationFailed);
+  });
+
   it("uses a learned anchor only when its /metadata.json confirms the member it was learned for", async () => {
     const t = bed();
     const honest = kpsAddressFor(5, 20005);
@@ -329,6 +358,54 @@ describe("KPS discovery: chain checks", () => {
     }
   });
 
+  it("with a probation pinned entry, paid exits and entry switches stay within the probation cap", async () => {
+    // Exits advertise paid execution (pinned capabilities).
+    const t = bed(makePinned([
+      { role: 1 }, { role: 1 }, { role: 1 }, { role: 1 }, { role: 1 },
+      { role: 2, capabilities: ["paid_v2"] }, { role: 2, capabilities: ["paid_v2"] }, { role: 2, capabilities: ["paid_v2"] },
+    ]));
+    const client = await connect(t.config());
+    await waitForLog(t, "discovery.verified");
+    t.chain.put(newMember(9, 1));
+    t.nodeAt.set(kpsAddressFor(9), memberAddress(9));
+    t.chain.advance();
+    await (Reflect.get(client, "_runChainCheck") as (reason: string, force: boolean) => Promise<boolean>).call(client, "test", true);
+    const entry = client.nodes.find((node) => node.id === memberAddress(9));
+    // A paid-capable exit on probation (in KPS mode capabilities come from the
+    // snapshot, so this marks a pinned exit directly to exercise the rule).
+    const nodes = Reflect.get(client, "_nodes") as TopologyNode[];
+    const exitIndex = nodes.findIndex((node) => node.id === memberAddress(6));
+    nodes[exitIndex] = { ...nodes[exitIndex]!, probation: true };
+    const newExit = nodes[exitIndex];
+    expect(entry?.probation).toBe(true);
+    expect(newExit?.probation).toBe(true);
+    // The pinned entry moves to the new member (as after entry switches).
+    Reflect.set(client, "_entryUrl", entry!.address);
+    for (let i = 0; i < 200; i++) {
+      const exit = client.selectPaidExit();
+      expect(exit.probation).toBeUndefined();
+    }
+    // A caller that names the probation exit gets a refusal, not a route with two probation hops.
+    const plan = Reflect.get(client, "_planRoute") as (exit: TopologyNode | undefined, avoid: Set<string>) => { route: Record<"entry" | "mix" | "exit", TopologyNode> };
+    expect(() => plan.call(client, newExit, new Set())).toThrow(expect.objectContaining({ code: NoxClientErrorCode.NoNodesAvailable }));
+    for (let i = 0; i < 200; i++) {
+      const { route } = plan.call(client, undefined, new Set());
+      expect([route.entry, route.mix, route.exit].filter((hop) => hop.probation === true)).toHaveLength(1);
+    }
+    // Switching away from a failed entry prefers settled entries over the probation one.
+    const pickOther = Reflect.get(client, "_pickOtherEntry") as (exclude: ReadonlySet<string>) => TopologyNode;
+    // Leave one settled entry without an open connection and the probation entry: both share a tier.
+    const transport = (Reflect.get(client, "_kps") as { transport: { isConnected(address: string): boolean } }).transport;
+    const settled = client.nodes.filter((node) => node.probation !== true && node.role === 1 && node.address.startsWith("kps:"));
+    const keep = settled.find((node) => !transport.isConnected(node.address.slice("kps:".length)))!;
+    expect(keep).toBeDefined();
+    expect(transport.isConnected(entry!.address.slice("kps:".length))).toBe(false);
+    const exclude = new Set(client.nodes.filter((node) => node.id !== keep.id && node.id !== entry!.id).map((node) => node.id));
+    for (let i = 0; i < 200; i++) {
+      expect(pickOther.call(client, exclude).id).toBe(keep.id);
+    }
+  });
+
   it("keeps the snapshot floor when two providers disagree, and logs discovery.disagreement", async () => {
     const t = bed();
     const liar = new FakeRegistryChain(t.pinned);
@@ -356,6 +433,17 @@ describe("KPS discovery: chain checks", () => {
     const client = await connect(t.config());
     await waitForLog(t, "discovery.verified");
     expect(client.nodes.map((node) => node.id)).not.toContain(memberAddress(8));
+  });
+
+  it("reads through the pinned entry's own exit by entering elsewhere when only quorum exits remain", async () => {
+    const t = bed();
+    t.chain.remove(memberAddress(8));
+    const client = await connect(t.config());
+    await waitForLog(t, "discovery.verified");
+    // Pin exit 6: exits 6 and 7 are the only two, and the quorum needs both.
+    Reflect.set(client, "_entryUrl", client.nodes.find((node) => node.id === memberAddress(6))!.address);
+    const run = Reflect.get(client, "_runChainCheck") as (reason: string, force: boolean) => Promise<boolean>;
+    await expect(run.call(client, "test", true)).resolves.toBe(true);
   });
 
   it("runs a chain check instead of failing when served documents would declare the snapshot stale", async () => {

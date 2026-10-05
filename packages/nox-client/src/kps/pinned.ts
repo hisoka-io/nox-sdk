@@ -27,6 +27,7 @@ import {
   verifySelfConsistency,
 } from "../topology.js";
 import { kpsAddrFromMetadataUrl, kpsEntryEndpoint } from "./address.js";
+import { DISCOVERY_LIMITS } from "./constants.js";
 
 export const PINNED_SNAPSHOT_FORMAT = "nox-anon-rpc-snapshot/1";
 /** Cap on pinned members and on `relayerCount` (schema `maxItems`). */
@@ -522,6 +523,9 @@ function rejectionReason(
   options: ApplyServedOptions,
 ): string | null {
   const snapshot = source.snapshot;
+  if (snapshot.nodes.length > DISCOVERY_LIMITS.maxCandidates) {
+    return `lists ${snapshot.nodes.length} nodes, more than the ${DISCOVERY_LIMITS.maxCandidates} a registry holds for this client`;
+  }
   try {
     verifySelfConsistency(snapshot, true);
   } catch (error) {

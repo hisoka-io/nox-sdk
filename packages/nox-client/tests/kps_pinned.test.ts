@@ -12,6 +12,7 @@ import {
 import { primaryLayerForRole } from "../src/topology.js";
 import { NoxClientError, NoxClientErrorCode, type PinnedSnapshot } from "../src/types.js";
 import { kpsAddressFor } from "./helpers/fake_kps.js";
+import { DISCOVERY_LIMITS } from "../src/kps/constants.js";
 import { PINNED_BLOCK, makePinned, memberAddress, served, type ServedSpec } from "./helpers/pinned_fixture.js";
 
 const NOW = 1_800_000_000;
@@ -358,6 +359,20 @@ describe("applyServedTopologies (removals only)", () => {
     }
     const foreign = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(77), snapshot: served(pinned, NOW) }], NOW, OPTIONS);
     expect(foreign.rejected[0]?.reason).toMatch(/not a pinned member/u);
+  });
+
+  it("rejects a self-consistent document that lists more nodes than the member bound", () => {
+    const template = served(pinned, NOW).nodes[0]!;
+    const extra = Array.from({ length: DISCOVERY_LIMITS.maxCandidates }, (_, index) => ({
+      ...template,
+      address: `0x${(0xf000_0000 + index).toString(16).padStart(40, "0")}`,
+    }));
+    const flood = served(pinned, NOW, { add: extra });
+    expect(flood.nodes.length).toBeGreaterThan(DISCOVERY_LIMITS.maxCandidates);
+    const result = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(1), snapshot: flood }], NOW, OPTIONS);
+    expect(result.sourcesAccepted).toBe(0);
+    expect(result.rejected[0]?.reason).toMatch(/more than the 256/u);
+    expect(result.members.map((node) => node.address)).toEqual(all);
   });
 
   it("keeps the previous members of a layer that two sources would push below the floor", () => {

@@ -93,6 +93,13 @@ export const DISCOVERY_LIMITS = Object.freeze({
   maxRpcUrlLength: 256,
   /** First-seen records accepted (the registry holds at most 256 members). */
   maxFirstSeen: 256,
+  /**
+   * Member addresses one chain check reads, and nodes one served topology
+   * document may list: the same 256-member bound. Each candidate costs two
+   * `eth_call`s per pair at the public providers, so one anchor must not be
+   * able to grow the read without limit.
+   */
+  maxCandidates: 256,
 });
 
 /** Pairings a chain check tries before it gives up until the next run. */

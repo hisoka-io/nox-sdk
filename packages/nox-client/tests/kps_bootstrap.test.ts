@@ -150,6 +150,25 @@ describe("probation cap in route selection", () => {
     expect(route.exit.id).toBe("0x05");
   });
 
+  it("refuses a probation exit with a probation pinned entry while a settled exit exists", () => {
+    const nodes = [node("0x01", 1, true), node("0x03", 1), node("0x04", 1), node("0x05", 2, true), node("0x06", 2)];
+    expect(() => selectRoute(nodes, nodes[0], nodes[3], undefined, () => true, 1)).toThrow(
+      expect.objectContaining({ code: NoxClientErrorCode.NoNodesAvailable, message: expect.stringMatching(/probation/u) }),
+    );
+    for (let i = 0; i < 200; i++) {
+      const route = selectRoute(nodes, nodes[0], nodes[4], undefined, () => true, 1);
+      expect([route.entry, route.mix, route.exit].filter((hop) => hop.probation === true)).toHaveLength(1);
+    }
+    // A budget of 2 lets the caller's choice stand.
+    expect(selectRoute(nodes, nodes[0], nodes[3], undefined, () => true, 2).exit.id).toBe("0x05");
+  });
+
+  it("keeps a probation exit with a probation pinned entry when no settled exit exists (availability)", () => {
+    const nodes = [node("0x01", 1, true), node("0x03", 1), node("0x05", 2, true)];
+    const route = selectRoute(nodes, nodes[0], nodes[2], undefined, () => true, 1);
+    expect(route.mix.id).toBe("0x03");
+  });
+
   it("allows any mix without a cap (classic and pinned-only modes)", () => {
     const nodes = [node("0x01", 1, true), node("0x02", 1, true), node("0x03", 2, true)];
     expect(() => selectRoute(nodes, undefined, undefined, undefined, () => true)).not.toThrow();

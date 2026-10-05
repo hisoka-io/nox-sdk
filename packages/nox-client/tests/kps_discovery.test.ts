@@ -18,6 +18,7 @@ import {
   mergeBatchReplies,
   planBodies,
   planBody,
+  rankChainCandidates,
   registrationLogsBody,
   registryReadPlan,
   runChainCheck,
@@ -25,9 +26,9 @@ import {
   type ChainMembership,
   type FinalizedBlock,
 } from "../src/kps/discovery.js";
-import { DISCOVERY_LOG_SCAN, DISCOVERY_PAIRING_BUDGET } from "../src/kps/constants.js";
+import { DISCOVERY_LIMITS, DISCOVERY_LOG_SCAN, DISCOVERY_PAIRING_BUDGET } from "../src/kps/constants.js";
 import { FakeRegistryChain } from "./helpers/fake_chain.js";
-import { FIXTURE_PROVIDERS, makeBootstrap, makePinned, memberAddress, PINNED_BLOCK } from "./helpers/pinned_fixture.js";
+import { FIXTURE_PROVIDERS, makeBootstrap, makePinned, memberAddress, PINNED_BLOCK, served } from "./helpers/pinned_fixture.js";
 import { kpsAddressFor } from "./helpers/fake_kps.js";
 import { primaryLayerForRole } from "../src/topology.js";
 import type { MemberFirstSeen, PinnedMember } from "../src/types.js";
@@ -71,6 +72,7 @@ function context(
     quorum: 2,
     exits: EXITS,
     candidates: pinned.members.map((member) => member.address),
+    core: pinned.members.map((member) => member.address),
     minBlock: PINNED_BLOCK,
     logsFromBlock: PINNED_BLOCK,
     nowUnix: Math.floor(Date.now() / 1000),
@@ -360,6 +362,86 @@ describe("runChainCheck", () => {
     chain.put(newMember(9), PINNED_BLOCK - 10);
     const outcome = await runChainCheck(context(chain));
     expect(outcome.kind).toBe("incomplete");
+  });
+});
+
+describe("bounded chain-check candidates (one anchor cannot flood the providers)", () => {
+  const NOW = Math.floor(Date.now() / 1000);
+  const fake = (index: number): string => `0x${(0xf000_0000 + index).toString(16).padStart(40, "0")}`;
+  /** A self-consistent document from `anchor` that lists the pinned members plus `count` fake addresses. */
+  function flood(count: number, anchor = kpsAddressFor(1)) {
+    const template = served(pinned, NOW).nodes[0]!;
+    const add = Array.from({ length: count }, (_, index) => ({ ...template, address: fake(index) }));
+    return { anchor, snapshot: served(pinned, NOW, { add }) };
+  }
+  let seed = 11;
+  const randomIndex = (n: number): number => {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    return seed % n;
+  };
+  const core = pinned.members.map((member) => member.address);
+
+  it("ranks the core set first, then multi-anchor addresses, and stays within the bound", () => {
+    const corroborated = memberAddress(40);
+    const template = served(pinned, NOW).nodes[0]!;
+    const withNew = (anchor: string) => ({
+      anchor,
+      snapshot: served(pinned, NOW, { add: [{ ...template, address: corroborated }] }),
+    });
+    const ranked = rankChainCandidates({
+      core,
+      served: [flood(20_000), withNew(kpsAddressFor(2)), withNew(kpsAddressFor(3))],
+      minSources: 2,
+      max: DISCOVERY_LIMITS.maxCandidates,
+      randomIndex,
+    });
+    expect(ranked).toHaveLength(DISCOVERY_LIMITS.maxCandidates);
+    expect(ranked.slice(0, core.length)).toEqual([...core].sort());
+    expect(ranked[core.length]).toBe(corroborated);
+    expect(new Set(ranked).size).toBe(ranked.length);
+  });
+
+  it("keeps every address when the documents fit, and counts one anchor once however often it serves", () => {
+    const ranked = rankChainCandidates({
+      core,
+      served: [flood(3), flood(3)],
+      minSources: 2,
+      max: DISCOVERY_LIMITS.maxCandidates,
+      randomIndex,
+    });
+    expect(ranked).toEqual([...[...core].sort(), fake(0), fake(1), fake(2)]);
+  });
+
+  it("refuses a read plan over the bound", () => {
+    const chain = new FakeRegistryChain(pinned);
+    const many = Array.from({ length: DISCOVERY_LIMITS.maxCandidates + 1 }, (_, index) => fake(index));
+    expect(() => registryReadPlan(pinned.registry, blockOf(chain), many)).toThrow(expect.objectContaining({ kind: "incomplete" }));
+  });
+
+  it("an anchor serving 20,000 extra addresses costs at most the bounded read per pair", async () => {
+    const chain = new FakeRegistryChain(pinned);
+    const candidates = rankChainCandidates({ core, served: [flood(20_000)], minSources: 2, max: DISCOVERY_LIMITS.maxCandidates, randomIndex });
+    const ctx = context(chain, { candidates });
+    const outcome = await runChainCheck(ctx);
+    expect(outcome.kind).toBe("verified");
+    if (outcome.kind === "verified") expect(outcome.membership.registered).toHaveLength(pinned.members.length);
+    // 1 finalized-block request, then per pair ceil((5 + 2 * 256) / 20) = 26 batches.
+    const perPair = Math.ceil((5 + 2 * DISCOVERY_LIMITS.maxCandidates) / 20);
+    expect(ctx.sent.length).toBeLessThanOrEqual(1 + 2 * perPair);
+    // Unranked input over the bound is cut to the bound as well.
+    const raw = context(chain, { candidates: [...core, ...Array.from({ length: 5_000 }, (_, index) => fake(index))] });
+    expect((await runChainCheck(raw)).kind).toBe("verified");
+    expect(raw.sent.length).toBeLessThanOrEqual(1 + 2 * perPair);
+  });
+
+  it("after a log scan reads only the core set plus logged registrations, dropping served-only addresses", async () => {
+    const chain = new FakeRegistryChain(pinned);
+    chain.put(newMember(9, 2), PINNED_BLOCK + 50);
+    const extras = Array.from({ length: 200 }, (_, index) => fake(index));
+    const ctx = context(chain, { candidates: [...core, ...extras] });
+    const outcome = await runChainCheck(ctx);
+    expect(outcome).toMatchObject({ kind: "verified", logScan: true });
+    if (outcome.kind === "verified") expect(outcome.membership.registered.map((m) => m.address)).toContain(memberAddress(9));
   });
 });
 

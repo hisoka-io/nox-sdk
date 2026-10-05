@@ -739,6 +739,23 @@ export function selectRoute(
     );
   }
 
+  // The pinned entry and the selected exit are fixed hops: when together they
+  // exceed the probation budget while a settled exit could serve instead, the
+  // caller must pick that exit (PROPOSAL §2.6: at most `maxProbation` hops on
+  // probation per route).
+  const fixedProbation = (canonicalPinnedEntry?.probation === true ? 1 : 0) + (pinnedExit?.probation === true ? 1 : 0);
+  if (
+    pinnedExit?.probation === true &&
+    fixedProbation > maxProbation &&
+    exits.some((node) => node.probation !== true && node.id !== canonicalPinnedEntry?.id)
+  ) {
+    throw new NoxClientError(
+      `Selected exit is on probation and the route already carries ${fixedProbation - 1} probation hop(s); ` +
+        `the per-route cap is ${maxProbation} and a settled exit is available`,
+      NoxClientErrorCode.NoNodesAvailable,
+    );
+  }
+
   const selectableEntries = entries.filter((node) => node.id !== pinnedExit?.id);
   const entryOnly = selectableEntries.filter(
     (node) => !exits.some((exit) => exit.id === node.id),
