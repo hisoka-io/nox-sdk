@@ -1,7 +1,9 @@
 // The test-bed worker build's input handling (scripts/build-test-worker.mjs).
 // The chain and build steps it chains are covered by snapshot-chain and build tests.
 import { describe, expect, it } from "vitest";
-import { capabilitiesFromTopology, main, testbedRegistry, TestWorkerError } from "../scripts/build-test-worker.mjs";
+import { DISCOVERY_POLICY_DEFAULTS, verifyBootstrap, type PinnedSnapshot } from "@hisoka-io/nox-client";
+import { bootstrapFromTestbed, capabilitiesFromTopology, main, testbedRegistry, TestWorkerError } from "../scripts/build-test-worker.mjs";
+import { kpsAddressFor, makePinned } from "./helpers/fixtures.js";
 
 const REGISTRY = {
   address: "0xe7f1725e7734ce288f8367e1bb143e90bb3f0512",
@@ -51,6 +53,33 @@ describe("build-test-worker", () => {
       },
     });
     expect(capabilitiesFromTopology({}, "empty").members).toEqual({});
+  });
+
+  it("builds the bed's discovery bootstrap from testbed.json and the snapshot", () => {
+    const pinned: PinnedSnapshot = makePinned();
+    const info = {
+      mesh: {
+        registry: { ...REGISTRY, implementation: "0x5fbdb2315678afecb367f032d93f642f64180aa3" },
+        discovery: {
+          providers: ["http://127.0.0.1:8545", "http://127.0.0.1:8546/"],
+          anchors: [kpsAddressFor(1), kpsAddressFor(2)],
+          chainRefreshSeconds: 3,
+          maxStateAgeSeconds: 86_400,
+        },
+      },
+    };
+    const bootstrap = bootstrapFromTestbed(info, pinned);
+    expect(bootstrap).toMatchObject({
+      chainId: pinned.chainId,
+      registry: pinned.registry,
+      registryImpl: "0x5fbdb2315678afecb367f032d93f642f64180aa3",
+      anchors: [kpsAddressFor(1), kpsAddressFor(2)],
+      registryRpcUrls: ["http://127.0.0.1:8545", "http://127.0.0.1:8546/"],
+      policy: { ...DISCOVERY_POLICY_DEFAULTS, chainRefreshSeconds: 3, maxStateAgeSeconds: 86_400 },
+    });
+    expect(() => verifyBootstrap(bootstrap, pinned)).not.toThrow();
+    expect(() => bootstrapFromTestbed({ mesh: { registry: REGISTRY } }, pinned)).toThrow(/implementation/u);
+    expect(() => bootstrapFromTestbed({ mesh: { registry: info.mesh.registry } }, pinned)).toThrow(/mesh.discovery/u);
   });
 
   it("requires --testbed and --out", async () => {

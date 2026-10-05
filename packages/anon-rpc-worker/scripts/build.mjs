@@ -37,6 +37,9 @@
  *     repository (packages/nox-client/src), so the bundle is built from
  *     reviewed sources and not from a separately built dist/;
  *   - "nox-embed:wasm-bytes" exports noxWasmBytes(), the raw module bytes;
+ *   - "nox-embed:bootstrap" default-exports the discovery bootstrap
+ *     (snapshot/nox-bootstrap.json, or --bootstrap), embedded the same way;
+ *     the default entry must embed it;
  *   - "nox-embed:snapshot" default-exports the pinned registry snapshot
  *     (snapshot/nox-snapshot.json, or --snapshot for a test bed). The file
  *     must already be canonical JSON; its exact bytes are embedded as one
@@ -46,7 +49,7 @@
  *     cannot be bundled (a Node built-in, a missing file) fails the build.
  *
  * Usage:
- *   node scripts/build.mjs [--entry <file>] [--outfile <file>] [--snapshot <file>]
+ *   node scripts/build.mjs [--entry <file>] [--outfile <file>] [--snapshot <file>] [--bootstrap <file>]
  *                          [--wasm <nox_wasm_bg.wasm>] [--wasm-glue <nox_wasm.js>]
  */
 import { build as esbuild, version as esbuildVersion } from "esbuild";
@@ -62,7 +65,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import { parseArgs } from "node:util";
 import { runInNewContext } from "node:vm";
 import { errorMessage, isMain, runMain } from "./lib/cli.mjs";
-import { EMBED_DIR, PACKAGE_DIR, REPO_DIR, SNAPSHOT_PATH } from "./lib/paths.mjs";
+import { BOOTSTRAP_PATH, EMBED_DIR, PACKAGE_DIR, REPO_DIR, SNAPSHOT_PATH } from "./lib/paths.mjs";
 import { canonicalJson } from "./lib/snapshot-format.mjs";
 import { formatHashLine, KECCAK_FILE_SUFFIX, keccak256Hex, sha256Hex } from "./hash.mjs";
 
@@ -169,6 +172,7 @@ export function resolveNoxWasm(packageDir) {
  * @property {string} [wasm]       nox_wasm_bg.wasm to embed (default: the nox-wasm web build)
  * @property {string} [wasmGlue]   wasm-bindgen web glue matching `wasm`
  * @property {string} [snapshot]   pinned snapshot to embed (default snapshot/nox-snapshot.json)
+ * @property {string} [bootstrap]  discovery bootstrap to embed (default snapshot/nox-bootstrap.json)
  * @property {boolean} [write]     write the outputs (default true)
  */
 
@@ -188,6 +192,7 @@ export function resolveNoxWasm(packageDir) {
  * @property {{ version: string, options: Record<string, unknown> }} esbuild
  * @property {{ path: string, bytes: number, sha256: string, keccak256: string }} wasm
  * @property {{ path: string, bytes: number, sha256: string, keccak256: string }} snapshot
+ * @property {{ path: string, bytes: number, sha256: string, keccak256: string } | null} bootstrap
  * @property {ModuleInput[]} modules
  */
 
@@ -239,6 +244,12 @@ export async function buildWorker(options = {}) {
   const wasmBase64 = wasmBytes.toString("base64");
   const snapshotPath = resolve(options.snapshot ?? SNAPSHOT_PATH);
   const snapshotText = readCanonicalSnapshot(snapshotPath);
+  // The production entry must embed the bootstrap; test entries may leave it out.
+  const requireBootstrap = entry === DEFAULT_ENTRY || options.bootstrap !== undefined;
+  const bootstrapPath = resolve(options.bootstrap ?? BOOTSTRAP_PATH);
+  const bootstrapText = requireBootstrap || existsSync(bootstrapPath)
+    ? readCanonicalJson(bootstrapPath, "discovery bootstrap", "write it as canonical JSON or pass --bootstrap")
+    : null;
 
   const manifest = readPackageManifest(packageDir);
   const banner = `/* ${manifest.name} ${manifest.version} | ${manifest.license} | https://github.com/hisoka-io/nox-sdk */`;
@@ -259,7 +270,7 @@ export async function buildWorker(options = {}) {
       write: false,
       logLevel: "silent",
       logOverride: { "empty-import-meta": "error" },
-      plugins: [noxEmbedPlugin({ wasmBase64, gluePath, snapshotText })],
+      plugins: [noxEmbedPlugin({ wasmBase64, gluePath, snapshotText, bootstrapText })],
     });
   } catch (error) {
     throw new BuildError(`esbuild failed for ${entry}: ${errorMessage(error)}`, "bundle-failed");
@@ -277,7 +288,8 @@ export async function buildWorker(options = {}) {
   }
   const output = /** @type {import("esbuild").OutputFile} */ (result.outputFiles[0]);
   const bundle = output.contents;
-  checkBundle(output.text, wasmBase64, snapshotText);
+  checkBundle(output.text, wasmBase64, snapshotText, requireBootstrap ? bootstrapText : null);
+  const embeddedBootstrap = embeddedModuleText(output.text, "bootstrap");
 
   const record = makeRecord({
     packageDir,
@@ -289,6 +301,8 @@ export async function buildWorker(options = {}) {
     wasmBytes,
     snapshotPath,
     snapshotText,
+    bootstrapPath: embeddedBootstrap === null ? null : bootstrapPath,
+    bootstrapText: embeddedBootstrap,
     bundle,
     metafile: result.metafile,
   });
@@ -305,7 +319,18 @@ export async function buildWorker(options = {}) {
  * @returns {string}
  */
 export function readCanonicalSnapshot(path) {
-  requireFile(path, `pinned snapshot ${path} not found; run scripts/make-snapshot.mjs or pass --snapshot`);
+  return readCanonicalJson(path, "pinned snapshot", "run scripts/make-snapshot.mjs or pass --snapshot");
+}
+
+/**
+ * Read a JSON input to embed and require canonical bytes.
+ * @param {string} path
+ * @param {string} what
+ * @param {string} hint
+ * @returns {string}
+ */
+export function readCanonicalJson(path, what, hint) {
+  requireFile(path, `${what} ${path} not found; ${hint}`);
   const text = readFileSync(path, "utf8");
   /** @type {unknown} */
   let parsed;
@@ -316,7 +341,7 @@ export function readCanonicalSnapshot(path) {
   }
   if (canonicalJson(parsed) !== text) {
     throw new BuildError(
-      `${path} is not canonical JSON (keys sorted, 2-space indent, LF, trailing newline); regenerate it with scripts/make-snapshot.mjs`,
+      `${path} is not canonical JSON (keys sorted, 2-space indent, LF, trailing newline); ${hint}`,
       "invalid-snapshot",
     );
   }
@@ -333,11 +358,11 @@ export function snapshotModuleSource(snapshotText) {
 }
 
 /**
- * esbuild plugin that provides the embedded-WASM and snapshot modules.
- * @param {{ wasmBase64: string, gluePath: string, snapshotText: string }} inputs
+ * esbuild plugin that provides the embedded-WASM, snapshot and bootstrap modules.
+ * @param {{ wasmBase64: string, gluePath: string, snapshotText: string, bootstrapText: string | null }} inputs
  * @returns {import("esbuild").Plugin}
  */
-function noxEmbedPlugin({ wasmBase64, gluePath, snapshotText }) {
+function noxEmbedPlugin({ wasmBase64, gluePath, snapshotText, bootstrapText }) {
   // esbuild evaluates these filters as Go regular expressions: no JS flags.
   return {
     name: "nox-embed",
@@ -370,6 +395,16 @@ function noxEmbedPlugin({ wasmBase64, gluePath, snapshotText }) {
         contents: snapshotModuleSource(snapshotText),
         loader: "js",
       }));
+      build.onResolve({ filter: /^nox-embed:bootstrap$/ }, () => ({
+        path: "bootstrap",
+        namespace: "nox-embed",
+      }));
+      build.onLoad({ filter: /^bootstrap$/, namespace: "nox-embed" }, () => {
+        if (bootstrapText === null) {
+          throw new BuildError("the entry imports nox-embed:bootstrap but no bootstrap file was given", "missing-input");
+        }
+        return { contents: snapshotModuleSource(bootstrapText), loader: "js" };
+      });
     },
   };
 }
@@ -399,30 +434,47 @@ export function rewriteGlue(source, gluePath) {
 }
 
 /**
- * The one string literal the snapshot module emits, after esbuild re-quoted
- * it: `// nox-embed:snapshot`, esbuild's calls into injected modules, then
- * `var <name> = JSON.parse(<literal>);`.
+ * The one string literal an embedded JSON module emits, after esbuild
+ * re-quoted it: `// nox-embed:<name>`, esbuild's calls into injected modules,
+ * then `var <ident> = JSON.parse(<literal>);`.
+ * @param {"snapshot" | "bootstrap"} name
+ * @returns {RegExp}
  */
-const EMBEDDED_SNAPSHOT_RE = /\/\/ nox-embed:snapshot\n(?:\s*init_[\w$]+\(\);\n)*\s*var [A-Za-z_$][\w$]* = JSON\.parse\(('(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")\);/gu;
+function embeddedModuleRe(name) {
+  return new RegExp(
+    `\\/\\/ nox-embed:${name}\\n(?:\\s*init_[\\w$]+\\(\\);\\n)*\\s*var [A-Za-z_$][\\w$]* = JSON\\.parse\\(('(?:[^'\\\\\\n]|\\\\.)*'|"(?:[^"\\\\\\n]|\\\\.)*")\\);`,
+    "gu",
+  );
+}
 
 /**
- * The snapshot text a bundle embeds, decoded from its string literal, or
- * `null` when the bundle has no snapshot module. Throws when it has several.
+ * The text an embedded JSON module carries, decoded from its string literal,
+ * or `null` when the bundle has no such module. Throws when it has several.
  * @param {string} bundleText
+ * @param {"snapshot" | "bootstrap"} name
  * @returns {string | null}
  */
-export function embeddedSnapshotText(bundleText) {
-  const matches = [...bundleText.matchAll(EMBEDDED_SNAPSHOT_RE)];
+export function embeddedModuleText(bundleText, name) {
+  const matches = [...bundleText.matchAll(embeddedModuleRe(name))];
   if (matches.length === 0) return null;
   if (matches.length > 1) {
-    throw new BuildError(`the bundle embeds ${matches.length} snapshot modules; expected one`, "bundle-check-failed");
+    throw new BuildError(`the bundle embeds ${matches.length} ${name} modules; expected one`, "bundle-check-failed");
   }
   const literal = /** @type {string} */ (/** @type {RegExpExecArray} */ (matches[0])[1]);
   // The regular expression admits only a single string literal, so evaluating
   // it runs no code; vm keeps it out of this module's scope anyway.
   const value = runInNewContext(literal, Object.create(null), { timeout: 1_000 });
-  if (typeof value !== "string") throw new BuildError("the embedded snapshot literal is not a string", "bundle-check-failed");
+  if (typeof value !== "string") throw new BuildError(`the embedded ${name} literal is not a string`, "bundle-check-failed");
   return value;
+}
+
+/**
+ * The snapshot text a bundle embeds, or `null` when it has no snapshot module.
+ * @param {string} bundleText
+ * @returns {string | null}
+ */
+export function embeddedSnapshotText(bundleText) {
+  return embeddedModuleText(bundleText, "snapshot");
 }
 
 /**
@@ -440,12 +492,26 @@ export const FORBIDDEN_BUNDLE_PATTERNS = Object.freeze([
 ]);
 
 /**
- * Structural checks on the emitted bundle.
+ * Structural checks on the emitted bundle. With `bootstrapText`, the bundle
+ * must embed exactly that bootstrap.
  * @param {string} text
  * @param {string} wasmBase64
  * @param {string} snapshotText
+ * @param {string | null} [bootstrapText]
  */
-export function checkBundle(text, wasmBase64, snapshotText) {
+export function checkBundle(text, wasmBase64, snapshotText, bootstrapText = null) {
+  if (bootstrapText !== null) {
+    const embeddedBootstrap = embeddedModuleText(text, "bootstrap");
+    if (embeddedBootstrap === null) {
+      throw new BuildError(
+        "the bundle does not embed the discovery bootstrap: the worker source must import \"nox-embed:bootstrap\" and use it",
+        "bundle-check-failed",
+      );
+    }
+    if (embeddedBootstrap !== bootstrapText) {
+      throw new BuildError("the bootstrap embedded in the bundle differs from the bootstrap file", "bundle-check-failed");
+    }
+  }
   const embedded = embeddedSnapshotText(text);
   if (embedded === null) {
     throw new BuildError(
@@ -478,12 +544,14 @@ export function checkBundle(text, wasmBase64, snapshotText) {
 /**
  * @param {{ packageDir: string, entry: string, outfile: string, tsconfigPath: string, banner: string,
  *           wasmPath: string, wasmBytes: Buffer, snapshotPath: string, snapshotText: string,
+ *           bootstrapPath: string | null, bootstrapText: string | null,
  *           bundle: Uint8Array, metafile: import("esbuild").Metafile }} parts
  * @returns {BuildRecord}
  */
 function makeRecord(parts) {
   const { packageDir, entry, outfile, tsconfigPath, banner, wasmPath, wasmBytes, snapshotPath, snapshotText, bundle, metafile } = parts;
   const snapshotBytes = Buffer.from(snapshotText, "utf8");
+  const bootstrapBytes = parts.bootstrapText === null ? null : Buffer.from(parts.bootstrapText, "utf8");
   /** @type {ModuleInput[]} */
   const modules = Object.keys(metafile.inputs)
     .sort()
@@ -525,6 +593,14 @@ function makeRecord(parts) {
       sha256: sha256Hex(snapshotBytes),
       keccak256: keccak256Hex(snapshotBytes),
     },
+    bootstrap: bootstrapBytes === null || parts.bootstrapPath === null
+      ? null
+      : {
+        path: toPosix(relative(packageDir, parts.bootstrapPath)),
+        bytes: bootstrapBytes.byteLength,
+        sha256: sha256Hex(bootstrapBytes),
+        keccak256: keccak256Hex(bootstrapBytes),
+      },
     modules,
   };
 }
@@ -606,12 +682,13 @@ export async function main(argv) {
       wasm: { type: "string" },
       "wasm-glue": { type: "string" },
       snapshot: { type: "string" },
+      bootstrap: { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
     process.stdout.write(
-      "usage: build.mjs [--entry src/worker.ts] [--outfile dist/anon-rpc-worker.js] [--snapshot <file>] [--wasm <file>] [--wasm-glue <file>]\n",
+      "usage: build.mjs [--entry src/worker.ts] [--outfile dist/anon-rpc-worker.js] [--snapshot <file>] [--bootstrap <file>] [--wasm <file>] [--wasm-glue <file>]\n",
     );
     return 0;
   }
@@ -622,6 +699,7 @@ export async function main(argv) {
   if (values.wasm !== undefined) options.wasm = values.wasm;
   if (values["wasm-glue"] !== undefined) options.wasmGlue = values["wasm-glue"];
   if (values.snapshot !== undefined) options.snapshot = values.snapshot;
+  if (values.bootstrap !== undefined) options.bootstrap = values.bootstrap;
   const { record } = await buildWorker(options);
   const { artifact, wasm, snapshot } = record;
   process.stdout.write(
@@ -631,6 +709,7 @@ export async function main(argv) {
       `  sha256    ${artifact.sha256}`,
       `  nox-wasm  ${wasm.path} (${wasm.bytes} bytes, sha256 ${wasm.sha256})`,
       `  snapshot  ${snapshot.path} (keccak256 ${snapshot.keccak256})`,
+      ...(record.bootstrap === null ? [] : [`  bootstrap ${record.bootstrap.path} (keccak256 ${record.bootstrap.keccak256})`]),
       `  esbuild   ${record.esbuild.version}, ${record.modules.length} modules`,
       "",
     ].join("\n"),

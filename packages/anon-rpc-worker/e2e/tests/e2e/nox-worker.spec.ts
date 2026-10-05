@@ -488,9 +488,13 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
       });
     }
 
-    function drillConfig(gateways: readonly string[]): Record<string, unknown> {
+    /**
+     * `gateways` are tried first but any known entry may serve; `bridges` are the
+     * only addresses the worker ever dials (S1), which the wrong-certhash drill needs.
+     */
+    function drillConfig(addresses: readonly string[], kind: "gateways" | "bridges" = "gateways"): Record<string, unknown> {
       return {
-        gateways,
+        [kind]: addresses,
         logLevel: "debug",
         attemptTimeoutMs: DRILL_ATTEMPT_TIMEOUT_MS,
         callDeadlineMs: DRILL_CALL_DEADLINE_MS,
@@ -557,7 +561,7 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
           address: pin().worker.address,
           specifierRpcUrl: chains.specifier.url,
           readyTimeoutMs: NO_READY_WINDOW_MS,
-          config: drillConfig([pinnedA]),
+          config: drillConfig([pinnedA], "bridges"),
           awaitReady: false,
         });
         expect(onlyRotated.ok).toBe(true);
@@ -576,7 +580,7 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
         expectKpsOnlyEgress(guardedHost);
 
         // (b) Rotated entry plus a good one: boot and calls go through the good one.
-        const mixed = await boot(page, chains.specifier.url, cfg.worker.readyTimeoutMs, drillConfig([pinnedA, pinnedB]));
+        const mixed = await boot(page, chains.specifier.url, cfg.worker.readyTimeoutMs, drillConfig([pinnedA, pinnedB], "bridges"));
         expect(mixed.ok, JSON.stringify(mixed.error)).toBe(true);
         for (let i = 0; i < 3; i++) {
           okStatus(await rpcViaWorker(page, WORKER_ID, chains.upstream.url, rpcCall("eth_chainId", [], i), cfg.worker.callTimeoutMs));

@@ -4,7 +4,9 @@ import {
   DEFAULTS,
   PAID_V2_CAPABILITY,
   type HttpRequestOptions,
+  type KpsBootstrap,
   type KpsModeOptions,
+  type MemberFirstSeen,
   type NoxClientConfig,
   type NoxClientSettings,
   type NoxFetch,
@@ -20,21 +22,41 @@ import {
   type SurbFormat,
   type TopologyNode,
   type TopologySnapshot,
+  type VerifiedDiscovery,
 } from "./types.js";
 import { KpsHttpTransport, kpsFailurePhase } from "./kps/transport.js";
 import { kpsTransportSettingsFrom } from "./kps/fetch.js";
-import { isKpsAddress, kpsAddressLabel, kpsAddressOfEntry, kpsEntryEndpoint } from "./kps/address.js";
+import {
+  isKpsAddress,
+  kpsAddrFromMetadataUrl,
+  kpsAddressLabel,
+  kpsAddressOfEntry,
+  kpsEntryEndpoint,
+} from "./kps/address.js";
 import {
   applyServedTopologies,
   MIN_REMOVAL_SOURCES,
   eligiblePinnedMembers,
-  kpsTopologyNodes,
+  floorRecords,
   pinnedKpsAddresses,
   pinnedPowDifficulty,
+  routingNodes,
+  toRelayerNode,
   verifyPinnedSnapshot,
+  type MemberRecord,
+  type RoutingContext,
   type ServedTopology,
   type WorkingSet,
 } from "./kps/pinned.js";
+import { checkAnchorList, checkRpcUrls, verifyBootstrap } from "./kps/bootstrap.js";
+import {
+  membershipFromChain,
+  rankChainCandidates,
+  runChainCheck,
+  discoveryOutcomeError,
+  type ChainCheckOutcome,
+} from "./kps/discovery.js";
+import { decodeHttpResponse } from "./http_response.js";
 import { seedCandidates } from "./seeder.js";
 import {
   fetchTopology,
@@ -83,6 +105,9 @@ import {
   KPS_SECOND_SOURCE_WAIT_MS,
   KPS_ENTRY_SWITCH_AFTER_FAILURES,
   KPS_CLAIM_MAX_SURB_IDS,
+  DISCOVERY_LIMITS,
+  DISCOVERY_POLICY_RANGES,
+  DISCOVERY_TRIGGER_MIN_GAP_MS,
   claimWindow,
 } from "./kps/constants.js";
 import {
@@ -170,11 +195,40 @@ interface SendExtras {
   minSurbs?: number;
   signal?: AbortSignal;
   maxResponseBytes?: number;
+  /** Entry for the first route instead of the pinned one (a chain-check read whose exit is the pinned entry). */
+  entry?: TopologyNode;
+}
+
+/** Resolved run-time discovery inputs (PROPOSAL §2.2, §2.5). */
+interface ResolvedDiscovery {
+  readonly bootstrap: KpsBootstrap;
+  /** Anchor classes in dial order; each is shuffled at boot. The snapshot class comes last and is built at boot. */
+  readonly anchorClasses: readonly (readonly string[])[];
+  /** Bridges: only these anchors, never a published address. */
+  readonly exclusive: boolean;
+  /** Learned anchor → member it was confirmed for. */
+  readonly learned: ReadonlyMap<string, string>;
+  readonly providers: readonly string[];
+  readonly quorum: number;
+  readonly chain: boolean;
+  readonly firstSeen: ReadonlyMap<string, MemberFirstSeen>;
+  readonly onVerified: ((state: VerifiedDiscovery) => void) | undefined;
+}
+
+/** Last chain check the client applied. */
+interface VerifiedChainState {
+  readonly blockHash: string;
+  readonly blockNumber: number;
+  readonly blockTimestamp: number;
+  readonly fingerprint: string;
+  /** Every registered member's address. */
+  readonly registered: readonly string[];
 }
 
 /** Resolved KPS mode inputs (ARCHITECTURE §3.2 defaults applied). */
 interface ResolvedKpsOptions {
   readonly pinned: PinnedSnapshot;
+  readonly discovery: ResolvedDiscovery | undefined;
   readonly entries: ReadonlySet<string> | undefined;
   readonly deprioritize: ReadonlySet<string>;
   readonly topologySources: number;
@@ -196,6 +250,21 @@ interface KpsState {
   readonly claimCursors: Map<string, number>;
   /** Consecutive transport failures on the pinned entry. */
   pinnedEntryFailures: number;
+  /** Base membership: eligible floor members, or the last chain-verified set. */
+  membership: MemberRecord[];
+  /** Anchor KPS address → member it serves for (boot anchors with a resolved member). */
+  readonly anchorMembers: Map<string, string>;
+  /** Member → KPS address used as its entry endpoint. */
+  endpoints: Map<string, string>;
+  /** Served documents of the last boot or refresh, for re-applying after a chain check. */
+  lastServed: ServedTopology[];
+  verified: VerifiedChainState | undefined;
+  firstSeen: Map<string, MemberFirstSeen>;
+  /** Exits and provider keys that misbehaved in chain checks; tried last. */
+  readonly avoid: { readonly exits: Set<string>; readonly providers: Set<string> };
+  chainTimer: ReturnType<typeof setInterval> | undefined;
+  chainInFlight: Promise<boolean> | undefined;
+  lastChainRunMs: number;
 }
 
 export class NoxClient {
@@ -379,10 +448,15 @@ export class NoxClient {
 
   /**
    * KPS mode (ARCHITECTURE §3.4): no seed, no RPC, no ambient fetch, no
-   * WebSocket. Verify the pinned snapshot, dial pinned anchors over KPS, accept
-   * their served topologies under the removals-only rule, then route over the
+   * WebSocket. Verify the pinned snapshot, dial anchors over KPS, accept their
+   * served topologies under the removals-only rule, then route over the
    * working set with `kps:` entry endpoints. Fails closed: nothing here falls
    * back to classic transport.
+   *
+   * With `kps.discovery` (S1, PROPOSAL §2.2) the anchors are the wallet's
+   * gateways or bridges, the bundle's default anchors, learned and snapshot
+   * addresses, presence is judged on identity only, and after ready a chain
+   * check reads NoxRegistry through the mixnet in the background.
    */
   private static async _connectKps(config: NoxClientConfig): Promise<NoxClient> {
     const options = resolveKpsOptions(config);
@@ -393,10 +467,13 @@ export class NoxClient {
     const transport = new KpsHttpTransport(kpsConfig.dial, kpsTransportSettingsFrom(kpsConfig), log);
     try {
       const boot = await gatherServedTopologies(transport, options, log);
+      const membership = floorRecords(options.pinned);
+      const anchorMembers = boot.anchorMembers;
+      const endpoints = discoveryEndpoints(options, membership, anchorMembers, undefined);
       const working = applyServedTopologies(options.pinned, boot.sources, Math.floor(Date.now() / 1000), {
         clockSkewToleranceSeconds: options.clockSkewToleranceSeconds,
         livenessMaxAgeSeconds: Math.ceil(settings.livenessMaxAgeMs / 1000),
-        ...(options.entries === undefined ? {} : { entryAddresses: options.entries }),
+        ...servedRuleOptions(options, membership, anchorMembers, endpoints, options.pinned.blockNumber),
       });
       for (const { anchor, reason } of working.rejected) {
         emitLog(log, "warn", "topology.rejected", { anchor: kpsAddressLabel(anchor), reason });
@@ -404,7 +481,7 @@ export class NoxClient {
       if (working.sourcesAccepted === 0) {
         const tried = boot.failures.length + working.rejected.length;
         throw new NoxClientError(
-          `No pinned KPS entry served an acceptable topology (${tried} anchor(s) tried: ${
+          `No KPS anchor served an acceptable topology (${tried} anchor(s) tried: ${
             [...boot.failures, ...working.rejected.map((entry) => `${kpsAddressLabel(entry.anchor)} rejected`)]
               .join("; ")
           })`,
@@ -416,6 +493,7 @@ export class NoxClient {
         members: working.members.length,
         removed: working.removed.length,
         ignoredAdditions: working.ignoredAdditions,
+        relocated: working.relocated.length,
         removalQuorum: working.removalQuorum,
       });
       if (working.floorApplied) {
@@ -426,7 +504,25 @@ export class NoxClient {
       }
       const rejectedAnchors = new Set(working.rejected.map((entry) => entry.anchor));
       const accepted = boot.sources.filter((source) => !rejectedAnchors.has(source.anchor));
-      const nodes = kpsTopologyNodes(options.pinned, working.members, options.entries);
+      const kpsState: KpsState = {
+        options,
+        transport,
+        members: working.members,
+        claimsInFlight: new Set(),
+        claimCursors: new Map(),
+        pinnedEntryFailures: 0,
+        membership,
+        anchorMembers,
+        endpoints,
+        lastServed: accepted,
+        verified: undefined,
+        firstSeen: new Map(options.discovery?.firstSeen ?? []),
+        avoid: { exits: new Set(), providers: new Set() },
+        chainTimer: undefined,
+        chainInFlight: undefined,
+        lastChainRunMs: Number.NEGATIVE_INFINITY,
+      };
+      const nodes = routingNodes(working.members, kpsRoutingContext(kpsState));
       const powDifficultyPinned = config.powDifficulty !== undefined;
       settings.powDifficulty = effectivePowDifficulty(
         settings.powDifficulty,
@@ -442,23 +538,18 @@ export class NoxClient {
       client._powDifficultyPinned = powDifficultyPinned;
       client._fetchImpl = transport.fetch;
       client._webSocketImpl = null;
-      client._kps = {
-        options,
-        transport,
-        members: working.members,
-        claimsInFlight: new Set(),
-        claimCursors: new Map(),
-        pinnedEntryFailures: 0,
-      };
+      client._kps = kpsState;
       client._log = log;
       client._wasmProvider = config.wasm;
       client._wasm = bindings;
       client._startTopologyRefresh();
       client._startResponseStream();
+      client._startChainChecks();
       emitLog(log, "info", "kps.connected", {
         entry: kpsAddressLabel(kpsAddressOfEntry(entryUrl) ?? ""),
         members: nodes.length,
         powDifficulty: settings.powDifficulty,
+        discovery: options.discovery === undefined ? "pinned" : options.discovery.chain ? "chain" : "snapshot",
       });
       return client;
     } catch (error) {
@@ -858,6 +949,8 @@ export class NoxClient {
     if (kps !== undefined) {
       kps.claimsInFlight.clear();
       kps.claimCursors.clear();
+      if (kps.chainTimer !== undefined) clearInterval(kps.chainTimer);
+      kps.chainTimer = undefined;
       void kps.transport.close();
     }
   }
@@ -938,7 +1031,7 @@ export class NoxClient {
   ): Promise<{ response: Uint8Array; exit: TopologyNode }> {
     this._requireWasm();
     throwIfAborted(extras?.signal);
-    const first = this._planRoute(selectedExit, this._avoidedNodeIds());
+    const first = this._planRoute(selectedExit, this._avoidedNodeIds(), extras?.entry);
     try {
       const response = await this._sendOnRoute(payload, surbCount, timeoutMs, first, extras);
       this._clearAvoided(first.route);
@@ -1038,7 +1131,8 @@ export class NoxClient {
 
   /**
    * An entry-capable node outside `exclude`: one with an open KPS connection
-   * if any, else one not cooling down after failed dials, else any.
+   * if any, else one not cooling down after failed dials, else any; settled
+   * members before members on probation within each of those tiers.
    */
   private _pickOtherEntry(exclude: ReadonlySet<string>): TopologyNode {
     const rule = this._entryRule();
@@ -1052,7 +1146,9 @@ export class NoxClient {
         candidates,
       ];
     for (const tier of tiers) {
-      if (tier.length > 0) return tier[secureRandomIndex(tier.length)]!;
+      // Within a tier, settled members first: a new entry on probation spends the route's probation budget.
+      const pool = preferSettled(tier);
+      if (pool.length > 0) return pool[secureRandomIndex(pool.length)]!;
     }
     throw new NoxClientError("No other entry is available", NoxClientErrorCode.NoNodesAvailable);
   }
@@ -1080,6 +1176,8 @@ export class NoxClient {
     try {
       next = this._pickOtherEntry(new Set([failed.id]));
     } catch {
+      // No other checked entry is left: the chain may know where members moved.
+      this._triggerChainCheck("entries");
       return;
     }
     this._moveInFlightToAux(this._entryUrl);
@@ -1126,6 +1224,7 @@ export class NoxClient {
       selectedExit,
       avoid,
       this._entryRule(),
+      this._maxProbation(),
     );
     const version: SurbVersion =
       mode === "auto" && wasmSupportsSurbV2(this._wasm) && routeSupportsSurbV2(route) ? 2 : 1;
@@ -1164,7 +1263,7 @@ export class NoxClient {
       : undefined;
     let route: Route;
     try {
-      route = selectRoute(capable, entry, selectedExit, avoid, this._entryRule());
+      route = selectRoute(capable, entry, selectedExit, avoid, this._entryRule(), this._maxProbation());
     } catch (error) {
       throw new NoxClientError(
         "No route on which every hop advertises format v2 reply support",
@@ -1193,7 +1292,8 @@ export class NoxClient {
           NoxClientErrorCode.SurbV2Unavailable,
         );
       }
-      retryExit = candidates[secureRandomIndex(candidates.length)];
+      const pool = failed.entry.probation === true ? preferSettled(candidates) : candidates;
+      retryExit = pool[secureRandomIndex(pool.length)];
     }
     return this._planStrictV2(retryExit, avoid, failed.entry.id);
   }
@@ -1814,16 +1914,22 @@ export class NoxClient {
 
   /**
    * KPS mode refresh (ARCHITECTURE §3.4 step 7): fetch `/topology` over KPS
-   * from the current entry and from random other KPS members, then rebuild the
-   * working set from the pinned snapshot (not from the previous working set,
-   * so recovered members return). Seeds and RPC are never used. A refresh that
-   * gets no acceptable document keeps the current set and records the error.
+   * from the current entry and from random other anchors, then rebuild the
+   * working set from the base membership (the snapshot floor, or the last
+   * chain-verified set; never the previous working set, so recovered members
+   * return). Seeds and RPC are never used. A refresh that gets no acceptable
+   * document keeps the current set and records the error.
+   *
+   * With chain discovery, a served fingerprint that differs from the known
+   * membership starts an early chain check, and documents that would declare
+   * the snapshot stale first get a chain check: a stale verdict stands only
+   * when the registry itself no longer lists a route layer.
    */
   private async _refreshKpsTopology(kps: KpsState): Promise<void> {
     const { options } = kps;
-    const anchors = this._kpsRefreshAnchors(kps);
+    const refreshAnchors = this._kpsRefreshAnchors(kps);
     const settled = await Promise.allSettled(
-      anchors.map(async (anchor) => ({
+      refreshAnchors.map(async (anchor) => ({
         anchor,
         snapshot: await fetchTopology(`kps:${anchor}`, options.exchangeTimeoutMs, this.fetch),
       })),
@@ -1835,28 +1941,30 @@ export class NoxClient {
     }
     if (served.length === 0) {
       this._topologyRefreshError = new NoxClientError(
-        `KPS topology refresh: none of ${anchors.length} anchor(s) served a topology`,
+        `KPS topology refresh: none of ${refreshAnchors.length} anchor(s) served a topology`,
         NoxClientErrorCode.TopologyFetchFailed,
       );
-      emitLog(this._log, "warn", "topology.refresh.failed", { anchors: anchors.length });
+      emitLog(this._log, "warn", "topology.refresh.failed", { anchors: refreshAnchors.length });
       return;
     }
     let working: WorkingSet;
     try {
-      working = applyServedTopologies(options.pinned, served, Math.floor(Date.now() / 1000), {
-        clockSkewToleranceSeconds: options.clockSkewToleranceSeconds,
-        livenessMaxAgeSeconds: Math.ceil(this._config.livenessMaxAgeMs / 1000),
-        previous: kps.members,
-        ...(options.entries === undefined ? {} : { entryAddresses: options.entries }),
-      });
+      working = this._applyServed(kps, served);
     } catch (error) {
-      this._topologyRefreshError = error instanceof NoxClientError
-        ? error
-        : new NoxClientError(String(error), NoxClientErrorCode.TopologyVerificationFailed, error);
-      if (this._topologyRefreshError.code === NoxClientErrorCode.TopologyStale) {
-        emitLog(this._log, "error", "topology.stale", { sources: served.length });
+      if (isTopologyStale(error) && options.discovery?.chain === true) {
+        emitLog(this._log, "warn", "discovery.trigger", { reason: "stale" });
+        await this._runChainCheck("stale", true);
+        if (this._kps !== kps || this.topologyTimer === null) return;
+        try {
+          working = this._applyServed(kps, served);
+        } catch (retryError) {
+          this._recordRefreshError(retryError, served.length);
+          return;
+        }
+      } else {
+        this._recordRefreshError(error, served.length);
+        return;
       }
-      return;
     }
     for (const { anchor, reason } of working.rejected) {
       emitLog(this._log, "warn", "topology.rejected", { anchor: kpsAddressLabel(anchor), reason });
@@ -1878,40 +1986,308 @@ export class NoxClient {
       });
     }
     const rejected = new Set(working.rejected.map((entry) => entry.anchor));
+    const accepted = served.filter((source) => !rejected.has(source.anchor));
+    kps.lastServed = accepted;
     this._config.powDifficulty = effectivePowDifficulty(
       this._config.powDifficulty,
       this._powDifficultyPinned,
-      pinnedPowDifficulty(
-        options.pinned,
-        served.filter((source) => !rejected.has(source.anchor)).map((source) => source.snapshot),
-      ),
+      pinnedPowDifficulty(options.pinned, accepted.map((source) => source.snapshot)),
     );
     kps.members = working.members;
-    this._setNodes(kpsTopologyNodes(options.pinned, working.members, options.entries));
+    this._setNodes(routingNodes(working.members, kpsRoutingContext(kps)));
     emitLog(this._log, "debug", "topology.refreshed", {
       sources: working.sourcesAccepted,
       members: working.members.length,
       removed: working.removed.length,
+      relocated: working.relocated.length,
       removalQuorum: working.removalQuorum,
+    });
+    if (options.discovery?.chain === true) {
+      const known = kps.verified?.fingerprint ?? options.pinned.fingerprint;
+      const differs = accepted.some((source) => source.snapshot.fingerprint.toLowerCase().replace(/^0x/u, "") !== known);
+      if (differs) this._triggerChainCheck("fingerprint");
+    }
+  }
+
+  /** `applyServedTopologies` against the current base membership, anchors and endpoints. */
+  private _applyServed(kps: KpsState, served: readonly ServedTopology[]): WorkingSet {
+    const anchorMembers = new Map(kps.anchorMembers);
+    for (const [member, address] of kps.endpoints) {
+      if (!anchorMembers.has(address)) anchorMembers.set(address, member);
+    }
+    return applyServedTopologies(kps.options.pinned, served, Math.floor(Date.now() / 1000), {
+      clockSkewToleranceSeconds: kps.options.clockSkewToleranceSeconds,
+      livenessMaxAgeSeconds: Math.ceil(this._config.livenessMaxAgeMs / 1000),
+      previous: kps.members,
+      ...servedRuleOptions(
+        kps.options,
+        kps.membership,
+        anchorMembers,
+        kps.endpoints,
+        kps.verified?.blockNumber ?? kps.options.pinned.blockNumber,
+      ),
     });
   }
 
+  private _recordRefreshError(error: unknown, sources: number): void {
+    this._topologyRefreshError = error instanceof NoxClientError
+      ? error
+      : new NoxClientError(String(error), NoxClientErrorCode.TopologyVerificationFailed, error);
+    if (this._topologyRefreshError.code === NoxClientErrorCode.TopologyStale) {
+      emitLog(this._log, "error", "topology.stale", { sources });
+    }
+  }
+
   /**
-   * The current entry's KPS address first, then random other members drawn
-   * from the pinned KPS-capable eligible set (restricted by `entries`), never
-   * from the working set: a set that served topologies pruned must not pick
-   * the sources that confirm it (ARCHITECTURE §3.4 step 7, §5.3).
+   * The current entry's KPS address first, then random other anchors drawn
+   * from the base membership's entry locations (restricted by `entries`;
+   * bridges only, with bridges), never from the working set: a set that
+   * served topologies pruned must not pick the sources that confirm it
+   * (ARCHITECTURE §3.4 step 7, §5.3).
    */
   private _kpsRefreshAnchors(kps: KpsState): string[] {
     const anchors: string[] = [];
     const current = kpsAddressOfEntry(this._entryUrl);
     if (current !== null) anchors.push(current);
-    const others = pinnedAnchorAddresses(kps.options).filter((address) => address !== current);
-    const wanted = Math.max(MIN_REMOVAL_SOURCES, kps.options.topologySources);
+    const pool = kps.options.discovery === undefined
+      ? pinnedAnchorAddresses(kps.options)
+      : Array.from(new Set(kps.endpoints.values()));
+    const others = pool.filter((address) => address !== current);
+    const wanted = Math.max(kps.options.discovery?.bootstrap.policy.minRemovalSources ?? MIN_REMOVAL_SOURCES, kps.options.topologySources);
     while (anchors.length < wanted && others.length > 0) {
       anchors.push(others.splice(secureRandomIndex(others.length), 1)[0]!);
     }
     return anchors;
+  }
+
+  /** Start the background chain checks: one right after ready, then every `chainRefreshSeconds`. */
+  private _startChainChecks(): void {
+    const kps = this._kps;
+    const discovery = kps?.options.discovery;
+    if (kps === undefined || discovery === undefined || !discovery.chain) return;
+    setTimeout(() => {
+      if (this._kps === kps && this.topologyTimer !== null) void this._runChainCheck("ready", true);
+    }, 0);
+    kps.chainTimer = setInterval(() => {
+      void this._runChainCheck("timer", true);
+    }, discovery.bootstrap.policy.chainRefreshSeconds * 1_000);
+  }
+
+  /** An early chain check, at most once per `DISCOVERY_TRIGGER_MIN_GAP_MS`. */
+  private _triggerChainCheck(reason: string): void {
+    const kps = this._kps;
+    if (kps?.options.discovery?.chain !== true) return;
+    if (Date.now() - kps.lastChainRunMs < DISCOVERY_TRIGGER_MIN_GAP_MS) return;
+    emitLog(this._log, "info", "discovery.trigger", { reason });
+    void this._runChainCheck(reason, true);
+  }
+
+  /**
+   * Run one chain check (single flight) and apply a verified result.
+   * Resolves true when a result was applied. Never rejects.
+   */
+  private _runChainCheck(reason: string, force: boolean): Promise<boolean> {
+    const kps = this._kps;
+    if (kps === undefined || kps.options.discovery?.chain !== true) return Promise.resolve(false);
+    if (kps.chainInFlight !== undefined) return kps.chainInFlight;
+    if (!force && Date.now() - kps.lastChainRunMs < DISCOVERY_TRIGGER_MIN_GAP_MS) return Promise.resolve(false);
+    kps.lastChainRunMs = Date.now();
+    const run = this._chainCheckOnce(kps, reason)
+      .catch((error: unknown) => {
+        emitLog(this._log, "warn", "discovery.failed", { reason, detail: describeUnknown(error).slice(0, 200) });
+        return false;
+      })
+      .finally(() => {
+        kps.chainInFlight = undefined;
+      });
+    kps.chainInFlight = run;
+    return run;
+  }
+
+  private async _chainCheckOnce(kps: KpsState, reason: string): Promise<boolean> {
+    const discovery = kps.options.discovery!;
+    const pinned = kps.options.pinned;
+    const settledExits = this._nodes.filter((node) => (node.role === 2 || node.role === 3) && node.probation !== true);
+    // A route cannot use the pinned entry as its exit too: leave it out while enough other exits remain.
+    const pinnedId = this._pinnedEntry()?.id;
+    const otherExits = settledExits.filter((node) => node.id !== pinnedId);
+    const exits = otherExits.length >= discovery.quorum ? otherExits : settledExits;
+    const core = [...new Set([
+      ...pinned.members.map((member) => member.address),
+      ...kps.membership.map((member) => member.address),
+      ...(kps.verified?.registered ?? []),
+    ].map((address) => address.toLowerCase()))];
+    const candidates = rankChainCandidates({
+      core,
+      served: kps.lastServed,
+      minSources: discovery.bootstrap.policy.minRemovalSources,
+      max: DISCOVERY_LIMITS.maxCandidates,
+      randomIndex: (n) => secureRandomIndex(n),
+    });
+    const started = Date.now();
+    const outcome = await runChainCheck({
+      bootstrap: discovery.bootstrap,
+      providers: discovery.providers,
+      quorum: discovery.quorum,
+      exits: exits.map((node) => node.id),
+      candidates,
+      core,
+      minBlock: Math.max(pinned.blockNumber, kps.verified?.blockNumber ?? 0),
+      logsFromBlock: pinned.blockNumber,
+      nowUnix: Math.floor(Date.now() / 1000),
+      send: (exitId, url, body, expectedBytes) => this._postViaExit(exitId, url, body, expectedBytes),
+      randomIndex: (n) => secureRandomIndex(n),
+      avoid: kps.avoid,
+    });
+    if (this._kps !== kps || this.topologyTimer === null) return false;
+    if (outcome.kind !== "verified") {
+      this._logChainFailure(outcome, reason);
+      return false;
+    }
+    this._applyChainOutcome(kps, outcome, Date.now() - started);
+    return true;
+  }
+
+  private _logChainFailure(outcome: Exclude<ChainCheckOutcome, { kind: "verified" }>, reason: string): void {
+    const detail = outcome.detail.slice(0, 200);
+    switch (outcome.kind) {
+      case "disagreement":
+        emitLog(this._log, "warn", "discovery.disagreement", { reason, attempts: outcome.attempts, detail });
+        break;
+      case "incomplete":
+        emitLog(this._log, "warn", "discovery.incomplete", { reason, detail });
+        break;
+      case "rejected":
+        emitLog(this._log, "error", "discovery.rejected", { reason, cause: outcome.reason, detail });
+        break;
+      case "insufficient":
+      case "failed":
+        emitLog(this._log, "warn", "discovery.failed", { reason, kind: outcome.kind, detail });
+        break;
+    }
+    if (this._topologyRefreshError === null) this._topologyRefreshError = discoveryOutcomeError(outcome);
+  }
+
+  /**
+   * Apply a verified registry read (PROPOSAL §2.2 step 8): the eligible
+   * members become the base membership (floor members, members on probation,
+   * removal floor), their chain locations become entry endpoints and routing
+   * URLs, and the working set is rebuilt from the last served documents.
+   */
+  private _applyChainOutcome(kps: KpsState, outcome: Extract<ChainCheckOutcome, { kind: "verified" }>, ms: number): void {
+    const discovery = kps.options.discovery!;
+    const pinned = kps.options.pinned;
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const result = membershipFromChain(pinned, outcome.membership, kps.firstSeen, discovery.bootstrap.policy, nowUnix);
+    const before = new Map(kps.membership.map((member) => [member.address, member]));
+    const beforeEndpoints = new Map(kps.endpoints);
+    kps.firstSeen = result.firstSeen;
+    kps.membership = result.members;
+    kps.verified = {
+      blockHash: outcome.membership.block.hash,
+      blockNumber: outcome.membership.block.number,
+      blockTimestamp: outcome.membership.block.timestamp,
+      fingerprint: outcome.membership.fingerprint,
+      registered: outcome.membership.registered.map((member) => member.address),
+    };
+    kps.endpoints = discoveryEndpoints(kps.options, kps.membership, kps.anchorMembers, kps.verified);
+    let working: WorkingSet | undefined;
+    try {
+      working = this._applyServed(kps, kps.lastServed);
+    } catch {
+      working = undefined;
+    }
+    const members = working === undefined || working.sourcesAccepted === 0
+      ? kps.membership.map(toRelayerNode)
+      : working.members;
+    kps.members = members;
+    this._setNodes(routingNodes(members, kpsRoutingContext(kps)));
+    const added = kps.membership.filter((member) => !before.has(member.address)).length;
+    const removed = [...before.keys()].filter((address) => !kps.membership.some((member) => member.address === address)).length;
+    const moved = kps.membership.filter((member) => {
+      const previous = before.get(member.address);
+      return previous !== undefined &&
+        (previous.url !== member.url || beforeEndpoints.get(member.address) !== kps.endpoints.get(member.address));
+    }).length;
+    emitLog(this._log, "info", "discovery.verified", {
+      block: outcome.membership.block.number,
+      members: kps.membership.length,
+      added,
+      removed,
+      moved,
+      probation: result.probation.length,
+      keptByFloor: result.keptByFloor.length,
+      attempts: outcome.attempts,
+      logScan: outcome.logScan,
+      ms,
+    });
+    if (result.keptByFloor.length > 0) {
+      emitLog(this._log, "warn", "discovery.floor", { kept: result.keptByFloor.length });
+    }
+    if (result.probation.length > 0) {
+      const nodes = this._nodes;
+      const onlyProbation = (["entry", "mix", "exit"] as const).filter((layer) => {
+        const inLayer = nodes.filter((node) => nodeInLayer(node, layer));
+        return inLayer.length > 0 && inLayer.every((node) => node.probation === true);
+      });
+      emitLog(this._log, onlyProbation.length > 0 ? "warn" : "info", "discovery.probation", {
+        members: result.probation.length,
+        onlyProbationLayers: onlyProbation.join(","),
+      });
+    }
+    const callback = discovery.onVerified;
+    if (callback !== undefined) {
+      try {
+        callback({
+          blockHash: outcome.membership.block.hash,
+          blockNumber: outcome.membership.block.number,
+          blockTimestamp: outcome.membership.block.timestamp,
+          members: kps.membership.map((member) => ({
+            address: member.address,
+            kpsAddress: kpsAddrFromMetadataUrl(member.metadataUrl),
+            floor: member.floor,
+            probation: member.probation,
+          })),
+          firstSeen: [...kps.firstSeen.values()],
+        });
+      } catch (error) {
+        emitLog(this._log, "warn", "discovery.callback.failed", { detail: describeUnknown(error).slice(0, 200) });
+      }
+    }
+  }
+
+  /**
+   * POST a JSON-RPC body to `url` through exit `exitId` (one route, no
+   * resend). Resolves with the body text on HTTP 200 with a complete body.
+   */
+  private async _postViaExit(exitId: string, url: string, body: string, expectedBytes: number): Promise<string> {
+    const exit = this._nodes.find((node) => node.id === exitId);
+    if (exit === undefined) {
+      throw new NoxClientError(`Exit ${exitId} left the topology`, NoxClientErrorCode.NoNodesAvailable);
+    }
+    const inner = encodeServiceRequest({
+      tag: "HttpRequest",
+      method: "POST",
+      url,
+      headers: [["content-type", "application/json"], ["accept", "application/json"]],
+      body: new TextEncoder().encode(body),
+    });
+    // The pinned entry cannot also be the exit of a route: such a read enters through another entry.
+    const extras = exit.id === this._pinnedEntry()?.id ? { entry: this._pickOtherEntry(new Set([exit.id])) } : undefined;
+    const reply = await this._sendAnonymous(inner, "discovery", undefined, expectedBytes, undefined, exit, "none", extras);
+    const decoded = decodeHttpResponse(reply);
+    if (decoded.status !== 200 || decoded.truncated) {
+      throw new NoxClientError(
+        `Registry read through exit answered HTTP ${decoded.status}${decoded.truncated ? " (truncated)" : ""}`,
+        NoxClientErrorCode.TransportFailed,
+      );
+    }
+    return new TextDecoder("utf-8", { fatal: true }).decode(decoded.body);
+  }
+
+  /** Probation hops allowed per route (unbounded without discovery). */
+  private _maxProbation(): number {
+    return this._kps?.options.discovery?.bootstrap.policy.probationMaxPerRoute ?? Number.POSITIVE_INFINITY;
   }
 
   /**
@@ -2086,11 +2462,17 @@ export class NoxClient {
     const preferred = capable.filter((node) => !avoided.has(node.id));
     const pool = preferred.length > 0 ? [...preferred] : [...capable];
     const pinnedEntry = this._pinnedEntry();
+    // With the pinned entry on probation, settled exits are tried first, so
+    // the route stays within the probation budget (selectRoute refuses a
+    // second probation hop while a settled exit exists).
+    const settledFirst = pinnedEntry?.probation === true;
     let lastError: unknown = null;
     while (pool.length > 0) {
-      const candidate = pool.splice(secureRandomIndex(pool.length), 1)[0]!;
+      const tier = settledFirst ? preferSettled(pool) : pool;
+      const candidate = tier[secureRandomIndex(tier.length)]!;
+      pool.splice(pool.indexOf(candidate), 1);
       try {
-        return selectRoute(this._nodes, pinnedEntry, candidate, avoided, this._entryRule()).exit;
+        return selectRoute(this._nodes, pinnedEntry, candidate, avoided, this._entryRule(), this._maxProbation()).exit;
       } catch (error) {
         lastError = error;
       }
@@ -2531,7 +2913,8 @@ function pickEntryUrl(
   nodes: TopologyNode[],
   isEntry: (node: TopologyNode) => boolean = hasHttpEntry,
 ): string {
-  const pool = nodes.filter((node) => isEntryCapable(node, isEntry));
+  const capable = nodes.filter((node) => isEntryCapable(node, isEntry));
+  const pool = preferSettled(capable);
   if (pool.length === 0) {
     throw new NoxClientError(
       isEntry === isKpsEntryNode
@@ -2542,6 +2925,12 @@ function pickEntryUrl(
   }
   const node = pool[secureRandomIndex(pool.length)]!;
   return node.address;
+}
+
+/** The members not on probation, or every candidate when all are on probation. */
+function preferSettled<T extends TopologyNode>(candidates: readonly T[]): T[] {
+  const settled = candidates.filter((node) => node.probation !== true);
+  return settled.length > 0 ? settled : [...candidates];
 }
 
 function isEntryCapable(node: TopologyNode, isEntry: (node: TopologyNode) => boolean): boolean {
@@ -2564,6 +2953,7 @@ const CLASSIC_ONLY_FIELDS = ["seeds", "ethRpcUrl", "dangerouslySkipFingerprintCh
 const KPS_OPTION_KEYS = new Set([
   "dial",
   "pinned",
+  "discovery",
   "entries",
   "deprioritize",
   "topologySources",
@@ -2638,6 +3028,13 @@ function resolveKpsOptions(config: NoxClientConfig): ResolvedKpsOptions {
     );
   }
   validateWasmProvider(config.wasm);
+  if (options.entries !== undefined && options.discovery !== undefined) {
+    throw new NoxClientError(
+      "kps.entries and kps.discovery exclude each other: with discovery, restrict entries with discovery.bridges",
+      NoxClientErrorCode.InvalidConfig,
+    );
+  }
+  const discovery = options.discovery === undefined ? undefined : resolveDiscovery(options.discovery, pinned);
   let entries: ReadonlySet<string> | undefined;
   if (options.entries !== undefined) {
     const published = new Set(pinnedKpsAddresses(pinned).values());
@@ -2682,6 +3079,7 @@ function resolveKpsOptions(config: NoxClientConfig): ResolvedKpsOptions {
   }
   return {
     pinned,
+    discovery,
     entries,
     deprioritize,
     topologySources: boundedInteger(options.topologySources, KPS_CLIENT_DEFAULTS.topologySources, 1, 4, "kps.topologySources"),
@@ -2786,41 +3184,91 @@ interface BootTopologies {
   sources: ServedTopology[];
   /** Short diagnostics for anchors that failed (label and code), never addresses in full. */
   failures: string[];
+  /** Anchor → member it serves for, for every anchor that served a topology. */
+  anchorMembers: Map<string, string>;
+}
+
+/** One boot anchor: its address and, when known, the member behind it. */
+interface BootAnchor {
+  readonly address: string;
+  /** Member known from the snapshot. */
+  readonly member?: string;
+  /** Member a learned record names; `/metadata.json` must confirm it. */
+  readonly hint?: string;
 }
 
 /**
- * Boot (ARCHITECTURE §3.4 step 3): dial shuffled KPS-capable eligible members
- * (restricted by `entries`), at most `anchorParallelism` at a time and started
- * `KPS_ANCHOR_STAGGER_MS` apart, and fetch `/topology` from each. Stop at
- * `topologySources` documents, or `KPS_SECOND_SOURCE_WAIT_MS` after the
- * first, or when every candidate has been tried.
+ * Boot anchors in dial order. Without discovery: the shuffled KPS-capable
+ * eligible pinned members (restricted by `entries`), deprioritised members
+ * last. With discovery (PROPOSAL §2.2 boot step 2), priority classes, each
+ * shuffled: bridges only (when set); otherwise the wallet's gateways or the
+ * bundle's anchors, then learned anchors, then the snapshot's KPS addresses.
+ */
+function bootAnchors(options: ResolvedKpsOptions): BootAnchor[] {
+  const pinnedList = pinnedAnchors(options);
+  const known = new Map(pinnedList.map((entry) => [entry.address, entry.member]));
+  const order = (list: BootAnchor[]): BootAnchor[] => {
+    const shuffled = shuffle(list);
+    return [
+      ...shuffled.filter((entry) => entry.member === undefined || !options.deprioritize.has(entry.member)),
+      ...shuffled.filter((entry) => entry.member !== undefined && options.deprioritize.has(entry.member)),
+    ];
+  };
+  const discovery = options.discovery;
+  if (discovery === undefined) {
+    return order(pinnedList.map((entry) => ({ address: entry.address, member: entry.member })));
+  }
+  const describe = (address: string): BootAnchor => {
+    const member = known.get(address);
+    if (member !== undefined) return { address, member };
+    const hint = discovery.learned.get(address);
+    return hint === undefined ? { address } : { address, hint };
+  };
+  const classes: BootAnchor[][] = discovery.anchorClasses.map((list) => order(list.map(describe)));
+  if (!discovery.exclusive) classes.push(order(pinnedList.map((entry) => ({ address: entry.address, member: entry.member }))));
+  const seen = new Set<string>();
+  const out: BootAnchor[] = [];
+  for (const list of classes) {
+    for (const entry of list) {
+      if (seen.has(entry.address)) continue;
+      seen.add(entry.address);
+      out.push(entry);
+    }
+  }
+  return out;
+}
+
+/**
+ * Boot (ARCHITECTURE §3.4 step 3): dial anchors in `bootAnchors` order, at
+ * most `anchorParallelism` at a time and started `KPS_ANCHOR_STAGGER_MS`
+ * apart, and fetch `/topology` from each. An anchor whose member is not known
+ * (a gateway, bridge or learned address) first answers `/metadata.json`; the
+ * node it names must be an eligible pinned member (and match a learned
+ * record's member). Stop at `topologySources` documents, or
+ * `KPS_SECOND_SOURCE_WAIT_MS` after the first, or when every candidate has
+ * been tried.
  */
 function gatherServedTopologies(
   transport: KpsHttpTransport,
   options: ResolvedKpsOptions,
   log: NoxLogSink | undefined,
 ): Promise<BootTopologies> {
-  const shuffled = pinnedAnchors(options);
-  for (let index = shuffled.length - 1; index > 0; index--) {
-    const other = secureRandomIndex(index + 1);
-    [shuffled[index], shuffled[other]] = [shuffled[other]!, shuffled[index]!];
-  }
-  // Deprioritised members go last; the order within each group stays random.
-  const candidates = [
-    ...shuffled.filter((entry) => !options.deprioritize.has(entry.member)),
-    ...shuffled.filter((entry) => options.deprioritize.has(entry.member)),
-  ].map((entry) => entry.address);
+  const candidates = bootAnchors(options);
   if (candidates.length === 0) {
     return Promise.reject(
       new NoxClientError(
-        "No eligible pinned member publishes a KPS address that this client may use as an entry",
+        options.discovery === undefined
+          ? "No eligible pinned member publishes a KPS address that this client may use as an entry"
+          : "No anchor to dial: no gateway, bridge, bundle anchor, learned or snapshot KPS address",
         NoxClientErrorCode.KpsUnavailable,
       ),
     );
   }
+  const eligible = new Set(eligiblePinnedMembers(options.pinned).map((member) => member.address));
   return new Promise<BootTopologies>((resolve) => {
     const sources: ServedTopology[] = [];
     const failures: string[] = [];
+    const anchorMembers = new Map<string, string>();
     const controller = new AbortController();
     const timers: ReturnType<typeof setTimeout>[] = [];
     let next = 0;
@@ -2831,23 +3279,38 @@ function gatherServedTopologies(
       done = true;
       for (const timer of timers) clearTimeout(timer);
       controller.abort(new NoxClientError("Boot found enough topology sources", NoxClientErrorCode.Aborted));
-      resolve({ sources, failures });
+      resolve({ sources, failures, anchorMembers });
     };
     const fetchWithBootSignal: NoxFetch = (input, init) =>
       transport.fetch(input, { ...init, signal: linkSignals(init?.signal ?? undefined, controller.signal) });
+    const resolveMember = async (candidate: BootAnchor): Promise<string> => {
+      if (candidate.member !== undefined) return candidate.member;
+      const node = await fetchAnchorNode(candidate.address, options.exchangeTimeoutMs, fetchWithBootSignal);
+      if (candidate.hint !== undefined && node !== candidate.hint) {
+        throw new NoxClientError("the learned anchor now names another member", NoxClientErrorCode.TopologyVerificationFailed);
+      }
+      if (!eligible.has(node)) {
+        throw new NoxClientError("the anchor names no eligible pinned member", NoxClientErrorCode.TopologyVerificationFailed);
+      }
+      return node;
+    };
     const launch = (): void => {
       if (done || running >= options.anchorParallelism) return;
       if (next >= candidates.length) {
         if (running === 0) finish();
         return;
       }
-      const anchor = candidates[next++]!;
+      const candidate = candidates[next++]!;
+      const anchor = candidate.address;
       running += 1;
       emitLog(log, "info", "anchor.dial", { anchor: kpsAddressLabel(anchor) });
-      fetchTopology(`kps:${anchor}`, options.exchangeTimeoutMs, fetchWithBootSignal)
+      resolveMember(candidate)
+        .then(async (member) => ({ member, snapshot: await fetchTopology(`kps:${anchor}`, options.exchangeTimeoutMs, fetchWithBootSignal) }))
         .then(
-          (snapshot) => {
+          ({ member, snapshot }) => {
             if (done) return;
+            // Only anchors that served are recorded: they become entry locations of their members.
+            anchorMembers.set(anchor, member);
             sources.push({ anchor, snapshot });
             if (sources.length >= options.topologySources) {
               finish();
@@ -2872,6 +3335,264 @@ function gatherServedTopologies(
       else timers.push(setTimeout(launch, index * KPS_ANCHOR_STAGGER_MS));
     }
   });
+}
+
+/** Most bytes read from an anchor's `/metadata.json`. */
+const MAX_METADATA_BYTES = 16_384;
+
+/**
+ * The registry address an anchor's `/metadata.json` names in `node`
+ * (nox-kps PROTOCOL §5), lowercase. The claim is only a routing hint: the
+ * entry layer of every packet is encrypted to that member's key, which an
+ * impostor cannot peel.
+ */
+async function fetchAnchorNode(address: string, timeoutMs: number, fetchImpl: NoxFetch): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let text: string;
+  try {
+    const response = await fetchImpl(`kps:${address}/metadata.json`, { signal: controller.signal });
+    if (!response.ok) {
+      throw new NoxClientError(`anchor metadata answered HTTP ${response.status}`, NoxClientErrorCode.TopologyFetchFailed);
+    }
+    text = await response.text();
+  } catch (error) {
+    if (error instanceof NoxClientError) throw error;
+    throw new NoxClientError(`anchor metadata fetch failed: ${describeUnknown(error)}`, NoxClientErrorCode.TopologyFetchFailed, error);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (text.length > MAX_METADATA_BYTES) {
+    throw new NoxClientError("anchor metadata is too large", NoxClientErrorCode.TopologyFetchFailed);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new NoxClientError("anchor metadata is not JSON", NoxClientErrorCode.TopologyFetchFailed);
+  }
+  const node = typeof value === "object" && value !== null ? (value as { node?: unknown }).node : undefined;
+  if (typeof node !== "string" || !/^0x[0-9a-fA-F]{40}$/u.test(node)) {
+    throw new NoxClientError(
+      "anchor metadata names no node address: a gateway or bridge nox-kps must set node_address to its member's registered address",
+      NoxClientErrorCode.TopologyVerificationFailed,
+    );
+  }
+  return node.toLowerCase();
+}
+
+/**
+ * Entry location per member. Without discovery: the pinned KPS addresses.
+ * With bridges: only bridge anchors, for the member each serves. Otherwise,
+ * before a chain check the address of an anchor that served for the member
+ * wins over the snapshot's (the member may have moved since); after one the
+ * chain's published address wins over anchors.
+ */
+function discoveryEndpoints(
+  options: ResolvedKpsOptions,
+  membership: readonly MemberRecord[],
+  anchorMembers: ReadonlyMap<string, string>,
+  verified: VerifiedChainState | undefined,
+): Map<string, string> {
+  const discovery = options.discovery;
+  if (discovery === undefined) return pinnedKpsAddresses(options.pinned);
+  const anchorFor = new Map<string, string>();
+  for (const [anchor, member] of anchorMembers) {
+    if (discovery.exclusive && !discovery.anchorClasses[0]!.includes(anchor)) continue;
+    if (!anchorFor.has(member)) anchorFor.set(member, anchor);
+  }
+  if (discovery.exclusive) return anchorFor;
+  const out = new Map<string, string>();
+  for (const member of membership) {
+    const published = kpsAddrFromMetadataUrl(member.metadataUrl);
+    const anchor = anchorFor.get(member.address);
+    const chosen = verified === undefined ? anchor ?? published : published ?? anchor;
+    if (chosen !== undefined && chosen !== null) out.set(member.address, chosen);
+  }
+  return out;
+}
+
+/** The served-document rule's membership, anchors, endpoints and policy thresholds. */
+function servedRuleOptions(
+  options: ResolvedKpsOptions,
+  membership: readonly MemberRecord[],
+  anchorMembers: ReadonlyMap<string, string>,
+  endpoints: ReadonlyMap<string, string>,
+  membershipBlock: number,
+): Pick<
+  ApplyServedOptionsShape,
+  "membership" | "anchorMembers" | "endpoints" | "entryAddresses" | "minRemovalSources" | "minMembersPerLayer" | "membershipBlock"
+> {
+  const discovery = options.discovery;
+  if (discovery === undefined) {
+    return options.entries === undefined ? {} : { entryAddresses: options.entries };
+  }
+  return {
+    membership,
+    anchorMembers,
+    endpoints,
+    membershipBlock,
+    ...(discovery.exclusive ? { entryAddresses: new Set(discovery.anchorClasses[0]) } : {}),
+    minRemovalSources: discovery.bootstrap.policy.minRemovalSources,
+    minMembersPerLayer: discovery.bootstrap.policy.minMembersPerLayer,
+  };
+}
+
+type ApplyServedOptionsShape = Parameters<typeof applyServedTopologies>[3];
+
+/**
+ * Routing context of a KPS client: entry endpoints, capability hints (the
+ * snapshot's reviewed hints for pinned members, served liveness for the
+ * rest) and probation flags.
+ */
+function kpsRoutingContext(kps: KpsState): RoutingContext {
+  const { options } = kps;
+  if (options.discovery === undefined) {
+    return {
+      endpoints: kps.endpoints,
+      entryAddresses: options.entries,
+      capabilities: new Map(options.pinned.members.map((member) => [member.address, member.capabilities])),
+      probation: new Set(),
+    };
+  }
+  const capabilities = new Map<string, readonly string[]>();
+  for (const source of kps.lastServed) {
+    for (const [address, list] of livenessCapabilities(source.snapshot)) {
+      if (!capabilities.has(address)) capabilities.set(address, list);
+    }
+  }
+  for (const member of options.pinned.members) capabilities.set(member.address, member.capabilities);
+  return {
+    endpoints: kps.endpoints,
+    entryAddresses: options.discovery.exclusive ? new Set(options.discovery.anchorClasses[0]) : undefined,
+    capabilities,
+    probation: new Set(kps.membership.filter((member) => member.probation).map((member) => member.address)),
+  };
+}
+
+/** Validate `kps.discovery` (PROPOSAL §2.5). Throws `INVALID_CONFIG` or `TOPOLOGY_VERIFICATION_FAILED`. */
+function resolveDiscovery(raw: unknown, pinned: PinnedSnapshot): ResolvedDiscovery {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new NoxClientError("kps.discovery must be an object", NoxClientErrorCode.InvalidConfig);
+  }
+  const options = raw as Record<string, unknown>;
+  for (const key of Object.keys(options)) {
+    if (!DISCOVERY_OPTION_KEYS.has(key)) {
+      throw new NoxClientError(`kps.discovery.${key} is not a discovery option`, NoxClientErrorCode.InvalidConfig);
+    }
+  }
+  const bootstrap = verifyBootstrap(options["bootstrap"], pinned);
+  const configError = (detail: string): NoxClientError =>
+    new NoxClientError(`kps.discovery.${detail}`, NoxClientErrorCode.InvalidConfig);
+  if (options["gateways"] !== undefined && options["bridges"] !== undefined) {
+    throw configError("gateways and bridges exclude each other: bridges are the only anchors when set");
+  }
+  const bridges = options["bridges"] === undefined ? undefined : checkAnchorList(options["bridges"], "bridges", 1, configError);
+  const gateways = options["gateways"] === undefined ? undefined : checkAnchorList(options["gateways"], "gateways", 1, configError);
+  const learned = new Map<string, string>();
+  if (options["learned"] !== undefined) {
+    const list = options["learned"];
+    if (!Array.isArray(list) || list.length > DISCOVERY_LIMITS.maxLearned) {
+      throw configError(`learned must be a list of at most ${DISCOVERY_LIMITS.maxLearned} anchors`);
+    }
+    list.forEach((entry: unknown, index) => {
+      const record = entry as { address?: unknown; member?: unknown } | null;
+      if (
+        typeof record !== "object" || record === null ||
+        typeof record.address !== "string" || !isKpsAddress(record.address) ||
+        typeof record.member !== "string" || !MEMBER_ADDRESS_RE.test(record.member)
+      ) {
+        throw configError(`learned[${index}] must be { address: <kps address>, member: <lowercase 0x address> }`);
+      }
+      if (!learned.has(record.address)) learned.set(record.address, record.member);
+    });
+  }
+  const providers = options["registryRpcUrls"] === undefined
+    ? bootstrap.registryRpcUrls
+    : checkRpcUrls(options["registryRpcUrls"], "registryRpcUrls", configError);
+  const [quorumMin, quorumMax] = DISCOVERY_POLICY_RANGES.chainQuorum;
+  const quorum = boundedInteger(options["chainQuorum"], bootstrap.policy.chainQuorum, quorumMin, quorumMax, "kps.discovery.chainQuorum");
+  const chain = options["chain"] ?? true;
+  if (typeof chain !== "boolean") throw configError("chain must be a boolean");
+  const firstSeen = new Map<string, MemberFirstSeen>();
+  if (options["firstSeen"] !== undefined) {
+    const list = options["firstSeen"];
+    if (!Array.isArray(list) || list.length > DISCOVERY_LIMITS.maxFirstSeen) {
+      throw configError(`firstSeen must be a list of at most ${DISCOVERY_LIMITS.maxFirstSeen} records`);
+    }
+    list.forEach((entry: unknown, index) => {
+      const record = entry as Partial<MemberFirstSeen> | null;
+      if (
+        typeof record !== "object" || record === null ||
+        typeof record.address !== "string" || !MEMBER_ADDRESS_RE.test(record.address) ||
+        typeof record.block !== "number" || !Number.isSafeInteger(record.block) || record.block < pinned.blockNumber ||
+        typeof record.time !== "number" || !Number.isSafeInteger(record.time) || record.time < 0
+      ) {
+        throw configError(`firstSeen[${index}] must be { address, block >= the snapshot block, time }`);
+      }
+      firstSeen.set(record.address, { address: record.address, block: record.block, time: record.time });
+    });
+  }
+  const onVerified = options["onVerified"];
+  if (onVerified !== undefined && typeof onVerified !== "function") throw configError("onVerified must be a function");
+  const anchorClasses: string[][] = bridges !== undefined
+    ? [bridges]
+    : [gateways ?? bootstrap.anchors, [...learned.keys()]];
+  return {
+    bootstrap,
+    anchorClasses,
+    exclusive: bridges !== undefined,
+    learned,
+    providers,
+    quorum,
+    chain,
+    firstSeen,
+    onVerified: onVerified as ((state: VerifiedDiscovery) => void) | undefined,
+  };
+}
+
+/** Keys of `KpsDiscoveryOptions`. */
+const DISCOVERY_OPTION_KEYS = new Set([
+  "bootstrap",
+  "gateways",
+  "bridges",
+  "learned",
+  "registryRpcUrls",
+  "chainQuorum",
+  "chain",
+  "firstSeen",
+  "onVerified",
+]);
+
+function shuffle<T>(list: readonly T[]): T[] {
+  const out = [...list];
+  for (let index = out.length - 1; index > 0; index--) {
+    const other = secureRandomIndex(index + 1);
+    [out[index], out[other]] = [out[other]!, out[index]!];
+  }
+  return out;
+}
+
+function isTopologyStale(error: unknown): boolean {
+  return error instanceof NoxClientError && error.code === NoxClientErrorCode.TopologyStale;
+}
+
+/** True when `node` can serve `layer` (entries need a `kps:` endpoint). */
+function nodeInLayer(node: TopologyNode, layer: "entry" | "mix" | "exit"): boolean {
+  const layers = layersForRole(node.role);
+  switch (layer) {
+    case "entry":
+      return layers.includes(0) && node.address.length > 0;
+    case "mix":
+      return layers.includes(1);
+    case "exit":
+      return node.role === 2 || node.role === 3;
+  }
+}
+
+function describeUnknown(error: unknown): string {
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  return String(error);
 }
 
 /** A signal that aborts when either input aborts. */

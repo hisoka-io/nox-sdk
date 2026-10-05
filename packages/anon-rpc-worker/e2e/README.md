@@ -15,6 +15,10 @@ headless Chromium (Playwright)
 upstream anvil also holds a NoxRegistry (behind an ERC1967 proxy) that every node observes; each node
 is registered there with its sphinx key, multiaddr, ingress URL and `kps:` metadataUrl, and the worker's
 pinned snapshot is generated from it with the release tooling (scripts/make-snapshot.mjs)
+
+worker registry checks (S1) -> mixnet -> exit HttpRequest -> two "providers" of the upstream chain:
+  the upstream anvil itself and an RPC forwarder on another port in front of it
+  (anvil runs with --slots-in-an-epoch 1, so `finalized` trails `latest` by two blocks)
 ```
 
 It also proves each layer on its own first: the harness with the upstream passthrough worker, browser
@@ -45,6 +49,7 @@ servers), solc 0.8.28 only to regenerate the vendored specifier artifact.
 | `kps-webrtc.spec.ts` | Browser WebRTC-KPS in this environment: the page dials with `@kpstreams/webrtc-client` and a hash-pinned probe worker dials through `anonRpcWorker.kps` (`dial` and `openStream`). Echo (32 B, 32 KiB, 512 KiB, 10 sequential and 4 parallel streams) against the Go and Rust reference servers; small-request/large-response (32 KiB to 16 MiB) against `tools/kps-bulk-server`. Loopback and the host's external IPv4, with Chromium's default WebRTC settings and with the flags the upstream anon-rpc e2e uses. | KPS servers |
 | `classic-sdk.spec.ts` | The existing SDK transport (HTTP ingress, seed topology, SURB replies) through the 10-node mesh: echo, then `eth_chainId`, `eth_getBalance`, a 3-call batch and a JSON-RPC error through an exit to the upstream anvil, compared with direct calls. | nox binaries, SDK dist |
 | `nox-kps-sidecar.spec.ts` | One nox-kps per mesh node, reached from a hash-pinned probe worker through `anonRpcWorker.kps` with KPS-HTTP/1: `/topology` matches the node's own topology, `/health` and `/metadata.json` answer, `/api/v1/ws` stays unexposed. Runs once `NOX_KPS_CMD` is set. | nox binaries, nox-kps |
+| `s1-discovery.spec.ts` | S1 discovery with a bundle built for the spec (snapshot after parking every node's KPS address except two and after one node left; bootstrap anchor = one node; empty worker config): (1) a node restarts its nox-kps on another port with the same identity and sends `updateMetadataUrl` from its own key; the running worker's chain check (two exits, two providers, finalized block) logs `discovery.verified` with `moved >= 1`, and calls succeed with the moved address as the only reachable entry; (2) the node that left registers again; the running worker finds it (registration logs close the set), logs `discovery.probation`, and calls succeed with it as the only reachable entry. Everything is restored afterwards. | everything above, nox-kps, `NOX_WORKER_BUILD_CMD` |
 | `nox-worker.spec.ts` | The Nox worker through harness → KPS → nox-kps → mesh → exit → anvil, with a bundle built for this run (snapshot of the local NoxRegistry): boot by specifier (`.ready`, sandbox) on harness 0.3.2 and 0.3.0; the JSON-RPC matrix compared with direct calls (`eth_chainId`, `eth_blockNumber`, `eth_getBalance`, `eth_call`, `eth_getLogs` small and about 1 MB, a 4-call batch, an invalid and a valid `eth_sendRawTransaction`, an unknown method); the bundle served by a sidecar through a `kps:` resolver only; calls issued before `ready`; host abort (queued and in flight); `worker.close()` with calls in flight, then a fresh worker; `bad-config`; boot time and per-call p50/p95; drills TC-571 (an entry goes down, calls move to the other) and TC-570 (a rotated certhash under the pinned address: no fallback, `timeout`, other entries keep serving). Every test runs under the egress check below, from page load on. | everything above, nox-kps, worker bundle |
 
 Reports land in `.run/reports/*.json` (latest) and in each run directory `.run/<timestamp>-<label>-<pid>/`
@@ -123,15 +128,20 @@ bundle is built for the running mesh. `run-all.sh` sets this when the sidecars r
 export NOX_WORKER_BUILD_CMD="node ../scripts/build-test-worker.mjs --testbed {testbed_json} --out {out}"
 ```
 
-`build-test-worker.mjs` runs `make-snapshot.mjs` against the local registry at the registration block, with
-capability hints from a node's served liveness section, then `build.mjs --snapshot`; the snapshot, networks and
-capability files are written next to the bundle in the run directory.
+`build-test-worker.mjs` runs `make-snapshot.mjs` against the local registry at the registration block (or
+`--snapshot-block <n>`), with capability hints from a node's served liveness section, writes a discovery bootstrap
+for the bed (the registry implementation, the two local providers, the published KPS addresses of the first
+`E2E_BOOTSTRAP_ANCHORS` nodes, the production policy with `E2E_CHAIN_REFRESH_SECS` and `E2E_MAX_STATE_AGE_SECS`),
+then `build.mjs --snapshot --bootstrap`; the snapshot, bootstrap, networks and capability files are written next to
+the bundle in the run directory.
 
 `{testbed_json}` is the run's `testbed.json` (`src/testbed.ts` `TestbedInfo`): `mesh.nodes[]` with `id`, `role`
 (1 relay, 2 exit, 3 full), `address`, `sphinxPublicKey`, `peerId`, `p2pMultiaddr`, `ingressUrl`, `topologyUrl` and
-`kpsAddress`, plus both chains. The command writes the bundle to `{out}`; the bed pins it behind a fresh
+`kpsAddress`, `mesh.registry` (address, implementation, chain, blocks), `mesh.discovery` (providers, anchors, check
+interval, state age), plus both chains. The command writes the bundle to `{out}`; the bed pins it behind a fresh
 `WorkerSpecifier` and boots it. Without a build command, `NOX_WORKER_BUNDLE` (default `../dist/anon-rpc-worker.js`)
-is used as is. The worker config defaults to `{ "gateways": [<every sidecar address>], "logLevel": "debug" }`;
+is used as is. The worker config defaults to `{ "gateways": [<every sidecar address>], "logLevel": "debug" }`
+(gateways are tried first; the wrong-certhash drill uses `bridges`, the only addresses the worker then dials);
 `NOX_WORKER_CONFIG` (a JSON file) or `NOX_WORKER_CONFIG_MODULE` (exports `buildWorkerConfig(testbed)`) replace it.
 
 ## Configuration
@@ -150,6 +160,7 @@ Every port, path, timeout and size comes from `src/config.ts`; each default can 
 | `NOX_KPS_CMD`, `NOX_KPS_INIT_CMD`, `NOX_KPS_CONFIG_TEMPLATE` | unset | nox-kps sidecars |
 | `NOX_WORKER_BUILD_CMD`, `NOX_WORKER_BUNDLE` | unset, `../dist/anon-rpc-worker.js` | worker under test |
 | `NOX_WORKER_CONFIG`, `NOX_WORKER_CONFIG_MODULE` | unset | worker config |
+| `E2E_BOOTSTRAP_ANCHORS`, `E2E_CHAIN_REFRESH_SECS`, `E2E_MAX_STATE_AGE_SECS` | 3, 3, 86400 | test-bed bundle bootstrap: default anchors, chain check interval, oldest finalized block accepted |
 | `E2E_EXPECT_BAD_CONFIG_CODE` | `bad-config` | `signalFailed` code for an invalid config |
 | `NOX_CLIENT_ENTRY` | `../../nox-client/dist/index.js` | classic SDK build |
 | `E2E_*_TIMEOUT_MS` | see `src/config.ts` | readiness and call deadlines |

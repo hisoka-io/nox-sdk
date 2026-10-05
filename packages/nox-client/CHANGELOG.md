@@ -2,6 +2,36 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
+## 0.6.0 (unreleased)
+
+Additive; every 0.5.0 configuration behaves as before.
+
+### Added
+
+- `kps.discovery` (S1): identity from the snapshot and the chain, location looked up at run time.
+  - Boot anchors in priority classes: `bridges` only (Tor bridge semantics), or `gateways` (in place of the
+    bootstrap's default anchors), learned anchors, then the snapshot's KPS addresses. Unknown addresses are mapped
+    to a member through their `/metadata.json` and must name an eligible snapshot member.
+  - Identity-only presence: url, ingressUrl and metadataUrl changes in served topologies are moves, not removals.
+    A new routing url two anchors agree on is used provisionally.
+  - Chain check after ready and every `chainRefreshSeconds`: NoxRegistry read through `chainQuorum` exits to as many
+    RPC providers at one finalized block (EIP-1898 pinned), used only on byte-identical agreement, a closed member
+    set and the expected EIP-1967 implementation; registration logs complete a set served documents did not name.
+  - New members on probation (`probationSeconds`, `probationMaxPerRoute`), removal floor per route layer,
+    `onVerified` callback with chain-confirmed KPS addresses and first-seen records.
+  - `nox-anon-rpc-bootstrap/1` format with `verifyBootstrap`; discovery building blocks exported for tools.
+- `selectRoute` takes an optional probation cap; `TopologyNode.probation`. A pinned entry and a selected exit that
+  both are on probation over the cap are refused while a settled exit exists; paid-exit selection and entry
+  switches prefer settled members.
+- Chain checks read at most 256 candidate addresses (`DISCOVERY_LIMITS.maxCandidates`, `rankChainCandidates`):
+  snapshot and verified members first, then addresses at least `minRemovalSources` anchors list, then the rest.
+  Served documents listing more than 256 nodes are refused.
+
+### Changed
+
+- KPS mode judges served topologies on identity (address, Sphinx key, role, layer) also without discovery: a
+  member whose served `metadataUrl` or `ingressUrl` differs from the snapshot is kept instead of removed.
+
 ## 0.5.0
 
 Needs `@hisoka-io/nox-wasm` 0.2.0 (unchanged). Classic mode is the default and behaves exactly as 0.4.0: the 0.4.0

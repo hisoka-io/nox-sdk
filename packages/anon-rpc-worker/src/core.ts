@@ -4,22 +4,29 @@
  * or SDK side effects. `worker.ts` wires the real harness API, the embedded
  * WASM and snapshot, and `NoxClient.connect`.
  *
- * Boot: snapshot check → config → platform → WASM → accept loop (calls may
- * arrive before ready) → `NoxClient.connect({ mode: "kps" })` with retries →
- * `signalReady()`. Ready means: config valid, WASM initialised, pinned
- * snapshot verified, at least one KPS entry dialled and one served topology
- * accepted. Only permanent faults call `signalFailed`; transient ones retry
- * forever with back-off while `ready` stays pending.
+ * Boot: snapshot and bootstrap check → config → platform → WASM → accept
+ * loop (calls may arrive before ready) → `NoxClient.connect({ mode: "kps" })`
+ * with retries → `signalReady()`. Ready means: config valid, WASM
+ * initialised, pinned snapshot and discovery bootstrap verified, at least one
+ * KPS anchor dialled and one served topology accepted. Only permanent faults
+ * call `signalFailed`; transient ones retry forever with back-off while
+ * `ready` stays pending. After ready the SDK checks NoxRegistry through the
+ * mixnet in the background (S1); each verified check refreshes the
+ * learned-anchor cache.
  */
 import {
   eligiblePinnedMembers,
   pinnedKpsAddresses,
+  verifyBootstrap,
   verifyPinnedSnapshot,
+  type KpsBootstrap,
   type KpsConnLike,
+  type KpsDiscoveryOptions,
   type NoxClientConfig,
   type NoxLogSink,
   type NoxWasmBindings,
   type PinnedSnapshot,
+  type VerifiedDiscovery,
 } from "@hisoka-io/nox-client";
 import type { AnonFetchResponse, AnonRpcWorkerApi, FetchCall } from "./spec-types.js";
 import { ConfigError, parseConfig, type NoxWorkerConfig } from "./config.js";
@@ -35,7 +42,15 @@ import {
 } from "./errors.js";
 import { mapClientError, prepareRequest, sendPrepared, type CallBudget, type NoxHttpPort } from "./fetch-map.js";
 import { createLogger, describeError, errorCode, type LogLevel, type WorkerLogger } from "./log.js";
-import { RemovalCacheWriter, REMOVAL_CACHE_WRITE_INTERVAL_MS, readRemovalCache } from "./storage.js";
+import {
+  LearnedCacheWriter,
+  RemovalCacheWriter,
+  REMOVAL_CACHE_WRITE_INTERVAL_MS,
+  learnedCacheRegistry,
+  readLearnedCache,
+  readRemovalCache,
+  type LearnedForBoot,
+} from "./storage.js";
 
 /** The slice of `NoxClient` the worker uses. */
 export interface NoxClientPort extends NoxHttpPort {
@@ -48,6 +63,8 @@ export interface NoxClientPort extends NoxHttpPort {
 export interface WorkerDeps {
   /** The pinned snapshot embedded in the bundle, as parsed JSON (verified at boot). */
   readonly snapshot: unknown;
+  /** The discovery bootstrap embedded in the bundle (`nox-anon-rpc-bootstrap/1`), verified at boot. */
+  readonly bootstrap: unknown;
   /** Initialise the embedded WASM and return its bindings; throws when WebAssembly is blocked. */
   loadWasm(): Promise<NoxWasmBindings>;
   /** `NoxClient.connect`. */
@@ -129,6 +146,7 @@ class NoxWorker {
   private readonly readyWaiters = new Set<{ resolve(client: NoxClientPort): void; reject(error: unknown): void }>();
   private readonly trapTimes: number[] = [];
   private cacheTimer: ReturnType<typeof setInterval> | undefined;
+  private learnedWriter: LearnedCacheWriter | undefined;
   private callSeq = 0;
   private readonly now: () => number;
   private readonly random: () => number;
@@ -154,9 +172,17 @@ class NoxWorker {
       return;
     }
 
+    let bootstrap: KpsBootstrap;
+    try {
+      bootstrap = verifyBootstrap(this.deps.bootstrap, pinned);
+    } catch (error) {
+      this.fail(FAILED_CODES.snapshotInvalid, `The discovery bootstrap in this bundle is invalid: ${describeError(error)}`);
+      return;
+    }
+
     let cfg: NoxWorkerConfig;
     try {
-      cfg = parseConfig(this.api.config, new Set(pinnedKpsAddresses(pinned).values()));
+      cfg = parseConfig(this.api.config);
     } catch (error) {
       const message = error instanceof ConfigError ? error.message : describeError(error);
       this.fail(FAILED_CODES.badConfig, message);
@@ -169,6 +195,10 @@ class NoxWorker {
       block: pinned.blockNumber,
       members: pinned.members.length,
       kpsMembers: pinnedKpsAddresses(pinned).size,
+      anchors: bootstrap.anchors.length,
+      discovery: cfg.discovery,
+      gateways: cfg.gateways?.length ?? 0,
+      bridges: cfg.bridges?.length ?? 0,
     });
 
     const missing = missingPlatform(this.api);
@@ -193,8 +223,14 @@ class NoxWorker {
     void this.acceptLoop(cfg);
 
     const snapshotId = snapshotIdentity(pinned);
-    const stored = await readRemovalCache(this.api.storage, snapshotId, Math.floor(this.now() / 1000));
-    const client = await this.connectWithRetries(cfg, pinned, wasm, stored);
+    const nowUnix = Math.floor(this.now() / 1000);
+    const stored = await readRemovalCache(this.api.storage, snapshotId, nowUnix);
+    const registry = learnedCacheRegistry(pinned.chainId, pinned.registry);
+    const eligible = new Set(eligiblePinnedMembers(pinned).map((member) => member.address));
+    const learned = await readLearnedCache(this.api.storage, registry, pinned.blockNumber, eligible, nowUnix);
+    this.log.info("boot.learned", { anchors: learned.learned.length, firstSeen: learned.firstSeen.length });
+    this.learnedWriter = new LearnedCacheWriter(this.api.storage, registry);
+    const client = await this.connectWithRetries(cfg, pinned, bootstrap, wasm, stored, learned);
     if (client === undefined) return;
 
     if (cfg.warmup) await this.warmup(client);
@@ -235,8 +271,10 @@ class NoxWorker {
   private async connectWithRetries(
     cfg: NoxWorkerConfig,
     pinned: PinnedSnapshot,
+    bootstrap: KpsBootstrap,
     wasm: NoxWasmBindings,
     deprioritize: readonly string[],
+    learned: LearnedForBoot,
   ): Promise<NoxClientPort | undefined> {
     const dial = this.api.kps.dial.bind(this.api.kps);
     const kpsDial = async (address: string, opts?: { signal?: AbortSignal }): Promise<KpsConnLike> => {
@@ -258,7 +296,7 @@ class NoxWorker {
         pinned,
         topologySources: cfg.topologySources,
         claimIntervalMs: cfg.claimIntervalMs,
-        ...(cfg.gateways === undefined ? {} : { entries: cfg.gateways }),
+        discovery: this.discoveryOptions(cfg, bootstrap, learned),
         ...(deprioritize.length === 0 ? {} : { deprioritize }),
       },
     };
@@ -295,6 +333,34 @@ class NoxWorker {
         await this.sleep(delayMs);
       }
     }
+  }
+
+  /** SDK discovery options from the config, the bundle's bootstrap and the learned-anchor cache. */
+  private discoveryOptions(cfg: NoxWorkerConfig, bootstrap: KpsBootstrap, learned: LearnedForBoot): KpsDiscoveryOptions {
+    return {
+      bootstrap,
+      chain: cfg.discovery === "chain",
+      onVerified: (state) => this.onVerified(state),
+      ...(cfg.gateways === undefined ? {} : { gateways: cfg.gateways }),
+      ...(cfg.bridges === undefined ? {} : { bridges: cfg.bridges }),
+      // With bridges the worker never dials a published address, learned ones included.
+      ...(cfg.bridges === undefined && learned.learned.length > 0 ? { learned: learned.learned } : {}),
+      ...(learned.firstSeen.length > 0 ? { firstSeen: learned.firstSeen } : {}),
+      ...(cfg.registryRpcUrls === undefined ? {} : { registryRpcUrls: cfg.registryRpcUrls }),
+      ...(cfg.chainQuorum === undefined ? {} : { chainQuorum: cfg.chainQuorum }),
+    };
+  }
+
+  /** A verified chain check: refresh the learned-anchor cache (best effort). */
+  private onVerified(state: VerifiedDiscovery): void {
+    const writer = this.learnedWriter;
+    if (writer === undefined || this.failed) return;
+    writer.update(state, this.now()).then(
+      (wrote) => {
+        if (wrote) this.log.debug("storage.learned", { anchors: state.members.filter((m) => m.kpsAddress !== null).length });
+      },
+      (error: unknown) => this.log.warn("storage.failed", { code: errorCode(error) ?? "error" }),
+    );
   }
 
   private async warmup(client: NoxClientPort): Promise<void> {

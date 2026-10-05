@@ -55,3 +55,74 @@ export function claimWindow(
   if (window.length < max) window.push(...ids.slice(0, max - window.length));
   return { window, next: (start + max) % ids.length };
 }
+
+/** Format tag of the discovery bootstrap a bundle pins (`KpsBootstrap`). */
+export const BOOTSTRAP_FORMAT = "nox-anon-rpc-bootstrap/1";
+
+/** Inclusive ranges of the `DiscoveryPolicy` fields. */
+export const DISCOVERY_POLICY_RANGES = Object.freeze({
+  chainQuorum: [2, 4],
+  maxStateAgeSeconds: [60, 86_400],
+  chainRefreshSeconds: [1, 86_400],
+  probationMaxPerRoute: [0, 2],
+  probationSeconds: [0, 31_536_000],
+  minRemovalSources: [2, 4],
+  minMembersPerLayer: [1, 4],
+} as const satisfies Record<string, readonly [number, number]>);
+
+/** Policy of the production bootstrap (PROPOSAL §2.2). */
+export const DISCOVERY_POLICY_DEFAULTS = Object.freeze({
+  chainQuorum: 2,
+  maxStateAgeSeconds: 3_600,
+  chainRefreshSeconds: 600,
+  probationMaxPerRoute: 1,
+  probationSeconds: 1_209_600,
+  minRemovalSources: 2,
+  minMembersPerLayer: 2,
+});
+
+/** Bounds on list fields of the bootstrap and discovery options. */
+export const DISCOVERY_LIMITS = Object.freeze({
+  /** Anchors, gateways or bridges. */
+  maxAnchors: 16,
+  /** Learned anchors accepted from a cache. */
+  maxLearned: 32,
+  /** Registry RPC endpoints. */
+  minRpcUrls: 2,
+  maxRpcUrls: 8,
+  maxRpcUrlLength: 256,
+  /** First-seen records accepted (the registry holds at most 256 members). */
+  maxFirstSeen: 256,
+  /**
+   * Member addresses one chain check reads, and nodes one served topology
+   * document may list: the same 256-member bound. Each candidate costs two
+   * `eth_call`s per pair at the public providers, so one anchor must not be
+   * able to grow the read without limit.
+   */
+  maxCandidates: 256,
+});
+
+/** Pairings a chain check tries before it gives up until the next run. */
+export const DISCOVERY_PAIRING_BUDGET = 3;
+
+/** Shortest gap between two chain checks that a trigger (not the timer) starts. */
+export const DISCOVERY_TRIGGER_MIN_GAP_MS = 30_000;
+
+/** Per-request reply budget of a registry read: fixed part plus per candidate member. */
+export const DISCOVERY_REPLY_BYTES = Object.freeze({ base: 8_192, perMember: 2_048 });
+
+/**
+ * `eth_getLogs` fallback when served topologies do not name every member:
+ * block span per request and requests per check.
+ */
+export const DISCOVERY_LOG_SCAN = Object.freeze({ chunkBlocks: 2_000_000, maxChunks: 8 });
+
+/**
+ * Most JSON-RPC calls in one request of a chain check. Public providers cap
+ * batches (Tenderly's gateway answers 429 above 20 calls), so a larger read
+ * goes out as several requests, one after another, all pinned to one block.
+ */
+export const DISCOVERY_MAX_BATCH_CALLS = 20;
+
+/** Clock skew tolerated on a finalized block's timestamp. */
+export const DISCOVERY_CLOCK_SKEW_SECONDS = 600;

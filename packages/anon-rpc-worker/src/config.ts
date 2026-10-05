@@ -1,21 +1,33 @@
 /**
- * `anonRpcWorker.config` (ARCHITECTURE §4.2): optional, JSON-compatible, and
- * validated before anything touches the network. `undefined` and `{}` both
- * mean "defaults": entries and the snapshot are pinned in the bundle, so the
- * worker boots with no config at all (D-02).
+ * `anonRpcWorker.config` (ARCHITECTURE §4.2, PROPOSAL §2.5): optional,
+ * JSON-compatible, and validated before anything touches the network.
+ * `undefined` and `{}` both mean "defaults": the bundle pins the snapshot and
+ * the default anchors, so the worker boots with no config at all (D-24).
  *
  * The host's value is never mutated; the parsed result is a frozen copy.
  */
-import { isKpsAddress } from "@hisoka-io/nox-client";
+import { checkAnchorList, checkRpcUrls, DISCOVERY_POLICY_RANGES } from "@hisoka-io/nox-client";
 import { FAILED_CODES, NoxWorkerError } from "./errors.js";
 import { LOG_LEVELS, type LogLevel } from "./log.js";
 
 export type SurbFormatSetting = "auto" | "v1" | "v2";
 
+/** `"chain"`: registry reads through the mixnet (S1). `"snapshot"`: the pinned snapshot is the only membership source. */
+export type DiscoverySetting = "chain" | "snapshot";
+
 export interface NoxWorkerConfig {
   readonly v: 1;
-  /** Allowed entry KPS addresses (`<ip>:<port>:<certhash>`); `undefined` = every KPS-capable pinned member. */
+  /** KPS addresses (`<ip>:<port>:<certhash>`) tried first, in place of the bundle's default anchors. */
   readonly gateways: readonly string[] | undefined;
+  /** The only KPS addresses the worker dials (Tor bridge semantics); excludes `gateways`. */
+  readonly bridges: readonly string[] | undefined;
+  /** Replaces the bundle's registry RPC URLs. */
+  readonly registryRpcUrls: readonly string[] | undefined;
+  /** Distinct exit/provider pairs that must agree; `undefined` = the bundle's policy. */
+  readonly chainQuorum: number | undefined;
+  readonly discovery: DiscoverySetting;
+  /** Reserved for proof-backed discovery; only `"auto"` is accepted. */
+  readonly trust: "auto";
   readonly logLevel: LogLevel;
   /** Per attempt for small and medium reads. */
   readonly attemptTimeoutMs: number;
@@ -36,6 +48,11 @@ export interface NoxWorkerConfig {
 export const CONFIG_DEFAULTS: NoxWorkerConfig = Object.freeze({
   v: 1,
   gateways: undefined,
+  bridges: undefined,
+  registryRpcUrls: undefined,
+  chainQuorum: undefined,
+  discovery: "chain",
+  trust: "auto",
   logLevel: "info",
   attemptTimeoutMs: 12_000,
   callDeadlineMs: 25_000,
@@ -61,11 +78,14 @@ export const CONFIG_RANGES = Object.freeze({
   topologySources: [1, 4],
 } as const satisfies Record<string, readonly [number, number]>);
 
-/** `gateways` list length bounds. */
+/** `gateways` and `bridges` list length bounds. */
 export const GATEWAYS_RANGE = Object.freeze([1, 16] as const);
 
 const SURB_FORMATS: readonly SurbFormatSetting[] = ["auto", "v1", "v2"];
-const KNOWN_KEYS = new Set<string>(Object.keys(CONFIG_DEFAULTS));
+const DISCOVERY_SETTINGS: readonly DiscoverySetting[] = ["chain", "snapshot"];
+/** Names reserved for later stages (PROPOSAL §2.5): refused so they are never reused differently. */
+const RESERVED_KEYS = new Set(["checkpoint"]);
+const KNOWN_KEYS = new Set<string>([...Object.keys(CONFIG_DEFAULTS), ...RESERVED_KEYS]);
 
 type NumericField = keyof typeof CONFIG_RANGES;
 
@@ -78,11 +98,12 @@ export class ConfigError extends NoxWorkerError {
 }
 
 /**
- * Validate `raw` and fill defaults. `pinnedGateways` is the set of KPS
- * addresses the pinned snapshot publishes; each configured gateway must be one
- * of them (config can restrict entries, never add identities).
+ * Validate `raw` and fill defaults. Gateways and bridges are addresses, not
+ * identities: any well-formed KPS address is accepted, and the node behind it
+ * must still be a known member (its `/metadata.json` names it) before the
+ * worker routes through it.
  */
-export function parseConfig(raw: unknown, pinnedGateways: ReadonlySet<string>): NoxWorkerConfig {
+export function parseConfig(raw: unknown): NoxWorkerConfig {
   if (raw === undefined || raw === null) return CONFIG_DEFAULTS;
   if (!isPlainObject(raw)) {
     throw new ConfigError("config must be a plain object (or absent)");
@@ -123,27 +144,38 @@ export function parseConfig(raw: unknown, pinnedGateways: ReadonlySet<string>): 
     if (typeof warmup !== "boolean") throw new ConfigError("config.warmup must be a boolean");
     out.warmup = warmup;
   }
-  if (raw["gateways"] !== undefined) out.gateways = parseGateways(raw["gateways"], pinnedGateways);
-  return Object.freeze(out);
-}
-
-function parseGateways(value: unknown, pinned: ReadonlySet<string>): readonly string[] {
-  const [min, max] = GATEWAYS_RANGE;
-  if (!Array.isArray(value) || value.length < min || value.length > max) {
-    throw new ConfigError(`config.gateways must be a list of ${min}..${max} KPS addresses`);
+  for (const key of RESERVED_KEYS) {
+    if (raw[key] !== undefined) throw new ConfigError(`config.${key} is reserved for a later version and not accepted yet`);
   }
-  const seen = new Set<string>();
-  value.forEach((entry: unknown, index) => {
-    if (typeof entry !== "string" || !isKpsAddress(entry)) {
-      throw new ConfigError(`config.gateways[${index}] is not a KPS address <ip>:<port>:<certhash>`);
+  const trust = raw["trust"];
+  if (trust !== undefined && trust !== "auto") {
+    throw new ConfigError('config.trust is reserved: only "auto" is accepted until proof-backed discovery ships');
+  }
+  const discovery = raw["discovery"];
+  if (discovery !== undefined) {
+    if (typeof discovery !== "string" || !(DISCOVERY_SETTINGS as readonly string[]).includes(discovery)) {
+      throw new ConfigError(`config.discovery must be one of ${DISCOVERY_SETTINGS.join(", ")}`);
     }
-    if (!pinned.has(entry)) {
-      throw new ConfigError(`config.gateways[${index}] is not the KPS address of a node pinned in this bundle`);
+    out.discovery = discovery as DiscoverySetting;
+  }
+  const fail = (detail: string): ConfigError => new ConfigError(`config.${detail}`);
+  if (raw["gateways"] !== undefined && raw["bridges"] !== undefined) {
+    throw new ConfigError("config.gateways and config.bridges exclude each other: with bridges the worker dials only bridges");
+  }
+  if (raw["gateways"] !== undefined) out.gateways = Object.freeze(checkAnchorList(raw["gateways"], "gateways", GATEWAYS_RANGE[0], fail));
+  if (raw["bridges"] !== undefined) out.bridges = Object.freeze(checkAnchorList(raw["bridges"], "bridges", GATEWAYS_RANGE[0], fail));
+  if (raw["registryRpcUrls"] !== undefined) {
+    out.registryRpcUrls = Object.freeze(checkRpcUrls(raw["registryRpcUrls"], "registryRpcUrls", fail));
+  }
+  const quorum = raw["chainQuorum"];
+  if (quorum !== undefined) {
+    const [min, max] = DISCOVERY_POLICY_RANGES.chainQuorum;
+    if (typeof quorum !== "number" || !Number.isSafeInteger(quorum) || quorum < min || quorum > max) {
+      throw new ConfigError(`config.chainQuorum must be an integer in ${min}..${max}`);
     }
-    if (seen.has(entry)) throw new ConfigError(`config.gateways[${index}] repeats an address`);
-    seen.add(entry);
-  });
-  return Object.freeze([...seen]);
+    out.chainQuorum = quorum;
+  }
+  return Object.freeze(out);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {

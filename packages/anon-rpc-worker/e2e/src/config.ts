@@ -100,6 +100,16 @@ export interface WorkerConfig {
   readonly expectedBadConfigCode: string;
 }
 
+/** Discovery bootstrap of test-bed worker bundles (S1). */
+export interface DiscoveryBedConfig {
+  /** Default anchors: the published KPS addresses of this many first nodes. */
+  readonly anchors: number;
+  /** Chain check interval of test-bed bundles (production: 600 s). */
+  readonly chainRefreshSeconds: number;
+  /** Oldest finalized block accepted; anvil mines only on demand, so blocks age. */
+  readonly maxStateAgeSeconds: number;
+}
+
 export interface ClassicSdkConfig {
   /** Built @hisoka-io/nox-client ESM entry (pnpm --filter @hisoka-io/nox-client build). */
   readonly clientEntry: string;
@@ -116,6 +126,7 @@ export interface TestbedConfig {
   readonly anvil: AnvilConfig;
   readonly kps: KpsConfig;
   readonly worker: WorkerConfig;
+  readonly discovery: DiscoveryBedConfig;
   readonly classic: ClassicSdkConfig;
   /** Upper bound for one Chromium page operation that has no other deadline. */
   readonly pageTimeoutMs: number;
@@ -201,6 +212,11 @@ export function loadConfig(env: Env = process.env, e2eRoot: string = E2E_ROOT): 
       readyTimeoutMs: intFrom(env, "E2E_WORKER_READY_TIMEOUT_MS", 60_000, 1_000, 600_000),
       callTimeoutMs: intFrom(env, "E2E_CALL_TIMEOUT_MS", 30_000, 1_000, 600_000),
       expectedBadConfigCode: env["E2E_EXPECT_BAD_CONFIG_CODE"] ?? "bad-config",
+    },
+    discovery: {
+      anchors: intFrom(env, "E2E_BOOTSTRAP_ANCHORS", 3, 0, 16),
+      chainRefreshSeconds: intFrom(env, "E2E_CHAIN_REFRESH_SECS", 3, 1, 86_400),
+      maxStateAgeSeconds: intFrom(env, "E2E_MAX_STATE_AGE_SECS", 86_400, 60, 86_400),
     },
     classic: {
       clientEntry: pathFrom(

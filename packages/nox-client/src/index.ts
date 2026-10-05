@@ -21,6 +21,13 @@ export type {
   PinnedMember,
   PinnedSnapshot,
   KpsModeOptions,
+  KpsBootstrap,
+  KpsDiscoveryOptions,
+  DiscoveryPolicy,
+  LearnedAnchor,
+  MemberFirstSeen,
+  VerifiedDiscovery,
+  VerifiedMember,
   NoxWasmBindings,
   NoxWasmProvider,
   NoxLogLevel,
@@ -112,7 +119,44 @@ export type {
   KpsFetchStats,
   KpsTransportSettings,
 } from "./kps/transport.js";
-export { KPS_CLIENT_DEFAULTS, KPS_CLAIM_MAX_SURB_IDS, claimWindow } from "./kps/constants.js";
+export {
+  KPS_CLIENT_DEFAULTS,
+  KPS_CLAIM_MAX_SURB_IDS,
+  claimWindow,
+  BOOTSTRAP_FORMAT,
+  DISCOVERY_POLICY_DEFAULTS,
+  DISCOVERY_POLICY_RANGES,
+  DISCOVERY_LIMITS,
+  DISCOVERY_MAX_BATCH_CALLS,
+} from "./kps/constants.js";
+export { verifyBootstrap, checkAnchorList, checkRpcUrls, isAllowedRpcUrl, rpcProviderKey } from "./kps/bootstrap.js";
+export {
+  EIP1967_IMPLEMENTATION_SLOT,
+  REGISTRATION_TOPICS,
+  DiscoveryError,
+  finalizedBlockBody,
+  parseFinalizedBlock,
+  registryReadPlan,
+  planBody,
+  planBodies,
+  mergeBatchReplies,
+  parseRegistryAnswer,
+  answersAgree,
+  closeMembership,
+  membershipFromChain,
+  runChainCheck,
+} from "./kps/discovery.js";
+export type {
+  DiscoveryFailureKind,
+  FinalizedBlock,
+  ChainProfile,
+  RegistryAnswer,
+  ChainMembership,
+  RegistryReadPlan,
+  ChainCheckContext,
+  ChainCheckOutcome,
+  ReadPair,
+} from "./kps/discovery.js";
 export {
   PINNED_SNAPSHOT_FORMAT,
   verifyPinnedSnapshot,
@@ -120,8 +164,9 @@ export {
   eligiblePinnedMembers,
   pinnedKpsAddresses,
   pinnedRelayerNodes,
+  floorRecords,
 } from "./kps/pinned.js";
-export type { ServedTopology, WorkingSet, ApplyServedOptions, RouteLayer } from "./kps/pinned.js";
+export type { ServedTopology, WorkingSet, ApplyServedOptions, RouteLayer, MemberRecord, RoutingContext } from "./kps/pinned.js";
 
 export type { IssuedPaidQuoteV2, PaidQuoteResultV2 } from "./paid.js";
 export { hashExecutionQuoteV1 } from "./paid.js";

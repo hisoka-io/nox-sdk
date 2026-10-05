@@ -675,6 +675,11 @@ export function hasHttpEntry(node: TopologyNode): boolean {
  * `isEntry` decides which layer-0-capable nodes the client can reach as an
  * entry. The default is the classic rule (an HTTP(S) ingress URL); KPS mode
  * passes a rule that admits only nodes with a KPS address.
+ *
+ * `maxProbation` (KPS discovery) caps the hops on probation per route: once
+ * the route holds that many, the remaining hops come from members that are
+ * not on probation whenever such a candidate exists. A layer with only
+ * probation members still serves (availability over the cap).
  */
 export function selectRoute(
   nodes: TopologyNode[],
@@ -682,6 +687,7 @@ export function selectRoute(
   selectedExit?: TopologyNode,
   avoid?: ReadonlySet<string>,
   isEntry: (node: TopologyNode) => boolean = hasHttpEntry,
+  maxProbation: number = Number.POSITIVE_INFINITY,
 ): Route {
   const entries = nodes.filter(
     (node) => layersForRole(node.role).includes(0) && isEntry(node),
@@ -733,11 +739,32 @@ export function selectRoute(
     );
   }
 
+  // The pinned entry and the selected exit are fixed hops: when together they
+  // exceed the probation budget while a settled exit could serve instead, the
+  // caller must pick that exit (PROPOSAL §2.6: at most `maxProbation` hops on
+  // probation per route).
+  const fixedProbation = (canonicalPinnedEntry?.probation === true ? 1 : 0) + (pinnedExit?.probation === true ? 1 : 0);
+  if (
+    pinnedExit?.probation === true &&
+    fixedProbation > maxProbation &&
+    exits.some((node) => node.probation !== true && node.id !== canonicalPinnedEntry?.id)
+  ) {
+    throw new NoxClientError(
+      `Selected exit is on probation and the route already carries ${fixedProbation - 1} probation hop(s); ` +
+        `the per-route cap is ${maxProbation} and a settled exit is available`,
+      NoxClientErrorCode.NoNodesAvailable,
+    );
+  }
+
   const selectableEntries = entries.filter((node) => node.id !== pinnedExit?.id);
   const entryOnly = selectableEntries.filter(
     (node) => !exits.some((exit) => exit.id === node.id),
   );
-  const entry = canonicalPinnedEntry ?? pickRandom(entryOnly) ?? pickRandom(selectableEntries);
+  // A selected exit on probation leaves no probation budget for the entry.
+  const entryBudget = pinnedExit?.probation === true ? maxProbation - 1 : maxProbation;
+  const entry = canonicalPinnedEntry ??
+    pickRandom(withinProbation(entryOnly, entryBudget)) ??
+    pickRandom(withinProbation(selectableEntries, entryBudget));
   if (entry === undefined) {
     throw new NoxClientError(
       "No distinct entry node is available for the selected exit",
@@ -749,8 +776,10 @@ export function selectRoute(
     (n) => n.id !== entry.id && n.id !== pinnedExit?.id,
   );
   const mixOnly = eligibleMixes.filter((n) => !exits.some((e) => e.id === n.id));
-  const mix = pickRandom(preferNotAvoided(mixOnly, avoid)) ??
-    pickRandom(preferNotAvoided(eligibleMixes, avoid));
+  const used = (entry.probation === true ? 1 : 0) + (pinnedExit?.probation === true ? 1 : 0);
+  const mixBudget = maxProbation - used;
+  const mix = pickRandom(preferNotAvoided(withinProbation(mixOnly, mixBudget), avoid)) ??
+    pickRandom(preferNotAvoided(withinProbation(eligibleMixes, mixBudget), avoid));
   if (mix === undefined) {
     throw new NoxClientError(
       "No distinct mix node is available for the selected exit",
@@ -759,7 +788,8 @@ export function selectRoute(
   }
 
   const eligibleExits = exits.filter((n) => n.id !== entry.id && n.id !== mix.id);
-  const exit = pinnedExit ?? pickRandom(preferNotAvoided(eligibleExits, avoid));
+  const exitBudget = maxProbation - (entry.probation === true ? 1 : 0) - (mix.probation === true ? 1 : 0);
+  const exit = pinnedExit ?? pickRandom(preferNotAvoided(withinProbation(eligibleExits, exitBudget), avoid));
   if (exit === undefined) {
     throw new NoxClientError(
       "No distinct exit node is available",
@@ -814,6 +844,16 @@ export function layersForRole(role: number): number[] {
     default:
       return [0, 1, 2];
   }
+}
+
+/**
+ * Candidates not on probation when the route has no probation budget left
+ * and such a candidate exists; otherwise every candidate.
+ */
+function withinProbation(candidates: TopologyNode[], budget: number): TopologyNode[] {
+  if (budget > 0) return candidates;
+  const settled = candidates.filter((node) => node.probation !== true);
+  return settled.length > 0 ? settled : candidates;
 }
 
 function preferNotAvoided(

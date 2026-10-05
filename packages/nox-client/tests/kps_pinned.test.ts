@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   applyServedTopologies,
   eligiblePinnedMembers,
+  floorRecords,
   formsRoute,
   kpsTopologyNodes,
   pinnedPowDifficulty,
@@ -11,6 +12,7 @@ import {
 import { primaryLayerForRole } from "../src/topology.js";
 import { NoxClientError, NoxClientErrorCode, type PinnedSnapshot } from "../src/types.js";
 import { kpsAddressFor } from "./helpers/fake_kps.js";
+import { DISCOVERY_LIMITS } from "../src/kps/constants.js";
 import { PINNED_BLOCK, makePinned, memberAddress, served, type ServedSpec } from "./helpers/pinned_fixture.js";
 
 const NOW = 1_800_000_000;
@@ -204,9 +206,24 @@ describe("applyServedTopologies (removals only)", () => {
     expect(result.removed).toEqual([]);
   });
 
-  it("treats a changed KPS identity (metadataUrl) as absent", () => {
+  it("treats a changed location (metadataUrl, ingressUrl) as a move, never as a removal", () => {
     const document = served(pinned, NOW, {
-      mutate: (node, index) => (index === 5 ? { ...node, metadata_url: `kps:${kpsAddressFor(99)}/metadata.json` } : node),
+      mutate: (node, index) =>
+        index === 5 ? { ...node, metadata_url: `kps:${kpsAddressFor(99)}/metadata.json`, ingress_url: "https://moved.test" } : node,
+    });
+    const result = applyServedTopologies(
+      pinned,
+      [{ anchor: kpsAddressFor(1), snapshot: document }, { anchor: kpsAddressFor(6), snapshot: document }],
+      NOW,
+      OPTIONS,
+    );
+    expect(result.removed).toEqual([]);
+    expect(result.members.map((node) => node.address)).toContain(memberAddress(5));
+  });
+
+  it("treats a changed identity (Sphinx key or role) as absent", () => {
+    const document = served(pinned, NOW, {
+      mutate: (node, index) => (index === 5 ? { ...node, sphinx_key: "ee".repeat(32) } : node),
     });
     const result = applyServedTopologies(
       pinned,
@@ -215,6 +232,91 @@ describe("applyServedTopologies (removals only)", () => {
       OPTIONS,
     );
     expect(result.removed).toEqual([memberAddress(5)]);
+  });
+
+  it("routes a mix or exit over a new url only when two different anchors agree on it", () => {
+    const moved = "/ip4/203.0.113.7/tcp/15000/p2p/12D3KooWNode7";
+    const relocate: ServedSpec = { mutate: (node, index) => (index === 7 ? { ...node, url: moved } : node) };
+    const agreed = applyServedTopologies(
+      pinned,
+      [
+        { anchor: kpsAddressFor(1), snapshot: served(pinned, NOW, relocate) },
+        { anchor: kpsAddressFor(2), snapshot: served(pinned, NOW, relocate) },
+      ],
+      NOW,
+      OPTIONS,
+    );
+    expect(agreed.relocated).toEqual([memberAddress(7)]);
+    expect(agreed.members.find((node) => node.address === memberAddress(7))?.url).toBe(moved);
+    const single = applyServedTopologies(
+      pinned,
+      [
+        { anchor: kpsAddressFor(1), snapshot: served(pinned, NOW, relocate) },
+        { anchor: kpsAddressFor(2), snapshot: served(pinned, NOW) },
+      ],
+      NOW,
+      OPTIONS,
+    );
+    expect(single.relocated).toEqual([]);
+    expect(single.members.find((node) => node.address === memberAddress(7))?.url).toBe(pinned.members[6]!.url);
+    const conflicting = applyServedTopologies(
+      pinned,
+      [
+        { anchor: kpsAddressFor(1), snapshot: served(pinned, NOW, relocate) },
+        { anchor: kpsAddressFor(2), snapshot: served(pinned, NOW, relocate) },
+        { anchor: kpsAddressFor(3), snapshot: served(pinned, NOW, { mutate: (node, index) => (index === 7 ? { ...node, url: "/ip4/1.1.1.1/tcp/1/p2p/x" } : node) }) },
+        { anchor: kpsAddressFor(4), snapshot: served(pinned, NOW, { mutate: (node, index) => (index === 7 ? { ...node, url: "/ip4/1.1.1.1/tcp/1/p2p/x" } : node) }) },
+      ],
+      NOW,
+      OPTIONS,
+    );
+    expect(conflicting.relocated).toEqual([]);
+  });
+
+  it("judges documents against a given membership, anchor map and endpoints", () => {
+    // Member 3 now listens on another KPS address that the anchor map knows.
+    const movedAnchor = kpsAddressFor(3, 16005);
+    const anchorMembers = new Map([[kpsAddressFor(1), memberAddress(1)], [movedAnchor, memberAddress(3)]]);
+    const result = applyServedTopologies(
+      pinned,
+      [
+        { anchor: kpsAddressFor(1), snapshot: served(pinned, NOW) },
+        { anchor: movedAnchor, snapshot: served(pinned, NOW) },
+      ],
+      NOW,
+      { ...OPTIONS, anchorMembers },
+    );
+    expect(result.sourcesAccepted).toBe(2);
+    expect(result.removalQuorum).toBe(true);
+    const unknown = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(5, 17005), snapshot: served(pinned, NOW) }], NOW, {
+      ...OPTIONS,
+      anchorMembers,
+    });
+    expect(unknown.rejected[0]?.reason).toMatch(/no known member/u);
+    // A membership without member 3 (not eligible) rejects its anchor.
+    const membership = floorRecords(pinned).filter((member) => member.address !== memberAddress(3));
+    const narrowed = applyServedTopologies(pinned, [{ anchor: movedAnchor, snapshot: served(pinned, NOW) }], NOW, {
+      ...OPTIONS,
+      anchorMembers,
+      membership,
+    });
+    expect(narrowed.rejected[0]?.reason).toMatch(/not an eligible known member/u);
+  });
+
+  it("counts members a document lists outside the membership as ignored additions", () => {
+    const extra = { ...served(pinned, NOW).nodes[0]!, address: memberAddress(40), sphinx_key: "40".repeat(32) };
+    extra.layer = primaryLayerForRole(extra.address, extra.role);
+    const result = applyServedTopologies(
+      pinned,
+      [
+        { anchor: kpsAddressFor(1), snapshot: served(pinned, NOW, { add: [extra] }) },
+        { anchor: kpsAddressFor(2), snapshot: served(pinned, NOW, { add: [extra] }) },
+      ],
+      NOW,
+      OPTIONS,
+    );
+    expect(result.ignoredAdditions).toBe(1);
+    expect(result.members.map((node) => node.address)).not.toContain(memberAddress(40));
   });
 
   it("needs every accepted source to agree before removing a member", () => {
@@ -257,6 +359,20 @@ describe("applyServedTopologies (removals only)", () => {
     }
     const foreign = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(77), snapshot: served(pinned, NOW) }], NOW, OPTIONS);
     expect(foreign.rejected[0]?.reason).toMatch(/not a pinned member/u);
+  });
+
+  it("rejects a self-consistent document that lists more nodes than the member bound", () => {
+    const template = served(pinned, NOW).nodes[0]!;
+    const extra = Array.from({ length: DISCOVERY_LIMITS.maxCandidates }, (_, index) => ({
+      ...template,
+      address: `0x${(0xf000_0000 + index).toString(16).padStart(40, "0")}`,
+    }));
+    const flood = served(pinned, NOW, { add: extra });
+    expect(flood.nodes.length).toBeGreaterThan(DISCOVERY_LIMITS.maxCandidates);
+    const result = applyServedTopologies(pinned, [{ anchor: kpsAddressFor(1), snapshot: flood }], NOW, OPTIONS);
+    expect(result.sourcesAccepted).toBe(0);
+    expect(result.rejected[0]?.reason).toMatch(/more than the 256/u);
+    expect(result.members.map((node) => node.address)).toEqual(all);
   });
 
   it("keeps the previous members of a layer that two sources would push below the floor", () => {

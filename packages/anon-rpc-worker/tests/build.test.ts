@@ -8,13 +8,14 @@ import {
   buildWorker,
   BUNDLE_OPTIONS,
   checkBundle,
+  embeddedModuleText,
   embeddedSnapshotText,
   GLUE_URL_EXPRESSION,
   resolveNoxWasm,
   rewriteGlue,
   snapshotModuleSource,
 } from "../scripts/build.mjs";
-import { PACKAGE_DIR, REPO_DIR, SNAPSHOT_PATH } from "../scripts/lib/paths.mjs";
+import { BOOTSTRAP_PATH, PACKAGE_DIR, REPO_DIR, SNAPSHOT_PATH } from "../scripts/lib/paths.mjs";
 import { gitState, makeProvenance, parseToolchainEnv, PROVENANCE_NAME } from "../scripts/provenance.mjs";
 import { canonicalJson } from "../scripts/lib/snapshot-format.mjs";
 
@@ -50,6 +51,23 @@ describe("buildWorker", () => {
     const keccak = `0x${Buffer.from(keccak_256(onDisk)).toString("hex")}`;
     expect(first.record.artifact.keccak256).toBe(keccak);
     expect(readFileSync(join(dir, "a", "anon-rpc-worker.js.keccak256"), "utf8")).toBe(`${keccak}  anon-rpc-worker.js\n`);
+  });
+
+  it("embeds the committed bootstrap byte for byte and records its digest", async () => {
+    const { bundle, record } = await buildWorker({ outfile: outfile("boot"), write: false });
+    const text = Buffer.from(bundle).toString("utf8");
+    const file = readFileSync(BOOTSTRAP_PATH, "utf8");
+    expect(embeddedModuleText(text, "bootstrap")).toBe(file);
+    expect(record.bootstrap).toEqual(expect.objectContaining({
+      path: "snapshot/nox-bootstrap.json",
+      keccak256: `0x${Buffer.from(keccak_256(Buffer.from(file))).toString("hex")}`,
+    }));
+  });
+
+  it("refuses a non-canonical bootstrap file", async () => {
+    const path = join(dir, "bootstrap-pretty.json");
+    writeFileSync(path, JSON.stringify(JSON.parse(readFileSync(BOOTSTRAP_PATH, "utf8"))));
+    await expect(buildWorker({ outfile: outfile("bad-boot"), write: false, bootstrap: path })).rejects.toThrow(/not canonical JSON/u);
   });
 
   it("emits one auditable classic script with the WASM and snapshot inlined and no machine paths", async () => {
@@ -151,10 +169,20 @@ describe("checkBundle", () => {
       expect(() => checkBundle(`${module(snapshot)}\n"${wasm}"\n${bad}`, wasm, snapshot)).toThrow(/bundle contains/u);
     }
   });
+  it("requires the bootstrap module when one is pinned, byte for byte", () => {
+    const bootstrap = '{\n  "format": "nox-anon-rpc-bootstrap/1"\n}\n';
+    const bootModule = (text: string) => `// nox-embed:bootstrap\n  var bootstrap_default = ${snapshotModuleSource(text).slice("export default ".length)}`;
+    const base = `${module(snapshot)}\n"${wasm}"`;
+    expect(() => checkBundle(`${base}\n${bootModule(bootstrap)}`, wasm, snapshot, bootstrap)).not.toThrow();
+    expect(() => checkBundle(base, wasm, snapshot, bootstrap)).toThrow(/does not embed the discovery bootstrap/u);
+    expect(() => checkBundle(`${base}\n${bootModule("{}\n")}`, wasm, snapshot, bootstrap)).toThrow(/bootstrap embedded in the bundle differs/u);
+    expect(embeddedModuleText(`${base}\n${bootModule(bootstrap)}`, "bootstrap")).toBe(bootstrap);
+    expect(() => checkBundle(base, wasm, snapshot)).not.toThrow();
+  });
 });
 
 describe("the release worker bundle", () => {
-  it("boots in a bare script context, verifies its snapshot and retries without an anchor, never touching fetch", async () => {
+  it("boots in a bare script context, verifies its snapshot and bootstrap, dials the default anchors and retries, never touching fetch", async () => {
     const { bundle } = await buildWorker({ outfile: outfile("release"), write: false });
     const events: string[] = [];
     const logs: unknown[][] = [];
@@ -204,9 +232,11 @@ describe("the release worker bundle", () => {
     expect(logs.some((entry) => entry[1] === "boot.wasm")).toBe(true);
     expect(events).toEqual([]);
     expect(fetchStub).not.toHaveBeenCalled();
-    // The committed snapshot predates the fleet's KPS addresses: no member is
-    // an anchor yet, so the worker keeps retrying and never dials or fails.
-    expect(dials).toEqual([]);
+    // An empty config boots on the bundle's default anchors (nox-1, nox-2, nox-8 on
+    // their Elastic IPs); the committed snapshot publishes no KPS address yet, so
+    // they are the only addresses tried, and the worker keeps retrying.
+    const bootstrap = JSON.parse(readFileSync(join(PACKAGE_DIR, "snapshot", "nox-bootstrap.json"), "utf8")) as { anchors: string[] };
+    expect(new Set(dials)).toEqual(new Set(bootstrap.anchors));
     const retry = logs.find((entry) => entry[1] === "boot.retry") as [string, string, { code: string }];
     expect(retry[2].code).toBe("no-anchor-reachable");
   });
