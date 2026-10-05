@@ -7,12 +7,23 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { bytesToHex, hexToBytes, keccakHex } from "../../src/abi.js";
-import { startAnvil, type AnvilChain } from "../../src/anvil.js";
+import { mineBlocks, startAnvil, type AnvilChain } from "../../src/anvil.js";
 import { deployLogFixture } from "../../src/chain-fixture.js";
 import { loadConfig } from "../../src/config.js";
 import { TestbedError } from "../../src/errors.js";
 import { jsonRpc } from "../../src/jsonrpc.js";
-import { deployLocalRegistry, registerMembers, relayerCount, topologyFingerprint, type RegistryMember } from "../../src/registry.js";
+import {
+  deployLocalRegistry,
+  forceUnregister,
+  registerMember,
+  registerMembers,
+  relayerCount,
+  topologyFingerprint,
+  updateMetadataUrl,
+  type RegistryMember,
+} from "../../src/registry.js";
+import { startRpcForwarder } from "../../src/rpc-forwarder.js";
+import { encodeCall } from "../../src/abi.js";
 
 const config = loadConfig();
 const hasAnvil = spawnSync(config.anvil.bin, ["--version"], { stdio: "ignore" }).status === 0;
@@ -47,6 +58,7 @@ describe.skipIf(!hasAnvil)("local NoxRegistry on anvil", () => {
       label: "unit-registry",
       chainId: 31_337,
       logDir: mkdtempSync(join(tmpdir(), "e2e-registry-")),
+      slotsInAnEpoch: 1,
     });
   });
 
@@ -65,6 +77,39 @@ describe.skipIf(!hasAnvil)("local NoxRegistry on anvil", () => {
     expect(await topologyFingerprint(chain.url, registry.address)).toBe(expectedFingerprint(members.map((m) => m.address)));
     // A second registration of the same member reverts (AlreadyRegistered).
     await expect(registerMembers(chain.url, registry, [members[0]!])).rejects.toThrow(TestbedError);
+  });
+
+  it("lets a member move its KPS address itself, and the admin remove and re-register it", async () => {
+    const registry = await deployLocalRegistry(chain.url, chain.account, chain.chainId);
+    const members = [member(0, "kps:127.0.0.1:27005:uEiA/metadata.json"), member(1, "")];
+    await registerMembers(chain.url, registry, members);
+    const moved = "kps:127.0.0.1:28005:uEiA/metadata.json";
+    await updateMetadataUrl(chain.url, registry.address, members[0]!.address, moved);
+    const profile = String(await jsonRpc(chain.url, "eth_call", [
+      { to: registry.address, data: encodeCall("relayers(address)", [{ type: "address", value: members[0]!.address }]) },
+      "latest",
+    ]));
+    expect(Buffer.from(profile.slice(2), "hex").toString("latin1")).toContain(moved);
+    await forceUnregister(chain.url, registry, members[1]!.address);
+    expect(await relayerCount(chain.url, registry.address)).toBe(1n);
+    await registerMember(chain.url, registry, members[1]!);
+    expect(await relayerCount(chain.url, registry.address)).toBe(2n);
+    expect(await topologyFingerprint(chain.url, registry.address)).toBe(expectedFingerprint(members.map((m) => m.address)));
+  });
+
+  it("keeps finalized two blocks behind latest, and the forwarder serves the same chain", async () => {
+    await mineBlocks(chain.url, 5);
+    const latest = Number.parseInt(String(await jsonRpc(chain.url, "eth_blockNumber")), 16);
+    const finalized = (await jsonRpc(chain.url, "eth_getBlockByNumber", ["finalized", false])) as { number: string; hash: string };
+    expect(Number.parseInt(finalized.number, 16)).toBe(latest - 2);
+    const forwarder = await startRpcForwarder(chain.url);
+    try {
+      const viaForwarder = (await jsonRpc(forwarder.url, "eth_getBlockByNumber", ["finalized", false])) as { hash: string };
+      expect(viaForwarder.hash).toBe(finalized.hash);
+      expect(forwarder.forwarded()).toBe(1);
+    } finally {
+      await forwarder.close();
+    }
   });
 
   it("emits Ping and Blob logs of the requested size", async () => {

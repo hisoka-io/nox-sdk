@@ -19,6 +19,7 @@ import {
   type RegistryMember,
 } from "./registry.js";
 import { startResolverServer, type ResolverServer } from "./resolver-server.js";
+import { startRpcForwarder, type RpcForwarder } from "./rpc-forwarder.js";
 import { deploySpecifier } from "./specifier.js";
 
 /** Directory of one test-bed run: logs, mesh data, KPS keys, reports. */
@@ -52,6 +53,13 @@ export interface Chains {
   readonly specifier: AnvilChain;
   /** The wallet's RPC target; the exits' HttpRequest destination. */
   readonly upstream: AnvilChain;
+  /**
+   * The RPC providers the worker's registry checks read through exits: the
+   * upstream anvil and a forwarder on another port in front of it (two
+   * providers serving one chain, as the fleet's providers serve Arbitrum).
+   */
+  readonly registryProviders: readonly string[];
+  readonly forwarder: RpcForwarder;
   stop(): Promise<void>;
 }
 
@@ -67,16 +75,27 @@ export async function startChains(config: TestbedConfig, paths: RunPaths): Promi
       label: "anvil-upstream",
       chainId: config.anvil.upstreamChainId,
       logDir: paths.logs,
+      // `finalized` trails `latest` by two blocks: registry checks see recent changes.
+      slotsInAnEpoch: 1,
     });
   } catch (error) {
     await specifier.stop();
     throw error;
   }
+  let forwarder: RpcForwarder;
+  try {
+    forwarder = await startRpcForwarder(upstream.url);
+  } catch (error) {
+    await Promise.all([specifier.stop(), upstream.stop()]);
+    throw error;
+  }
   return {
     specifier,
     upstream,
+    registryProviders: [upstream.url, forwarder.url],
+    forwarder,
     stop: async () => {
-      await Promise.all([specifier.stop(), upstream.stop()]);
+      await Promise.all([specifier.stop(), upstream.stop(), forwarder.close()]);
     },
   };
 }
@@ -164,6 +183,12 @@ export interface MeshWithSidecars {
    * published (pinned) address (TC-570 key rotation).
    */
   startSidecar(id: number, identity: SidecarIdentity): Promise<RunningKpsServer>;
+  /**
+   * Restart node `id`'s sidecar with its original identity on another UDP
+   * port: the node moves to a new KPS address with the same certhash, as an
+   * operator's IP change does.
+   */
+  moveSidecar(id: number, udpPort: number): Promise<RunningKpsServer>;
   stop(): Promise<void>;
 }
 
@@ -204,8 +229,8 @@ export async function startMeshWithSidecars(
     sidecars.clear();
     await mesh.stop();
   };
-  const varsFor = (node: MeshNodeInfo, keyName: string, certhash: string): SidecarVars => {
-    const udpPort = sidecarUdpPort(config.mesh.basePort, node.id);
+  const varsFor = (node: MeshNodeInfo, keyName: string, certhash: string, portOverride?: number): SidecarVars => {
+    const udpPort = portOverride ?? sidecarUdpPort(config.mesh.basePort, node.id);
     return {
       node: node.id,
       node_address: node.address,
@@ -223,7 +248,7 @@ export async function startMeshWithSidecars(
       expected_certhash: certhash,
     };
   };
-  const launch = async (node: MeshNodeInfo, keyName: string, certhash: string): Promise<RunningKpsServer> => {
+  const launch = async (node: MeshNodeInfo, keyName: string, certhash: string, portOverride?: number): Promise<RunningKpsServer> => {
     const command = config.kps.sidecarCommand;
     if (command === undefined) throw new TestbedError("config", "NOX_KPS_CMD is unset; there are no sidecars to start");
     const sidecar = await startSidecar({
@@ -232,7 +257,7 @@ export async function startMeshWithSidecars(
       configTemplate: config.kps.sidecarConfigTemplate,
       logDir: paths.logs,
       addressTimeoutMs: config.kps.addressTimeoutMs,
-      vars: varsFor(node, keyName, certhash),
+      vars: varsFor(node, keyName, certhash, portOverride),
     });
     sidecars.set(node.id, sidecar);
     return sidecar;
@@ -302,6 +327,17 @@ export async function startMeshWithSidecars(
       if (original === undefined) throw new TestbedError("config", `node ${id} never had a sidecar`);
       return launch(node, `node-${id}`, parseKpsAddress(original).certhash);
     },
+    moveSidecar: async (id, udpPort) => {
+      const node = nodeById(id);
+      const current = sidecars.get(id);
+      if (current !== undefined) {
+        sidecars.delete(id);
+        await current.stop();
+      }
+      const original = published.get(id);
+      if (original === undefined) throw new TestbedError("config", `node ${id} never had a sidecar`);
+      return launch(node, `node-${id}`, parseKpsAddress(original).certhash, udpPort);
+    },
     stop: stopAll,
   };
 }
@@ -322,10 +358,21 @@ export interface TestbedInfo {
     /** The NoxRegistry on the upstream chain the nodes observe; snapshots come from it. */
     readonly registry?: {
       readonly address: string;
+      /** Implementation behind the proxy (the bootstrap's `registryImpl`). */
+      readonly implementation: string;
       readonly chainId: number;
       readonly rpcUrl: string;
       readonly deployBlock: number;
       readonly registeredBlock: number;
+    };
+    /** Inputs of the worker's discovery bootstrap for this bed (scripts/build-test-worker.mjs). */
+    readonly discovery?: {
+      /** RPC providers the registry checks read through exits. */
+      readonly providers: readonly string[];
+      /** Default anchors: published KPS addresses of the first nodes. */
+      readonly anchors: readonly string[];
+      readonly chainRefreshSeconds: number;
+      readonly maxStateAgeSeconds: number;
     };
   };
   readonly workers?: Readonly<Record<string, PublishedWorker>>;
@@ -365,10 +412,20 @@ export function describeTestbed(input: TestbedInfoInput): TestbedInfo {
             : {
               registry: {
                 address: mesh.registry.address,
+                implementation: mesh.registry.implementation,
                 chainId: mesh.registry.chainId,
                 rpcUrl: input.chains.upstream.url,
                 deployBlock: mesh.registry.deployBlock,
                 registeredBlock: mesh.registry.registeredBlock,
+              },
+              discovery: {
+                providers: input.chains.registryProviders,
+                anchors: mesh.mesh.info.nodes
+                  .slice(0, input.config.discovery.anchors)
+                  .map((node) => mesh.publishedKps.get(node.id))
+                  .filter((address): address is string => address !== undefined),
+                chainRefreshSeconds: input.config.discovery.chainRefreshSeconds,
+                maxStateAgeSeconds: input.config.discovery.maxStateAgeSeconds,
               },
             }),
         },

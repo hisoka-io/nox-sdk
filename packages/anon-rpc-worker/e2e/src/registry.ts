@@ -94,6 +94,25 @@ export async function topologyFingerprint(rpcUrl: string, registry: string): Pro
   return decodeBytes32(ret).slice(2);
 }
 
+/** `registerPrivileged` one member from the admin; returns the block. */
+export async function registerMember(rpcUrl: string, registry: LocalRegistry, member: RegistryMember): Promise<number> {
+  const key = member.sphinxKey.startsWith("0x") ? member.sphinxKey : `0x${member.sphinxKey}`;
+  const data = encodeCall("registerPrivileged(address,bytes32,string,string,string,uint8)", [
+    { type: "address", value: member.address },
+    { type: "bytes32", value: key },
+    { type: "string", value: member.url },
+    { type: "string", value: member.ingressUrl },
+    { type: "string", value: member.metadataUrl },
+    { type: "uint", value: member.role },
+  ]);
+  const receipt = await sendTransaction(
+    rpcUrl,
+    { from: registry.admin, to: registry.address, data },
+    `registerPrivileged(${member.address})`,
+  );
+  return receipt.blockNumber;
+}
+
 /** `registerPrivileged` every member from the admin; returns the block of the last registration. */
 export async function registerMembers(
   rpcUrl: string,
@@ -102,21 +121,7 @@ export async function registerMembers(
 ): Promise<number> {
   let last = registry.deployBlock;
   for (const member of members) {
-    const key = member.sphinxKey.startsWith("0x") ? member.sphinxKey : `0x${member.sphinxKey}`;
-    const data = encodeCall("registerPrivileged(address,bytes32,string,string,string,uint8)", [
-      { type: "address", value: member.address },
-      { type: "bytes32", value: key },
-      { type: "string", value: member.url },
-      { type: "string", value: member.ingressUrl },
-      { type: "string", value: member.metadataUrl },
-      { type: "uint", value: member.role },
-    ]);
-    const receipt = await sendTransaction(
-      rpcUrl,
-      { from: registry.admin, to: registry.address, data },
-      `registerPrivileged(${member.address})`,
-    );
-    last = Math.max(last, receipt.blockNumber);
+    last = Math.max(last, await registerMember(rpcUrl, registry, member));
   }
   const count = await relayerCount(rpcUrl, registry.address);
   if (count !== BigInt(members.length)) {
@@ -160,6 +165,69 @@ export async function waitForServedRegistry(
       }
       if (Date.now() > deadline) {
         throw new TestbedError("timeout", `${url} did not serve the registry topology within ${timeoutMs} ms: ${last}`);
+      }
+      await delay(TOPOLOGY_POLL_MS);
+    }
+  }
+}
+
+/** Balance given to an impersonated member so it can pay for its own transactions (100 ETH). */
+const MEMBER_GAS_BALANCE = `0x${(100n * 10n ** 18n).toString(16)}`;
+
+/**
+ * Send a transaction as `member` (anvil impersonation): the registry's
+ * self-service calls (`updateUrl`, `updateMetadataUrl`) must come from the
+ * node's own key, which the mesh's synthetic addresses do not have.
+ */
+async function sendAsMember(rpcUrl: string, member: string, to: string, data: string, what: string): Promise<number> {
+  await jsonRpc(rpcUrl, "anvil_setBalance", [member, MEMBER_GAS_BALANCE]);
+  await jsonRpc(rpcUrl, "anvil_impersonateAccount", [member]);
+  try {
+    return (await sendTransaction(rpcUrl, { from: member, to, data }, what)).blockNumber;
+  } finally {
+    await jsonRpc(rpcUrl, "anvil_stopImpersonatingAccount", [member]);
+  }
+}
+
+/** `updateMetadataUrl(metadataUrl)` from the member's own address (an operator moving its KPS endpoint). */
+export async function updateMetadataUrl(rpcUrl: string, registry: string, member: string, metadataUrl: string): Promise<number> {
+  const data = encodeCall("updateMetadataUrl(string)", [{ type: "string", value: metadataUrl }]);
+  return sendAsMember(rpcUrl, member, registry, data, `updateMetadataUrl(${member})`);
+}
+
+/** `forceUnregister(member)` from the registry admin; returns the block. */
+export async function forceUnregister(rpcUrl: string, registry: LocalRegistry, member: string): Promise<number> {
+  const data = encodeCall("forceUnregister(address)", [{ type: "address", value: member }]);
+  const receipt = await sendTransaction(rpcUrl, { from: registry.admin, to: registry.address, data }, `forceUnregister(${member})`);
+  return receipt.blockNumber;
+}
+
+/** Member profiles each topology URL serves, keyed by lowercase address, once every URL serves at or after `minBlock`. */
+export async function waitForServedState(
+  topologyUrls: readonly string[],
+  minBlock: number,
+  timeoutMs: number,
+  accept: (nodes: ReadonlyMap<string, { readonly metadataUrl: string }>) => boolean,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (const url of topologyUrls) {
+    let last = "no reply yet";
+    for (;;) {
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(TOPOLOGY_FETCH_TIMEOUT_MS) });
+        const doc = (await response.json()) as { block_number?: unknown; nodes?: readonly ServedNode[] };
+        const block = typeof doc.block_number === "number" ? doc.block_number : 0;
+        const nodes = new Map((Array.isArray(doc.nodes) ? doc.nodes : []).map((node) => [
+          String(node.address).toLowerCase(),
+          { metadataUrl: typeof node.metadata_url === "string" ? node.metadata_url : "" },
+        ]));
+        if (block >= minBlock && accept(nodes)) break;
+        last = `block ${block} (want >= ${minBlock}), ${nodes.size} member(s), state not reached yet`;
+      } catch (error) {
+        last = String(error);
+      }
+      if (Date.now() > deadline) {
+        throw new TestbedError("timeout", `${url} did not serve the expected registry state within ${timeoutMs} ms: ${last}`);
       }
       await delay(TOPOLOGY_POLL_MS);
     }

@@ -27,6 +27,12 @@ export interface StartAnvilOptions {
   readonly chainId: number;
   readonly logDir: string;
   readonly port?: number;
+  /**
+   * anvil's `--slots-in-an-epoch`. With 1, the `finalized` block tag trails
+   * `latest` by two blocks (the default 32 keeps it at genesis on a short-lived
+   * chain), so the worker's registry checks see recent registry changes.
+   */
+  readonly slotsInAnEpoch?: number;
 }
 
 export async function startAnvil(config: AnvilConfig, options: StartAnvilOptions): Promise<AnvilChain> {
@@ -35,7 +41,12 @@ export async function startAnvil(config: AnvilConfig, options: StartAnvilOptions
   const proc = ManagedProcess.start({
     label: `anvil(${options.label})`,
     command: config.bin,
-    args: ["--host", "127.0.0.1", "--port", String(port), "--chain-id", String(options.chainId)],
+    args: [
+      "--host", "127.0.0.1",
+      "--port", String(port),
+      "--chain-id", String(options.chainId),
+      ...(options.slotsInAnEpoch === undefined ? [] : ["--slots-in-an-epoch", String(options.slotsInAnEpoch)]),
+    ],
     logFile,
   });
   const url = `http://127.0.0.1:${port}`;
@@ -76,4 +87,9 @@ export async function startAnvil(config: AnvilConfig, options: StartAnvilOptions
     logFile,
     stop: () => proc.stop("SIGTERM"),
   };
+}
+
+/** Mine `count` empty blocks (anvil `anvil_mine`). */
+export async function mineBlocks(url: string, count: number): Promise<void> {
+  await jsonRpc(url, "anvil_mine", [`0x${count.toString(16)}`]);
 }
