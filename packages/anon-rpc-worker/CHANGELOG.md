@@ -24,7 +24,11 @@ Built on `@hisoka-io/nox-client` 0.6.0 (`kps.discovery`). Every 0.1.0 config sta
 ### Changed
 
 - `gateways` no longer has to be a pinned member's published address; gateways are tried first in place of the
-  default anchors instead of restricting entries (use `bridges` to restrict).
+  default anchors instead of restricting entries. After the gateways, the worker may dial the default anchors and
+  other published entries. Wallets that used `gateways` to keep traffic on chosen addresses switch to `bridges`,
+  which the worker treats as the only addresses it ever dials.
+- A gateway or bridge must answer `/metadata.json` with the node it serves (nox-kps `node_address`), and that node
+  must be a member in the bundle's snapshot.
 
 ## 0.1.0
 

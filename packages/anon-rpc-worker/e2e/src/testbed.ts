@@ -189,6 +189,14 @@ export interface MeshWithSidecars {
    * operator's IP change does.
    */
   moveSidecar(id: number, udpPort: number): Promise<RunningKpsServer>;
+  /**
+   * Start an unpublished bridge for node `id`: a second nox-kps with its own
+   * identity (certhash) on its own UDP and admin ports, whose /metadata.json
+   * names the node (run-nox profile "kps-bridge"). One bridge per node.
+   */
+  startBridge(id: number, udpPort: number, adminPort: number): Promise<RunningKpsServer>;
+  /** Stop node `id`'s bridge, if one runs. */
+  stopBridge(id: number): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -222,14 +230,16 @@ export async function startMeshWithSidecars(
     ...(local === undefined ? {} : { registry: { address: local.address, chainId: local.chainId } }),
   });
   const sidecars = new Map<number, RunningKpsServer>();
+  const bridges = new Map<number, RunningKpsServer>();
   const published = new Map<number, string>();
   let rotations = 0;
   const stopAll = async (): Promise<void> => {
-    await Promise.all([...sidecars.values()].map((sidecar) => sidecar.stop()));
+    await Promise.all([...sidecars.values(), ...bridges.values()].map((sidecar) => sidecar.stop()));
     sidecars.clear();
+    bridges.clear();
     await mesh.stop();
   };
-  const varsFor = (node: MeshNodeInfo, keyName: string, certhash: string, portOverride?: number): SidecarVars => {
+  const varsFor = (node: MeshNodeInfo, keyName: string, certhash: string, portOverride?: number, adminOverride?: number): SidecarVars => {
     const udpPort = portOverride ?? sidecarUdpPort(config.mesh.basePort, node.id);
     return {
       node: node.id,
@@ -241,14 +251,20 @@ export async function startMeshWithSidecars(
       ingress_url: node.ingressUrl,
       topology_port: node.metricsPort,
       topology_url: node.topologyUrl,
-      admin_port: sidecarAdminPort(config.mesh.basePort, node.id),
+      admin_port: adminOverride ?? sidecarAdminPort(config.mesh.basePort, node.id),
       key_file: join(paths.kps, `${keyName}.key`),
       config_file: join(paths.kps, `${keyName}.conf`),
       bundle_dir: paths.keccak,
       expected_certhash: certhash,
     };
   };
-  const launch = async (node: MeshNodeInfo, keyName: string, certhash: string, portOverride?: number): Promise<RunningKpsServer> => {
+  const start = async (
+    node: MeshNodeInfo,
+    keyName: string,
+    certhash: string,
+    portOverride?: number,
+    adminOverride?: number,
+  ): Promise<RunningKpsServer> => {
     const command = config.kps.sidecarCommand;
     if (command === undefined) throw new TestbedError("config", "NOX_KPS_CMD is unset; there are no sidecars to start");
     const sidecar = await startSidecar({
@@ -257,8 +273,12 @@ export async function startMeshWithSidecars(
       configTemplate: config.kps.sidecarConfigTemplate,
       logDir: paths.logs,
       addressTimeoutMs: config.kps.addressTimeoutMs,
-      vars: varsFor(node, keyName, certhash, portOverride),
+      vars: varsFor(node, keyName, certhash, portOverride, adminOverride),
     });
+    return sidecar;
+  };
+  const launch = async (node: MeshNodeInfo, keyName: string, certhash: string, portOverride?: number): Promise<RunningKpsServer> => {
+    const sidecar = await start(node, keyName, certhash, portOverride);
     sidecars.set(node.id, sidecar);
     return sidecar;
   };
@@ -337,6 +357,17 @@ export async function startMeshWithSidecars(
       const original = published.get(id);
       if (original === undefined) throw new TestbedError("config", `node ${id} never had a sidecar`);
       return launch(node, `node-${id}`, parseKpsAddress(original).certhash, udpPort);
+    },
+    startBridge: async (id, udpPort, adminPort) => {
+      if (bridges.has(id)) throw new TestbedError("config", `node ${id} already runs a bridge`);
+      const bridge = await start(nodeById(id), `node-${id}-bridge`, "", udpPort, adminPort);
+      bridges.set(id, bridge);
+      return bridge;
+    },
+    stopBridge: async (id) => {
+      const running = bridges.get(id);
+      bridges.delete(id);
+      if (running !== undefined) await running.stop();
     },
     stop: stopAll,
   };

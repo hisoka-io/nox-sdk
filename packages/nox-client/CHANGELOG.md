@@ -20,7 +20,12 @@ Additive; every 0.5.0 configuration behaves as before.
   - New members on probation (`probationSeconds`, `probationMaxPerRoute`), removal floor per route layer,
     `onVerified` callback with chain-confirmed KPS addresses and first-seen records.
   - `nox-anon-rpc-bootstrap/1` format with `verifyBootstrap`; discovery building blocks exported for tools.
-- `selectRoute` takes an optional probation cap; `TopologyNode.probation`.
+- `selectRoute` takes an optional probation cap; `TopologyNode.probation`. A pinned entry and a selected exit that
+  both are on probation over the cap are refused while a settled exit exists; paid-exit selection and entry
+  switches prefer settled members.
+- Chain checks read at most 256 candidate addresses (`DISCOVERY_LIMITS.maxCandidates`, `rankChainCandidates`):
+  snapshot and verified members first, then addresses at least `minRemovalSources` anchors list, then the rest.
+  Served documents listing more than 256 nodes are refused.
 
 ### Changed
 

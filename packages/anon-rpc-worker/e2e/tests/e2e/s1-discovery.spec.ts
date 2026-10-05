@@ -9,6 +9,10 @@
 //   2. A node registers after the bundle was built. The running worker finds
 //      it (registration logs close the member set), puts it on probation, and
 //      routes through it when it is the only reachable entry.
+//   3. A bridge as run-nox's kps-bridge profile runs it: a second nox-kps for
+//      a member with its own identity (certhash) and port, never published,
+//      whose /metadata.json names the member. A worker configured with only
+//      that bridge boots, serves calls and dials nothing else.
 //
 // Setup: only two nodes publish a KPS address (the others' metadataUrl is
 // parked empty, restored afterwards), so the entries the worker can use are
@@ -171,13 +175,14 @@ test.describe.serial("S1: identity from chain, location at run time", () => {
     expect(guarded.monitor.violations(), guarded.monitor.describeViolations()).toEqual([]);
   }
 
-  async function bootEmpty(page: Page, specifierUrl: string, readyTimeoutMs: number) {
+  async function bootEmpty(page: Page, specifierUrl: string, readyTimeoutMs: number, config?: Record<string, unknown>) {
     // The adopters' default: no config at all. The bundle's bootstrap supplies the anchor.
     return page.evaluate((request) => window.e2e.boot(request), {
       id: WORKER_ID,
       address: pin().worker.address,
       specifierRpcUrl: specifierUrl,
       readyTimeoutMs,
+      ...(config === undefined ? {} : { config }),
     });
   }
 
@@ -314,5 +319,48 @@ test.describe.serial("S1: identity from chain, location at run time", () => {
       else await meshBed.startSidecar(MOVER, "original");
     }
     await page.evaluate((id) => window.e2e.close(id), WORKER_ID);
+  });
+
+  test("a bridge with its own identity, naming its member, serves a bridges-only worker", async ({
+    cfg,
+    runPaths,
+    chains,
+    meshBed,
+    guardedHost,
+  }) => {
+    // Ports above the mesh range: the moved sidecar uses +5, the bridge +7 (UDP) and +8 (admin).
+    const above = cfg.mesh.basePort + cfg.mesh.nodes * 10;
+    const bridge = await meshBed.startBridge(ANCHOR, above + 7, above + 8);
+    try {
+      const published = meshBed.publishedKps.get(ANCHOR)!;
+      expect(bridge.address.split(":")[2]).not.toBe(published.split(":")[2]);
+      expect(bridge.address).not.toBe(published);
+      const page = await guardedHost.open("0.3.2");
+      const ready = await bootEmpty(page, chains.specifier.url, cfg.worker.readyTimeoutMs, { bridges: [bridge.address] });
+      expect(ready.ok, JSON.stringify(ready.error)).toBe(true);
+      const outcomes = [];
+      for (let i = 0; i < 3; i++) {
+        const call = await rpcViaWorker(page, WORKER_ID, chains.upstream.url, rpcCall("eth_chainId", [], i), cfg.worker.callTimeoutMs);
+        outcomes.push({ ok: call.result.ok, ms: call.result.ms });
+        expect(rpcResult(call.json)).toBe(`0x${chains.upstream.chainId.toString(16)}`);
+      }
+      expectKpsOnlyEgress(guardedHost);
+      const logs: LogLine[] = [];
+      await waitForLog(page, logs, () => false, LOG_POLL_MS * 2);
+      const dialed = new Set(
+        logs.flatMap((line) => [...line.text.matchAll(/"(?:anchor|entry)":"([A-Za-z0-9_-]{12})…"/gu)].map((match) => match[1]!)),
+      );
+      // Labels are certhash prefixes: only the bridge's identity was dialed.
+      expect([...dialed].every((label) => bridge.address.split(":")[2]!.startsWith(label)), JSON.stringify([...dialed])).toBe(true);
+      writeReport(cfg, runPaths, "s1-bridge", {
+        bridge: bridge.address.split(":").slice(0, 2).join(":"),
+        readyMs: ready.readyMs,
+        calls: outcomes,
+        dialedLabels: [...dialed],
+      });
+      await page.evaluate((id) => window.e2e.close(id), WORKER_ID);
+    } finally {
+      await meshBed.stopBridge(ANCHOR);
+    }
   });
 });

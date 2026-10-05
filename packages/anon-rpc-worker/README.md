@@ -33,7 +33,7 @@ optional, and every config valid for 0.1.0 stays valid:
 |---|---|---|---|
 | `v` | number | 1 | must be 1 |
 | `gateways` | string[] | the bundle's default anchors | 1-16 unique KPS addresses (`<ip>:<port>:<certhash>`, no DNS names), tried first in place of the default anchors. Any address is accepted: the node behind it must name an eligible member in its `/metadata.json` before the worker routes through it |
-| `bridges` | string[] | none | 1-16 KPS addresses. When set, the worker dials **only** bridges and never a published Nox address (Tor bridge semantics). Excludes `gateways` |
+| `bridges` | string[] | none | 1-16 KPS addresses. When set, the worker dials **only** bridges and never a published Nox address (Tor bridge semantics). Each bridge's `/metadata.json` names the member it serves (nox-kps `node_address`), which must be in the bundle's snapshot. Excludes `gateways` |
 | `registryRpcUrls` | string[] | the bundle's list | 2-8 `https:` URLs, replacing the bundle's registry RPC providers (for example a wallet's own Arbitrum node) |
 | `chainQuorum` | integer | 2 (bundle policy) | 2-4 (exit, provider) pairs that must answer byte for byte the same; a check waits when fewer distinct exits or providers are available |
 | `discovery` | `"chain"`, `"snapshot"` | `"chain"` | `"snapshot"`: no registry reads, the pinned snapshot is the only membership source (0.1.0 behaviour, no RPC provider involved) |
