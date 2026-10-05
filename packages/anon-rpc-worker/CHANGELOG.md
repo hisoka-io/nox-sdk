@@ -10,7 +10,7 @@ Built on `@hisoka-io/nox-client` 0.6.0 (`kps.discovery`). Every 0.1.0 config sta
 
 - Discovery (S1): identity from the snapshot and NoxRegistry, location looked up at run time. The bundle pins a
   `nox-anon-rpc-bootstrap/1` file next to the snapshot: default anchors nox-1, nox-2 and nox-8 on their Elastic IPs,
-  the registry implementation, three keyless Arbitrum Sepolia RPC providers of different organisations and the
+  the registry implementation, two keyless Arbitrum Sepolia RPC providers of different organisations and the
   discovery policy. An empty config boots on those anchors.
 - Chain checks through the mixnet after ready: two exits to two providers at one finalized block, used on
   byte-identical agreement only; location updates, removals, new members on probation (1 per route, 14 days).

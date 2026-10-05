@@ -72,7 +72,7 @@ the worker hash:
 |---|---|
 | `anchors` | nox-1 `100.56.0.72:15005`, nox-2 `3.232.137.146:15005`, nox-8 `18.215.18.61:15005` (Elastic IPs) with their KPS certhashes |
 | `registry`, `registryImpl` | NoxRegistry `0xf7bf...6cb6` on Arbitrum Sepolia (421614), implementation `0x7285...e2a2` behind the EIP-1967 proxy |
-| `registryRpcUrls` | `https://sepolia-rollup.arbitrum.io/rpc` (Offchain Labs), `https://arbitrum-sepolia.gateway.tenderly.co` (Tenderly), `https://arbitrum-sepolia-testnet.api.pocket.network` (Pocket Network): keyless, serve `finalized` and EIP-1898 block-hash reads at the finalized block |
+| `registryRpcUrls` | `https://sepolia-rollup.arbitrum.io/rpc` (Offchain Labs) and `https://arbitrum-sepolia-testnet.api.pocket.network` (Pocket Network): keyless, and checked through the live exits for `finalized`, EIP-1898 block-hash reads at the finalized block and 20-call batches. Tenderly's and Tatum's public gateways rate-limit or charge for those batches, PublicNode prunes the state of the finalized block, dRPC's free tier caps batches at 3 calls; a wallet can add its own providers with `registryRpcUrls` |
 | `policy` | quorum 2, state at most 3,600 s old, check every 600 s, at most 1 member on probation per route, probation 14 days, removals need 2 anchors, 2 members per layer |
 
 Boot: the worker dials, in priority classes and shuffled within each, bridges only (when set); otherwise the

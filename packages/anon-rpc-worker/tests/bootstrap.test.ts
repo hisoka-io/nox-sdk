@@ -1,8 +1,8 @@
 /**
  * The committed discovery bootstrap (`snapshot/nox-bootstrap.json`): verifies
  * against the committed snapshot with the SDK's own verifier, names the three
- * default anchors on their Elastic IPs (D-21, D-22) and the RPC providers of
- * three different organisations, with the production policy.
+ * default anchors on their Elastic IPs (D-21, D-22) and RPC providers of
+ * different organisations, with the production policy.
  */
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
@@ -43,9 +43,10 @@ describe("committed bootstrap", () => {
     ]);
   });
 
-  it("reads the registry from the official endpoint plus two keyless providers of other organisations", () => {
+  it("reads the registry from the official endpoint plus keyless providers of other organisations", () => {
     const urls = (JSON.parse(text) as { registryRpcUrls: string[] }).registryRpcUrls;
-    expect(urls[0]).toBe("https://sepolia-rollup.arbitrum.io/rpc");
+    // Checked 2026-10-05 through the live exits: `finalized`, EIP-1898 reads at that block, 20-call batches.
+    expect(urls).toEqual(["https://sepolia-rollup.arbitrum.io/rpc", "https://arbitrum-sepolia-testnet.api.pocket.network"]);
     expect(new Set(urls.map(rpcProviderKey)).size).toBe(urls.length);
     expect(urls.every((url) => url.startsWith("https://") && !/key|token/iu.test(url))).toBe(true);
   });
