@@ -61,6 +61,22 @@ describe("verifyBootstrap", () => {
     ).not.toThrow();
     expect(isAllowedRpcUrl("ws://127.0.0.1:1")).toBe(false);
     expect(isAllowedRpcUrl("https://x.test/#frag")).toBe(false);
+    expect(isAllowedRpcUrl("https://x.test/rpc?network=arb-sepolia")).toBe(true);
+    expect(isAllowedRpcUrl("https://[::1]:8545/")).toBe(true);
+    expect(isAllowedRpcUrl("http://[::1]:8545/")).toBe(true);
+    for (const bad of [
+      "https://user@x.test/",
+      "https://x.test:99999/",
+      "https://-x.test/",
+      "https://x..test/",
+      "HTTPS://x.test/",
+      "https://X.test/",
+      "https://x.test/ space",
+      "http://127.0.0.256/",
+      "http://10.0.0.1:8545/",
+    ]) {
+      expect(isAllowedRpcUrl(bad), bad).toBe(false);
+    }
   });
 
   it("checks every policy field against its range", () => {

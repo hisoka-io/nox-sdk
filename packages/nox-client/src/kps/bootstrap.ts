@@ -111,29 +111,43 @@ export function checkRpcUrls(value: unknown, field: string, fail: (detail: strin
   return [...seen];
 }
 
-/** `https:` anywhere, `http:` only on 127.0.0.0/8, `localhost` or `[::1]`; no credentials or fragment. */
-export function isAllowedRpcUrl(value: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    return false;
+/**
+ * Scheme, host, optional port, optional path and query; no credentials and no
+ * fragment. Parsed without `URL`, which not every worker global provides.
+ */
+const RPC_URL_RE = /^(https|http):\/\/(\[::1\]|[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?)(?::([1-9][0-9]{0,4}))?(\/[\x21-\x22\x24-\x7e]*)?$/u;
+const LOOPBACK_V4_RE = /^127(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])){3}$/u;
+
+function parseRpcUrl(value: string): { scheme: string; host: string; port: string | undefined } | null {
+  const match = RPC_URL_RE.exec(value);
+  if (match === null) return null;
+  const port = match[3];
+  if (port !== undefined && Number(port) > 65_535) return null;
+  const host = match[2]!;
+  if (host.includes("..") || host.split(".").some((label) => label.length === 0 || label.length > 63 || label.startsWith("-") || label.endsWith("-"))) {
+    return host === "[::1]" ? { scheme: match[1]!, host, port } : null;
   }
-  if (url.username !== "" || url.password !== "" || url.hash !== "") return false;
-  if (url.protocol === "https:") return url.hostname.length > 0;
-  if (url.protocol !== "http:") return false;
-  return url.hostname === "localhost" || url.hostname === "[::1]" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/u.test(url.hostname);
+  return { scheme: match[1]!, host, port };
+}
+
+/** `https:` anywhere, `http:` only on 127.0.0.0/8, `localhost` or `[::1]`; lowercase host, no credentials or fragment. */
+export function isAllowedRpcUrl(value: string): boolean {
+  const parsed = parseRpcUrl(value);
+  if (parsed === null) return false;
+  if (parsed.scheme === "https") return true;
+  return parsed.host === "localhost" || parsed.host === "[::1]" || LOOPBACK_V4_RE.test(parsed.host);
 }
 
 /** Name of the organisation behind an RPC URL, for "different providers": its registrable host. */
 export function rpcProviderKey(url: string): string {
-  const host = new URL(url).hostname.toLowerCase();
+  const parsed = parseRpcUrl(url);
+  if (parsed === null) return url;
+  const { host, port } = parsed;
   if (/^\d{1,3}(?:\.\d{1,3}){3}$/u.test(host) || host.startsWith("[") || host === "localhost") {
     // Local beds run several providers on one host; tell them apart by port.
-    return new URL(url).host.toLowerCase();
+    return port === undefined ? host : `${host}:${port}`;
   }
-  const labels = host.split(".");
-  return labels.slice(-2).join(".");
+  return host.split(".").slice(-2).join(".");
 }
 
 function checkKeys(value: Record<string, unknown>, keys: readonly string[], where: string): void {
