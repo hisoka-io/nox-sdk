@@ -198,6 +198,47 @@ const client = await NoxClient.connect({
 KPS mode never falls back to HTTPS: classic-only settings (`seeds`, `ethRpcUrl`, `transport`) and non-`kps:`
 endpoints fail with `MODE_VIOLATION`. Classic mode stays the default.
 
+#### Run-time discovery (`kps.discovery`)
+
+With `kps.discovery` the snapshot says who a member is (address, Sphinx key, role) and acts as the floor, while
+where a member is (IP, port, certhash, P2P address) is looked up at run time, so operators can change IPs with
+`updateUrl` / `updateMetadataUrl` and new members join without a client release:
+
+```ts
+kps: {
+  dial,
+  pinned: snapshot,
+  discovery: {
+    bootstrap,                 // "nox-anon-rpc-bootstrap/1": default anchors, registry implementation, RPC URLs, policy
+    gateways: ["203.0.113.9:15005:uEiB..."],   // optional: tried first, in place of the bootstrap anchors
+    // bridges: [...],         // optional: the only addresses ever dialled (excludes gateways)
+    learned,                   // optional: addresses earlier checks confirmed (onVerified)
+    onVerified: (state) => saveLearnedAnchors(state),
+  },
+}
+```
+
+- Boot dials anchors in priority classes, each shuffled: bridges only (when set); otherwise gateways or the
+  bootstrap anchors, learned anchors, then the snapshot's KPS addresses. An address the snapshot does not hold
+  answers `GET /metadata.json`; the node it names must be an eligible snapshot member. Presence in served
+  topologies is judged on identity: a changed url or `metadataUrl` is a move, never a removal. A new routing url
+  that documents from two anchors agree on is used until the chain check confirms it.
+- After ready, a chain check reads NoxRegistry at one finalized block through the mixnet: `chainQuorum` (2) exits
+  to as many different RPC providers, every call pinned with EIP-1898 `{ blockHash, requireCanonical: true }`. The
+  answer is used only when every pair returns byte for byte the same values, the registered members close the set
+  (`relayerCount()` and `topologyFingerprint()`), and the proxy's EIP-1967 slot holds `bootstrap.registryImpl`.
+  It repeats every `chainRefreshSeconds` (600) and early when a served fingerprint differs or every entry failed.
+- A verified read updates locations and removes members (each route layer keeps at least two snapshot members).
+  A member outside the snapshot is on probation for `probationSeconds` (14 days) after the client first saw it,
+  and a route holds at most `probationMaxPerRoute` (1) such member.
+- Logs: `discovery.verified`, `discovery.disagreement`, `discovery.incomplete`, `discovery.rejected`,
+  `discovery.probation`, `discovery.floor`, `discovery.failed`. With `chain: false` the snapshot stays the only
+  membership source and no RPC provider is ever involved.
+
+Trust: RPC providers are data sources reached anonymously through exits; they see exit IPs and public registry
+reads. Until TLS runs inside the client, the exits terminate HTTPS, so the quorum is attested by the exits;
+probation and the snapshot floor bound what a forged answer can change.
+
 ### Cover traffic
 
 Send dummy packets at a configurable rate to hide when you're actually using the network:

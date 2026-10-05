@@ -72,6 +72,8 @@ export interface TopologyNode {
    * published no capability data for it.
    */
   capabilities?: readonly string[];
+  /** KPS discovery: a member outside the snapshot still on probation. */
+  probation?: boolean;
 }
 
 export interface PathHop {
@@ -182,12 +184,113 @@ export interface PinnedSnapshot {
   members: PinnedMember[];
 }
 
+/**
+ * Discovery policy pinned in the bundle next to the snapshot (S1): how the
+ * client checks NoxRegistry through the mixnet and how far it trusts members
+ * the snapshot does not hold.
+ */
+export interface DiscoveryPolicy {
+  /** Distinct (exit, provider) pairs that must answer byte for byte the same. 2..4. */
+  chainQuorum: number;
+  /** Oldest finalized block accepted, by the block's own timestamp. */
+  maxStateAgeSeconds: number;
+  /** Interval between chain checks. */
+  chainRefreshSeconds: number;
+  /** Most members on probation in one route. */
+  probationMaxPerRoute: number;
+  /** How long a member outside the snapshot stays on probation after the client first saw it on chain. */
+  probationSeconds: number;
+  /** Accepted served topologies from this many different anchors are needed before a member is removed. */
+  minRemovalSources: number;
+  /** Members each route layer keeps. */
+  minMembersPerLayer: number;
+}
+
+/** `nox-anon-rpc-bootstrap/1`: run-time discovery inputs a bundle pins next to its snapshot. */
+export interface KpsBootstrap {
+  format: "nox-anon-rpc-bootstrap/1";
+  chainId: number;
+  /** NoxRegistry proxy, lowercase; equals the snapshot's registry. */
+  registry: string;
+  /** Implementation the registry proxy's EIP-1967 slot must hold, lowercase. */
+  registryImpl: string;
+  /** Default entry anchors, `<ip>:<port>:<certhash>`. */
+  anchors: string[];
+  /** Public JSON-RPC endpoints of the registry's chain, read through exits. */
+  registryRpcUrls: string[];
+  policy: DiscoveryPolicy;
+}
+
+/** A KPS address a previous chain check confirmed for a member. */
+export interface LearnedAnchor {
+  /** `<ip>:<port>:<certhash>`. */
+  address: string;
+  /** Registry address of the member that published it, lowercase. */
+  member: string;
+}
+
+/** When the client first saw a member outside the snapshot in a verified registry read. */
+export interface MemberFirstSeen {
+  /** Registry address, lowercase. */
+  address: string;
+  /** Finalized block of that read. */
+  block: number;
+  /** That block's timestamp (unix seconds). */
+  time: number;
+}
+
+/** One eligible member of a verified registry read. */
+export interface VerifiedMember {
+  address: string;
+  /** KPS address the member publishes on chain, or `null`. */
+  kpsAddress: string | null;
+  /** True when the member is in the snapshot with the same identity. */
+  floor: boolean;
+  probation: boolean;
+}
+
+/** Result of a chain check the client applied. */
+export interface VerifiedDiscovery {
+  blockHash: string;
+  blockNumber: number;
+  blockTimestamp: number;
+  members: VerifiedMember[];
+  firstSeen: MemberFirstSeen[];
+}
+
+/**
+ * Run-time discovery (S1): identity from the snapshot and the chain, location
+ * looked up at run time. Without it the client keeps the pinned-only rules.
+ */
+export interface KpsDiscoveryOptions {
+  /** Verified `nox-anon-rpc-bootstrap/1` (same chain and registry as `pinned`). */
+  bootstrap: KpsBootstrap;
+  /** Anchors tried first, in place of `bootstrap.anchors`. 1..16 KPS addresses. */
+  gateways?: readonly string[];
+  /** The only anchors and entries the client ever dials (Tor bridge semantics). Excludes `gateways`. */
+  bridges?: readonly string[];
+  /** Addresses earlier chain checks confirmed; tried after the anchors. */
+  learned?: readonly LearnedAnchor[];
+  /** Replaces `bootstrap.registryRpcUrls`. */
+  registryRpcUrls?: readonly string[];
+  /** Replaces `bootstrap.policy.chainQuorum`. */
+  chainQuorum?: number;
+  /** Default true. False: no registry reads, the snapshot stays the only membership source. */
+  chain?: boolean;
+  /** Probation start times recorded by earlier chain checks. */
+  firstSeen?: readonly MemberFirstSeen[];
+  /** Called after each chain check the client applied. */
+  onVerified?: (state: VerifiedDiscovery) => void;
+}
+
 /** KPS mode inputs. There is no seed, no RPC and no HTTP(S) entry in this mode. */
 export interface KpsModeOptions {
   /** Dialer, e.g. `(a, o) => anonRpcWorker.kps.dial(a, o)`. */
   dial: KpsDial;
   /** The pinned registry snapshot; its members are the only nodes the client trusts. */
   pinned: PinnedSnapshot;
+  /** Run-time discovery (anchors, bridges, chain checks). Excludes `entries`. */
+  discovery?: KpsDiscoveryOptions;
   /** Allowed entry KPS addresses; each must belong to a pinned member. Default: every KPS-capable member. */
   entries?: readonly string[];
   /**

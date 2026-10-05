@@ -4,7 +4,14 @@
  * layers, fingerprints and complete liveness.
  */
 import { computeTopologyFingerprint, primaryLayerForRole } from "../../src/topology.js";
-import type { PinnedMember, PinnedSnapshot, RelayerNode, TopologySnapshot } from "../../src/types.js";
+import type {
+  DiscoveryPolicy,
+  KpsBootstrap,
+  PinnedMember,
+  PinnedSnapshot,
+  RelayerNode,
+  TopologySnapshot,
+} from "../../src/types.js";
 import { kpsAddressFor } from "./fake_kps.js";
 
 export const PINNED_BLOCK = 315_453_396;
@@ -125,5 +132,39 @@ export function served(pinned: PinnedSnapshot, nowUnix: number, spec: ServedSpec
         observed_at_unix: timestamp,
       };
     }),
+  };
+}
+
+/** RPC endpoints of the fixture bootstrap: three different organisations. */
+export const FIXTURE_PROVIDERS = [
+  "https://rpc.provider-a.test/rpc",
+  "https://gateway.provider-b.test/",
+  "https://api.provider-c.test/v1",
+];
+
+/** A `nox-anon-rpc-bootstrap/1` for `pinned`: anchors default to the KPS addresses of members `anchorIndexes`. */
+export function makeBootstrap(
+  pinned: PinnedSnapshot,
+  overrides: Partial<KpsBootstrap> & { policy?: Partial<DiscoveryPolicy> } = {},
+): KpsBootstrap {
+  const { policy, ...rest } = overrides;
+  return {
+    format: "nox-anon-rpc-bootstrap/1",
+    chainId: pinned.chainId,
+    registry: pinned.registry,
+    registryImpl: "0x7285125cfdcb6337aaed2d56d4fe99f870ede2a2",
+    anchors: [],
+    registryRpcUrls: [...FIXTURE_PROVIDERS],
+    ...rest,
+    policy: {
+      chainQuorum: 2,
+      maxStateAgeSeconds: 3_600,
+      chainRefreshSeconds: 600,
+      probationMaxPerRoute: 1,
+      probationSeconds: 1_209_600,
+      minRemovalSources: 2,
+      minMembersPerLayer: 2,
+      ...policy,
+    },
   };
 }

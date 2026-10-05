@@ -1,7 +1,10 @@
 /**
- * Pinned bootstrap (D-02, ARCHITECTURE §3.4, §5): the registry snapshot that
- * ships inside the hash-pinned bundle, and the removals-only rule for
- * topology documents served by nodes over KPS.
+ * Pinned bootstrap (D-02, ARCHITECTURE §3.4, §5) and the S1 identity/location
+ * split (PROPOSAL §2.2): the registry snapshot that ships inside the
+ * hash-pinned bundle is the floor of who a member is (address, Sphinx key,
+ * role, layer). Where a member is (url, ingressUrl, metadataUrl) is a hint
+ * that served documents and chain checks may update without the member
+ * counting as removed.
  *
  * Pure functions: no network, no clock reads (callers pass `nowUnix`).
  */
@@ -64,6 +67,16 @@ const MAX_FIELD_LENGTH = 256;
 const MAX_CAPABILITIES = 32;
 const MAX_CAPABILITY_LENGTH = 64;
 
+/**
+ * One member the client routes over: a pinned or chain-verified profile.
+ * `floor`: in the snapshot with the same identity. `probation`: outside the
+ * snapshot and seen on chain for less than the policy's probation period.
+ */
+export interface MemberRecord extends PinnedMember {
+  floor: boolean;
+  probation: boolean;
+}
+
 /** One topology document a node served over KPS, with the KPS address it came from. */
 export interface ServedTopology {
   anchor: string;
@@ -81,10 +94,12 @@ export const MIN_MEMBERS_PER_LAYER = 2;
 /** Members the client routes over after applying served topologies. */
 export interface WorkingSet {
   members: RelayerNode[];
-  /** Pinned eligible members left out (addresses, lowercase). */
+  /** Base members left out (addresses, lowercase). */
   removed: string[];
-  /** Served members that are not pinned, ignored (additions need a new bundle). */
+  /** Served members outside the base membership, ignored (additions come from a chain check or a new bundle). */
   ignoredAdditions: number;
+  /** Members whose routing `url` comes from served documents that agree on a newer value than the base. */
+  relocated: string[];
   /** Served documents that passed every check. */
   sourcesAccepted: number;
   /**
@@ -113,8 +128,38 @@ export interface ApplyServedOptions {
   livenessMaxAgeSeconds: number;
   /** KPS addresses allowed as entries; default every pinned member with one. */
   entryAddresses?: ReadonlySet<string>;
-  /** Working set whose members a layer below the floor keeps; default every pinned eligible member. */
+  /** Working set whose members a layer below the floor keeps; default every base member. */
   previous?: readonly RelayerNode[];
+  /**
+   * Eligible members the documents are judged against (snapshot floor, or a
+   * chain-verified set). Default: every eligible pinned member.
+   */
+  membership?: readonly MemberRecord[];
+  /** Member behind each anchor (KPS address → lowercase registry address). Default: the pinned KPS addresses. */
+  anchorMembers?: ReadonlyMap<string, string>;
+  /** Entry location per member (lowercase address → KPS address). Default: the pinned KPS addresses. */
+  endpoints?: ReadonlyMap<string, string>;
+  /**
+   * Block the base membership's locations and member list are known at
+   * (default: the snapshot block). Documents at or before it relocate
+   * nobody, and members that only documents older than it omit are kept:
+   * those documents cannot know them.
+   */
+  membershipBlock?: number;
+  /** Default `MIN_REMOVAL_SOURCES`. */
+  minRemovalSources?: number;
+  /** Default `MIN_MEMBERS_PER_LAYER`. */
+  minMembersPerLayer?: number;
+}
+
+/** Inputs of `routingNodes`: entry locations, capability hints and probation flags per member. */
+export interface RoutingContext {
+  /** Lowercase member address → KPS address used as its entry endpoint. */
+  readonly endpoints: ReadonlyMap<string, string>;
+  /** Only these KPS addresses may be entries; `undefined` = every endpoint. */
+  readonly entryAddresses?: ReadonlySet<string> | undefined;
+  readonly capabilities: ReadonlyMap<string, readonly string[]>;
+  readonly probation: ReadonlySet<string>;
 }
 
 /**
@@ -166,6 +211,11 @@ export function eligiblePinnedMembers(pinned: PinnedSnapshot): PinnedMember[] {
   return pinned.members.filter((member) => (member.status === 1 || member.status === 2) && !member.frozen);
 }
 
+/** Every eligible pinned member as a floor record. */
+export function floorRecords(pinned: PinnedSnapshot): MemberRecord[] {
+  return eligiblePinnedMembers(pinned).map((member) => ({ ...member, floor: true, probation: false }));
+}
+
 /** KPS address of each pinned member that published one, by lowercase registry address. */
 export function pinnedKpsAddresses(pinned: PinnedSnapshot): Map<string, string> {
   const out = new Map<string, string>();
@@ -186,51 +236,75 @@ export function kpsTopologyNodes(
   members: readonly RelayerNode[],
   entryAddresses?: ReadonlySet<string>,
 ): TopologyNode[] {
-  const kps = pinnedKpsAddresses(pinned);
-  const byAddress = new Map(pinned.members.map((member) => [member.address, member]));
+  return routingNodes(members, pinnedRoutingContext(pinned, entryAddresses));
+}
+
+/** Routing context of the pinned snapshot alone: pinned KPS addresses and capability hints, no probation. */
+export function pinnedRoutingContext(pinned: PinnedSnapshot, entryAddresses?: ReadonlySet<string>): RoutingContext {
+  return {
+    endpoints: pinnedKpsAddresses(pinned),
+    entryAddresses,
+    capabilities: new Map(pinned.members.map((member) => [member.address, member.capabilities])),
+    probation: new Set(),
+  };
+}
+
+/**
+ * Routing nodes for a working set: entry endpoint `kps:<address>` for members
+ * whose location is allowed as an entry, `""` for the rest (they still route
+ * as mix or exit by multiaddr), capability hints and probation flags.
+ */
+export function routingNodes(members: readonly RelayerNode[], context: RoutingContext): TopologyNode[] {
   return members.map((raw) => {
     const node = parseNode(raw);
-    const address = kps.get(node.id);
-    const allowed = address !== undefined && (entryAddresses === undefined || entryAddresses.has(address));
-    const capabilities = byAddress.get(node.id)?.capabilities ?? [];
+    const address = context.endpoints.get(node.id);
+    const allowed = address !== undefined && (context.entryAddresses === undefined || context.entryAddresses.has(address));
+    const capabilities = context.capabilities.get(node.id) ?? [];
     return {
       ...node,
       address: allowed ? kpsEntryEndpoint(address) : "",
       capabilities: Object.freeze([...capabilities]),
+      ...(context.probation.has(node.id) ? { probation: true } : {}),
     };
   });
 }
 
 /**
- * Apply node-served topology documents to the pinned snapshot with the
- * removals-only rule (ARCHITECTURE §5.3).
+ * Apply node-served topology documents to the base membership (the eligible
+ * pinned members, or a chain-verified set) under the removals-only rule
+ * (ARCHITECTURE §5.3) with identity-only presence (PROPOSAL §2.2 step 5).
  *
  * A served document S from anchor a is accepted only if it is self-consistent
  * with complete liveness, pinned at or after the snapshot block, timestamped
- * within the liveness window plus the clock skew tolerance, and lists a's own
- * member. A pinned eligible member is kept when at least one accepted document
- * lists it with exactly the pinned profile and reports it online with a fresh
- * observation, so a removal needs every accepted source to agree. Members a
- * document adds are ignored; a changed profile counts as absent.
+ * within the liveness window plus the clock skew tolerance, the anchor maps to
+ * a base member, and S lists that member. A base member is kept when at least
+ * one accepted document lists it with its identity (address, Sphinx key,
+ * role, layer) and reports it online with a fresh observation, so a removal
+ * needs every accepted source to agree. Members a document adds are ignored.
+ * A changed url, ingressUrl or metadataUrl is a location change, never a
+ * removal: when documents from at least `minRemovalSources` different anchors
+ * agree on a newer routing `url`, the member routes over it (listed in
+ * `relocated`); a wrong host cannot peel the layer encrypted to the member's
+ * key, so the worst case is a dropped packet until the next chain check.
  *
- * Single-source rule: removals apply only when documents from at least two
- * different anchors are accepted. Two different anchors always include one
- * that is not the current entry, so the entry, which already knows the
- * client's address, can never shrink the set on its own. With fewer, the
- * result is every pinned eligible member.
+ * Single-source rule: removals apply only when documents from at least
+ * `minRemovalSources` different anchors are accepted. Two different anchors
+ * always include one that is not the current entry, so the entry, which
+ * already knows the client's address, can never shrink the set on its own.
+ * With fewer, the result is every base member.
  *
  * Floor: each layer (KPS entries, mixes, exits) keeps at least
- * `min(2, pinned eligible members in that layer)` members. A layer the agreed
- * removals would leave below the floor keeps the previous working set's
- * members of that layer and is listed in `floorLayers`.
+ * `min(minMembersPerLayer, base members in that layer)` members. A layer the
+ * agreed removals would leave below the floor keeps the previous working
+ * set's members of that layer and is listed in `floorLayers`.
  *
- * Registry evidence versus liveness: `TOPOLOGY_STALE` (a newer bundle is due)
- * rests on registry evidence only, that is every accepted document omits each
- * pinned eligible member of a layer or lists it with a changed profile. A
- * layer whose members are still listed but reported offline (node liveness is
- * an in-memory P2P view that starts empty after a restart) is a transient
- * state: the layer keeps its previous members, is listed in `floorLayers` and
- * `offlineLayers`, and calls fail one by one until members come back online.
+ * Registry evidence versus liveness: `TOPOLOGY_STALE` rests on registry
+ * evidence only, that is every accepted document omits each base member of a
+ * layer or lists it with another identity. A layer whose members are still
+ * listed but reported offline (node liveness is an in-memory P2P view that
+ * starts empty after a restart) is a transient state: the layer keeps its
+ * previous members, is listed in `floorLayers` and `offlineLayers`, and calls
+ * fail one by one until members come back online.
  */
 export function applyServedTopologies(
   pinned: PinnedSnapshot,
@@ -238,36 +312,37 @@ export function applyServedTopologies(
   nowUnix: number,
   options: ApplyServedOptions,
 ): WorkingSet {
-  const kps = pinnedKpsAddresses(pinned);
-  const memberByKps = new Map<string, string>();
-  for (const [member, address] of kps) memberByKps.set(address, member);
-  const pinnedByAddress = new Map(pinned.members.map((member) => [member.address, member]));
+  const base = options.membership ?? floorRecords(pinned);
+  const baseByAddress = new Map(base.map((member) => [member.address, member]));
+  const anchorMembers = options.anchorMembers ?? invertMap(pinnedKpsAddresses(pinned));
+  const minSources = options.minRemovalSources ?? MIN_REMOVAL_SOURCES;
+  const minPerLayer = options.minMembersPerLayer ?? MIN_MEMBERS_PER_LAYER;
 
-  const accepted: TopologySnapshot[] = [];
+  const accepted: { anchor: string; snapshot: TopologySnapshot }[] = [];
   const acceptedAnchors = new Set<string>();
   const rejected: { anchor: string; reason: string }[] = [];
   for (const source of served) {
-    const reason = rejectionReason(pinned, source, memberByKps, nowUnix, options);
+    const reason = rejectionReason(pinned, source, anchorMembers, baseByAddress, nowUnix, options);
     if (reason === null) {
-      accepted.push(source.snapshot);
+      accepted.push(source);
       acceptedAnchors.add(source.anchor);
     } else {
       rejected.push({ anchor: source.anchor, reason });
     }
   }
 
-  const eligible = eligiblePinnedMembers(pinned);
   const additions = new Set<string>();
-  for (const snapshot of accepted) {
+  for (const { snapshot } of accepted) {
     for (const node of snapshot.nodes) {
       const address = node.address.toLowerCase();
-      if (!pinnedByAddress.has(address)) additions.add(address);
+      if (!baseByAddress.has(address)) additions.add(address);
     }
   }
   const unchanged = (removalQuorum: boolean): WorkingSet => ({
-    members: eligible.map(toRelayerNode),
+    members: base.map(toRelayerNode),
     removed: [],
     ignoredAdditions: additions.size,
+    relocated: [],
     sourcesAccepted: accepted.length,
     removalQuorum,
     floorApplied: false,
@@ -275,23 +350,42 @@ export function applyServedTopologies(
     offlineLayers: [],
     rejected,
   });
-  if (acceptedAnchors.size < MIN_REMOVAL_SOURCES) return unchanged(false);
+  if (acceptedAnchors.size < minSources) return unchanged(false);
 
   // `listed`: registry evidence, some accepted document lists the member with
-  // its pinned profile. `kept`: listed and reported online by such a document.
+  // its identity. `kept`: listed and reported online by such a document.
   const listed = new Set<string>();
   const kept = new Set<string>();
-  for (const member of eligible) {
-    const present = accepted.filter((snapshot) => isPresentWithPinnedProfile(snapshot, member));
-    if (present.length === 0) continue;
+  const relocatedUrls = new Map<string, string>();
+  const membershipBlock = options.membershipBlock ?? pinned.blockNumber;
+  const allOlder = accepted.every(({ snapshot }) => (snapshot.block_number ?? 0) < membershipBlock);
+  for (const member of base) {
+    const present = accepted.filter(({ snapshot }) => findWithIdentity(snapshot, member) !== undefined);
+    if (present.length === 0) {
+      if (allOlder && !accepted.some(({ snapshot }) => listsAddress(snapshot, member.address))) {
+        // Every document predates what the client knows about this member.
+        listed.add(member.address);
+        kept.add(member.address);
+      }
+      continue;
+    }
     listed.add(member.address);
-    if (present.some((snapshot) => isOnline(snapshot, member.address, options.livenessMaxAgeSeconds))) {
+    if (present.some(({ snapshot }) => isOnline(snapshot, member.address, options.livenessMaxAgeSeconds))) {
       kept.add(member.address);
     }
+    const newer = present.filter(({ snapshot }) => (snapshot.block_number ?? 0) > membershipBlock);
+    const agreed = agreedNewUrl(newer, member, minSources);
+    if (agreed !== undefined) relocatedUrls.set(member.address, agreed);
   }
 
-  const eligibleNodes = kpsTopologyNodes(pinned, eligible.map(toRelayerNode), options.entryAddresses);
-  const previous = new Set((options.previous ?? eligible.map(toRelayerNode)).map((node) => node.address.toLowerCase()));
+  const context: RoutingContext = {
+    endpoints: options.endpoints ?? pinnedKpsAddresses(pinned),
+    entryAddresses: options.entryAddresses,
+    capabilities: new Map(),
+    probation: new Set(),
+  };
+  const baseNodes = routingNodes(base.map(toRelayerNode), context);
+  const previous = new Set((options.previous ?? base.map(toRelayerNode)).map((node) => node.address.toLowerCase()));
   // Layers overlap (a relay can be entry and mix), so every layer is measured
   // against the agreed set before any layer gets its previous members back.
   const agreed = new Set(kept);
@@ -299,12 +393,13 @@ export function applyServedTopologies(
   const offlineLayers: RouteLayer[] = [];
   const gone: RouteLayer[] = [];
   for (const layer of ROUTE_LAYERS) {
-    const inLayer = eligibleNodes.filter((node) => isInLayer(node, layer));
+    const inLayer = baseNodes.filter((node) => isInLayer(node, layer));
+    if (inLayer.length === 0) continue;
     if (!inLayer.some((node) => listed.has(node.id))) {
       gone.push(layer);
       continue;
     }
-    const floor = Math.min(MIN_MEMBERS_PER_LAYER, inLayer.length);
+    const floor = Math.min(minPerLayer, inLayer.length);
     const remaining = inLayer.filter((node) => agreed.has(node.id)).length;
     if (remaining >= floor) continue;
     floorLayers.push(layer);
@@ -321,15 +416,22 @@ export function applyServedTopologies(
   if (gone.length > 0) {
     throw new NoxClientError(
       `${acceptedAnchors.size} served topologies from different anchors agree that the registry no longer lists ` +
-        `the pinned ${gone.join(", ")} members with their pinned profiles (${eligible.length} eligible members pinned); ` +
+        `the ${gone.join(", ")} members with their known identities (${base.length} eligible members known); ` +
         "this bundle's snapshot is stale",
       NoxClientErrorCode.TopologyStale,
     );
   }
+  const relocated = base.filter((member) => kept.has(member.address) && relocatedUrls.has(member.address));
   return {
-    members: eligible.filter((member) => kept.has(member.address)).map(toRelayerNode),
-    removed: eligible.filter((member) => !kept.has(member.address)).map((member) => member.address),
+    members: base
+      .filter((member) => kept.has(member.address))
+      .map((member) => {
+        const url = relocatedUrls.get(member.address);
+        return toRelayerNode(url === undefined ? member : { ...member, url });
+      }),
+    removed: base.filter((member) => !kept.has(member.address)).map((member) => member.address),
     ignoredAdditions: additions.size,
+    relocated: relocated.map((member) => member.address),
     sourcesAccepted: accepted.length,
     removalQuorum: true,
     floorApplied: floorLayers.length > 0,
@@ -337,6 +439,35 @@ export function applyServedTopologies(
     offlineLayers,
     rejected,
   };
+}
+
+/**
+ * The routing `url` that documents from at least `minSources` different
+ * anchors list for `member` (with its identity) when it differs from the
+ * base, or `undefined`.
+ */
+function agreedNewUrl(
+  present: readonly { anchor: string; snapshot: TopologySnapshot }[],
+  member: PinnedMember,
+  minSources: number,
+): string | undefined {
+  const anchorsByUrl = new Map<string, Set<string>>();
+  for (const { anchor, snapshot } of present) {
+    const node = findWithIdentity(snapshot, member);
+    if (node === undefined || node.url === member.url) continue;
+    const anchors = anchorsByUrl.get(node.url) ?? new Set<string>();
+    anchors.add(anchor);
+    anchorsByUrl.set(node.url, anchors);
+  }
+  const agreed = [...anchorsByUrl].filter(([, anchors]) => anchors.size >= minSources);
+  // Two different newer values with quorum each: no agreement, keep the base.
+  return agreed.length === 1 ? agreed[0]![0] : undefined;
+}
+
+function invertMap(map: ReadonlyMap<string, string>): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const [key, value] of map) out.set(value, key);
+  return out;
 }
 
 /** True when `node` can serve `layer` under `selectRoute`'s rules (entries need a `kps:` endpoint). */
@@ -368,11 +499,14 @@ export function formsRoute(
   members: readonly RelayerNode[],
   entryAddresses?: ReadonlySet<string>,
 ): boolean {
+  return formsRouteWith(members, pinnedRoutingContext(pinned, entryAddresses));
+}
+
+/** `formsRoute` with an explicit routing context (discovery). */
+export function formsRouteWith(members: readonly RelayerNode[], context: RoutingContext): boolean {
   if (members.length === 0) return false;
   try {
-    selectRoute(kpsTopologyNodes(pinned, members, entryAddresses), undefined, undefined, undefined, (node) =>
-      node.address.length > 0
-    );
+    selectRoute(routingNodes(members, context), undefined, undefined, undefined, (node) => node.address.length > 0);
     return true;
   } catch {
     return false;
@@ -382,7 +516,8 @@ export function formsRoute(
 function rejectionReason(
   pinned: PinnedSnapshot,
   source: ServedTopology,
-  memberByKps: ReadonlyMap<string, string>,
+  anchorMembers: ReadonlyMap<string, string>,
+  base: ReadonlyMap<string, MemberRecord>,
   nowUnix: number,
   options: ApplyServedOptions,
 ): string | null {
@@ -402,25 +537,33 @@ function rejectionReason(
   if (timestamp < oldest || timestamp > newest) {
     return `timestamp ${timestamp} is outside [${oldest}, ${newest}] (local clock ${nowUnix})`;
   }
-  const anchorMember = memberByKps.get(source.anchor);
-  if (anchorMember === undefined) return "the anchor is not a pinned member's KPS address";
-  if (!snapshot.nodes.some((node) => node.address.toLowerCase() === anchorMember)) {
+  const anchorMember = anchorMembers.get(source.anchor);
+  if (anchorMember === undefined) {
+    return options.anchorMembers === undefined
+      ? "the anchor is not a pinned member's KPS address"
+      : "the anchor maps to no known member";
+  }
+  const member = base.get(anchorMember);
+  if (member === undefined) return "the anchor's member is not an eligible known member";
+  if (findWithIdentity(snapshot, member) === undefined) {
     return "the anchor's own member is missing from the document it served";
   }
   return null;
 }
 
-function isPresentWithPinnedProfile(snapshot: TopologySnapshot, member: PinnedMember): boolean {
+function listsAddress(snapshot: TopologySnapshot, address: string): boolean {
+  return snapshot.nodes.some((node) => node.address.toLowerCase() === address);
+}
+
+/** The document's entry for `member` when it carries the same identity (address, Sphinx key, role, layer). */
+function findWithIdentity(snapshot: TopologySnapshot, member: PinnedMember): RelayerNode | undefined {
   const node = snapshot.nodes.find((candidate) => candidate.address.toLowerCase() === member.address);
-  return (
-    node !== undefined &&
-    node.sphinx_key.toLowerCase().replace(/^0x/u, "") === member.sphinxKey &&
-    node.url === member.url &&
-    (node.ingress_url ?? "") === member.ingressUrl &&
-    (node.metadata_url ?? "") === member.metadataUrl &&
-    node.role === member.role &&
-    node.layer === member.layer
-  );
+  return node !== undefined &&
+      node.sphinx_key.toLowerCase().replace(/^0x/u, "") === member.sphinxKey &&
+      node.role === member.role &&
+      node.layer === member.layer
+    ? node
+    : undefined;
 }
 
 function isOnline(snapshot: TopologySnapshot, address: string, maxAgeSeconds: number): boolean {
@@ -436,7 +579,8 @@ function isOnline(snapshot: TopologySnapshot, address: string, maxAgeSeconds: nu
   );
 }
 
-function toRelayerNode(member: PinnedMember): RelayerNode {
+/** A member profile in the client's `RelayerNode` shape. */
+export function toRelayerNode(member: PinnedMember): RelayerNode {
   return {
     address: member.address,
     sphinx_key: member.sphinxKey,
