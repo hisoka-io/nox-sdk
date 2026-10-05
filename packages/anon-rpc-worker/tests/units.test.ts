@@ -6,6 +6,12 @@ import { CLASS_REPLY_BYTES, classifyCall, profileRequest } from "../src/jsonrpc.
 import { createLogger, redact } from "../src/log.js";
 import type { LogArg, StorageApi } from "../src/spec-types.js";
 import {
+  LEARNED_CACHE_KEY,
+  LEARNED_CACHE_MAX_AGE_SECONDS,
+  LEARNED_CACHE_MAX_ANCHORS,
+  LearnedCacheWriter,
+  learnedCacheFrom,
+  readLearnedCache,
   REMOVAL_CACHE_KEY,
   REMOVAL_CACHE_MAX_AGE_SECONDS,
   RemovalCacheWriter,
@@ -13,14 +19,13 @@ import {
 } from "../src/storage.js";
 import { kpsAddressFor } from "./helpers/fixtures.js";
 
-const PINNED = new Set([kpsAddressFor(1), kpsAddressFor(2)]);
 const encoder = new TextEncoder();
 
 describe("config", () => {
   it("uses defaults for undefined, null and {}", () => {
-    expect(parseConfig(undefined, PINNED)).toBe(CONFIG_DEFAULTS);
-    expect(parseConfig(null, PINNED)).toBe(CONFIG_DEFAULTS);
-    expect(parseConfig({}, PINNED)).toEqual(CONFIG_DEFAULTS);
+    expect(parseConfig(undefined)).toBe(CONFIG_DEFAULTS);
+    expect(parseConfig(null)).toBe(CONFIG_DEFAULTS);
+    expect(parseConfig({})).toEqual(CONFIG_DEFAULTS);
   });
 
   it("accepts a full valid config, including a JSON5-parsed object, without mutating it", () => {
@@ -30,7 +35,7 @@ describe("config", () => {
         '"surbFormat":"v2","claimIntervalMs":100,"bootRetryMaxMs":10000,"topologySources":3,"warmup":true}',
     ) as Record<string, unknown>;
     const snapshot = JSON.stringify(raw);
-    const config = parseConfig(raw, PINNED);
+    const config = parseConfig(raw);
     expect(config).toMatchObject({ gateways: [kpsAddressFor(2)], logLevel: "warn", surbFormat: "v2", warmup: true, topologySources: 3 });
     expect(Object.isFrozen(config)).toBe(true);
     expect(JSON.stringify(raw)).toBe(snapshot);
@@ -49,10 +54,47 @@ describe("config", () => {
     ["warmup", { warmup: "yes" }, /warmup/u],
     ["gateways empty", { gateways: [] }, /gateways must be a list of 1\.\.16/u],
     ["gateway malformed", { gateways: ["1.2.3.4:15005"] }, /not a KPS address/u],
-    ["gateway not pinned", { gateways: [kpsAddressFor(3)] }, /not the KPS address of a node pinned/u],
     ["gateway repeated", { gateways: [kpsAddressFor(1), kpsAddressFor(1)] }, /repeats/u],
+    ["17 gateways", { gateways: Array.from({ length: 17 }, (_, i) => kpsAddressFor(i + 1)) }, /1\.\.16/u],
+    ["bridges empty", { bridges: [] }, /bridges must be a list of 1\.\.16/u],
+    ["bridge malformed", { bridges: ["bridge.example:15005:uEiB"] }, /bridges\[0\] is not a KPS address/u],
+    ["gateways with bridges", { gateways: [kpsAddressFor(1)], bridges: [kpsAddressFor(2)] }, /exclude each other/u],
+    ["one RPC URL", { registryRpcUrls: ["https://a.test/"] }, /registryRpcUrls must be a list of 2\.\.8/u],
+    ["plain-http RPC URL", { registryRpcUrls: ["https://a.test/", "http://b.test/"] }, /registryRpcUrls\[1\]/u],
+    ["quorum 1", { chainQuorum: 1 }, /chainQuorum must be an integer in 2\.\.4/u],
+    ["quorum 5", { chainQuorum: 5 }, /chainQuorum/u],
+    ["discovery mode", { discovery: "dns" }, /discovery must be one of chain, snapshot/u],
+    ["trust proven", { trust: "proven" }, /trust is reserved/u],
+    ["checkpoint", { checkpoint: { block: 1 } }, /checkpoint is reserved/u],
   ])("rejects %s with bad-config", (_name, raw, message) => {
-    expect(() => parseConfig(raw, PINNED)).toThrow(expect.objectContaining({ code: "bad-config", message: expect.stringMatching(message) }));
+    expect(() => parseConfig(raw)).toThrow(expect.objectContaining({ code: "bad-config", message: expect.stringMatching(message) }));
+  });
+
+  it("accepts gateways that no pinned member publishes: they are addresses, not identities", () => {
+    expect(parseConfig({ gateways: [kpsAddressFor(77)] }).gateways).toEqual([kpsAddressFor(77)]);
+  });
+
+  it("accepts the S1 discovery fields", () => {
+    const config = parseConfig({
+      bridges: [kpsAddressFor(9)],
+      registryRpcUrls: ["https://own.wallet.test/rpc", "https://other.test/rpc"],
+      chainQuorum: 3,
+      discovery: "snapshot",
+      trust: "auto",
+    });
+    expect(config).toMatchObject({
+      bridges: [kpsAddressFor(9)],
+      registryRpcUrls: ["https://own.wallet.test/rpc", "https://other.test/rpc"],
+      chainQuorum: 3,
+      discovery: "snapshot",
+      trust: "auto",
+    });
+    expect(Object.isFrozen(config.bridges)).toBe(true);
+  });
+
+  it("keeps the adopters exampleConfig valid", () => {
+    const example = { gateways: ["100.56.0.72:15005:uEiBVDwIs40bsslDkM-BYb2AOHw3PHe70_bj5U_09r7vdIQ"] };
+    expect(parseConfig(example).gateways).toEqual(example.gateways);
   });
 });
 
@@ -212,5 +254,123 @@ describe("storage", () => {
     const saved = JSON.parse(new TextDecoder().decode(store.map.get(REMOVAL_CACHE_KEY)!)) as Record<string, unknown>;
     expect(Object.keys(saved).sort()).toEqual(["at", "block", "removed", "snapshot"]);
     expect(saved["removed"]).toEqual([address(2), address(5)]);
+  });
+
+  describe("learned-anchor cache", () => {
+    const REGISTRY = "421614:0xf7bff88a1412054a001dc4b8acbddad6f9b26cb6";
+    const SNAPSHOT_BLOCK = 1_000;
+    const NOW = 2_000_000_000;
+    const HASH = `0x${"cd".repeat(32)}`;
+    const eligible = new Set([address(1), address(2), address(3)]);
+    const anchor = (index: number, extra: Record<string, unknown> = {}) => ({
+      address: kpsAddressFor(index),
+      member: address(index),
+      block: SNAPSHOT_BLOCK + 10,
+      blockHash: HASH,
+      at: NOW - 100,
+      ...extra,
+    });
+    const put = (store: ReturnType<typeof memory>, value: unknown) =>
+      store.map.set(LEARNED_CACHE_KEY, encoder.encode(JSON.stringify(value)));
+    const read = (store: StorageApi | undefined) => readLearnedCache(store, REGISTRY, SNAPSHOT_BLOCK, eligible, NOW);
+
+    it("returns chain-confirmed anchors of eligible snapshot members and valid first-seen records", async () => {
+      const store = memory();
+      put(store, {
+        registry: REGISTRY,
+        anchors: [anchor(1), anchor(2)],
+        firstSeen: [{ address: address(9), block: SNAPSHOT_BLOCK + 5, time: NOW - 50 }],
+      });
+      expect(await read(store)).toEqual({
+        learned: [
+          { address: kpsAddressFor(1), member: address(1) },
+          { address: kpsAddressFor(2), member: address(2) },
+        ],
+        firstSeen: [{ address: address(9), block: SNAPSHOT_BLOCK + 5, time: NOW - 50 }],
+      });
+    });
+
+    it("drops stale, future, pre-snapshot and non-member anchors one by one", async () => {
+      const store = memory();
+      put(store, {
+        registry: REGISTRY,
+        anchors: [
+          anchor(1, { at: NOW - LEARNED_CACHE_MAX_AGE_SECONDS - 1 }),
+          anchor(2, { at: NOW + 10 }),
+          anchor(3, { block: SNAPSHOT_BLOCK - 1 }),
+          anchor(7),
+          anchor(2),
+        ],
+        firstSeen: [
+          { address: address(8), block: SNAPSHOT_BLOCK - 1, time: NOW - 50 },
+          { address: address(9), block: SNAPSHOT_BLOCK + 1, time: NOW + 50 },
+        ],
+      });
+      expect(await read(store)).toEqual({ learned: [{ address: kpsAddressFor(2), member: address(2) }], firstSeen: [] });
+    });
+
+    it("ignores the whole cache on poisoning attempts: other registry, oversize, malformed records, bad bytes", async () => {
+      const cases: unknown[] = [
+        { registry: "1:0xabc", anchors: [anchor(1)], firstSeen: [] },
+        { registry: REGISTRY, anchors: Array.from({ length: LEARNED_CACHE_MAX_ANCHORS + 1 }, () => anchor(1)), firstSeen: [] },
+        { registry: REGISTRY, anchors: [anchor(1), anchor(2, { address: "evil.example:15005:uEiB" })], firstSeen: [] },
+        { registry: REGISTRY, anchors: [anchor(1, { member: "0xABC" })], firstSeen: [] },
+        { registry: REGISTRY, anchors: [anchor(1, { blockHash: "0x12" })], firstSeen: [] },
+        { registry: REGISTRY, anchors: [anchor(1)], firstSeen: [{ address: address(9), block: -1, time: 1 }] },
+        { registry: REGISTRY, anchors: "nope", firstSeen: [] },
+        [anchor(1)],
+      ];
+      for (const value of cases) {
+        const store = memory();
+        put(store, value);
+        expect(await read(store)).toEqual({ learned: [], firstSeen: [] });
+      }
+      const store = memory();
+      store.map.set(LEARNED_CACHE_KEY, new Uint8Array([0xff, 0xfe]));
+      expect(await read(store)).toEqual({ learned: [], firstSeen: [] });
+      expect(await read(undefined)).toEqual({ learned: [], firstSeen: [] });
+      const failing = { ...memory(), get: async () => { throw new Error("blocked"); } };
+      expect(await read(failing)).toEqual({ learned: [], firstSeen: [] });
+    });
+
+    it("stores only public chain data: addresses, members, block and first-seen times, snapshot members first, bounded", () => {
+      const members = Array.from({ length: 40 }, (_, i) => ({
+        address: address(i + 1),
+        kpsAddress: i === 5 ? null : kpsAddressFor(i + 1),
+        floor: i >= 30,
+        probation: i < 30,
+      }));
+      const cache = learnedCacheFrom(REGISTRY, {
+        blockHash: HASH,
+        blockNumber: SNAPSHOT_BLOCK + 50,
+        blockTimestamp: NOW - 900,
+        members,
+        firstSeen: [{ address: address(1), block: SNAPSHOT_BLOCK + 50, time: NOW - 900 }],
+      }, NOW);
+      expect(cache.anchors).toHaveLength(LEARNED_CACHE_MAX_ANCHORS);
+      expect(cache.anchors.slice(0, 10).map((entry) => entry.member)).toEqual(members.slice(30).map((member) => member.address));
+      expect(cache.anchors.some((entry) => entry.member === address(6))).toBe(false);
+      expect(Object.keys(cache.anchors[0]!).sort()).toEqual(["address", "at", "block", "blockHash", "member"]);
+    });
+
+    it("writes on change at most once per interval and round-trips through the reader", async () => {
+      const store = memory();
+      const writer = new LearnedCacheWriter(store, REGISTRY, 60_000);
+      const state = {
+        blockHash: HASH,
+        blockNumber: SNAPSHOT_BLOCK + 50,
+        blockTimestamp: NOW - 900,
+        members: [{ address: address(1), kpsAddress: kpsAddressFor(1), floor: true, probation: false }],
+        firstSeen: [],
+      };
+      expect(await writer.update(state, NOW * 1000)).toBe(true);
+      expect(await writer.update(state, NOW * 1000 + 120_000)).toBe(false);
+      const moved = { ...state, members: [{ ...state.members[0]!, kpsAddress: kpsAddressFor(2) }] };
+      expect(await writer.update(moved, NOW * 1000 + 30_000)).toBe(false);
+      expect(await writer.update(moved, NOW * 1000 + 61_000)).toBe(true);
+      expect(store.writes).toBe(2);
+      const later = await readLearnedCache(store, REGISTRY, SNAPSHOT_BLOCK, eligible, NOW + 100);
+      expect(later.learned).toEqual([{ address: kpsAddressFor(2), member: address(1) }]);
+    });
   });
 });

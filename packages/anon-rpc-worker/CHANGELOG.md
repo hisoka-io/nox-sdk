@@ -2,6 +2,30 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
+## 0.2.0 (unreleased)
+
+Built on `@hisoka-io/nox-client` 0.6.0 (`kps.discovery`). Every 0.1.0 config stays valid.
+
+### Added
+
+- Discovery (S1): identity from the snapshot and NoxRegistry, location looked up at run time. The bundle pins a
+  `nox-anon-rpc-bootstrap/1` file next to the snapshot: default anchors nox-1, nox-2 and nox-8 on their Elastic IPs,
+  the registry implementation, three keyless Arbitrum Sepolia RPC providers of different organisations and the
+  discovery policy. An empty config boots on those anchors.
+- Chain checks through the mixnet after ready: two exits to two providers at one finalized block, used on
+  byte-identical agreement only; location updates, removals, new members on probation (1 per route, 14 days).
+- Config: `bridges` (only addresses ever dialled), `registryRpcUrls`, `chainQuorum`, `discovery`
+  (`"chain"` / `"snapshot"`), reserved `trust` and `checkpoint`.
+- Learned-anchor cache `nox/v1/anchors` (public chain data, at most 32 entries, 30 days), validated whole and
+  confirmed through `/metadata.json` before use.
+- Build: `--bootstrap`, bootstrap digest in the build record and provenance; the test-bed build writes a bed
+  bootstrap (local providers, anchors, short check interval).
+
+### Changed
+
+- `gateways` no longer has to be a pinned member's published address; gateways are tried first in place of the
+  default anchors instead of restricting entries (use `bridges` to restrict).
+
 ## 0.1.0
 
 First version of the Nox mixnet worker for the anon-rpc standard (SPEC 0.3.2), built on

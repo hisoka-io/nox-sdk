@@ -4,7 +4,7 @@ import { bootBackoffMs, installUnhandledRejectionLog, runNoxWorker, snapshotIden
 import { REMOVAL_CACHE_KEY } from "../src/storage.js";
 import type { KpsApi } from "../src/spec-types.js";
 import { FakeHarness, idleKps } from "./helpers/fake-harness.js";
-import { FakeClient, deferred, exitReply, kpsAddressFor, makePinned, scriptedConnect } from "./helpers/fixtures.js";
+import { FakeClient, deferred, exitReply, kpsAddressFor, makeBootstrap, makePinned, scriptedConnect } from "./helpers/fixtures.js";
 
 const unhandled: unknown[] = [];
 const onUnhandled = (reason: unknown): void => {
@@ -33,6 +33,7 @@ function setup(options: {
   const scripted = scriptedConnect(client, options.failures);
   const deps: WorkerDeps = {
     snapshot: pinned,
+    bootstrap: makeBootstrap(pinned),
     loadWasm: async () => ({ marker: true }),
     connect: scripted.connect,
     sleep: fastSleep,
@@ -65,17 +66,24 @@ describe("boot", () => {
     expect(config.wasm).toEqual({ marker: true });
     expect(config.kps?.pinned).toBe(pinned);
     expect(config.kps?.entries).toBeUndefined();
+    // An empty config boots on the bundle's bootstrap with chain checks on (D-24).
+    expect(config.kps?.discovery?.bootstrap).toEqual(makeBootstrap(pinned));
+    expect(config.kps?.discovery?.chain).toBe(true);
+    expect(config.kps?.discovery?.gateways).toBeUndefined();
+    expect(config.kps?.discovery?.bridges).toBeUndefined();
     expect(harness.events("ready")).toHaveLength(1);
   });
 
   it("passes configured gateways, timeouts and tuning to the client", async () => {
-    const gateways = [kpsAddressFor(2), kpsAddressFor(6)];
+    // Gateways need not be pinned members' published addresses (an operator may have moved).
+    const gateways = [kpsAddressFor(2), kpsAddressFor(77)];
     const { harness, configs } = setup({
       config: { gateways, attemptTimeoutMs: 5_000, surbFormat: "v1", claimIntervalMs: 100, topologySources: 1 },
     });
     await harness.ready;
     const config = configs[0] as NoxClientConfig;
-    expect(config.kps?.entries).toEqual(gateways);
+    expect(config.kps?.discovery?.gateways).toEqual(gateways);
+    expect(config.kps?.entries).toBeUndefined();
     expect(config.timeoutMs).toBe(5_000);
     expect(config.surbFormat).toBe("v1");
     expect(config.kps?.claimIntervalMs).toBe(100);
@@ -98,7 +106,9 @@ describe("boot", () => {
     ["an unknown key", { gateway: [] }, /config\.gateway is not a known field/u],
     ["a wrong type", { logLevel: 3 }, /logLevel/u],
     ["an out-of-range value", { callDeadlineMs: 500_000 }, /callDeadlineMs/u],
-    ["a gateway outside the pinned set", { gateways: [kpsAddressFor(77)] }, /not the KPS address of a node pinned/u],
+    ["gateways and bridges together", { gateways: [kpsAddressFor(1)], bridges: [kpsAddressFor(2)] }, /exclude each other/u],
+    ["a reserved field", { checkpoint: "0xabc" }, /config\.checkpoint is reserved/u],
+    ["a trust level other than auto", { trust: "proven" }, /config\.trust is reserved/u],
   ])("fails with bad-config for %s, before any network use", async (_name, config, message) => {
     const { harness, configs, run } = setup({ config });
     await run;
@@ -109,6 +119,26 @@ describe("boot", () => {
     expect(harness.readyCount).toBe(0);
     // The cause is logged before signalFailed.
     expect(harness.events("worker.failed")).toHaveLength(1);
+  });
+
+  it("passes bridges, RPC overrides, quorum and snapshot-only discovery to the client", async () => {
+    const bridges = [kpsAddressFor(91)];
+    const registryRpcUrls = ["https://own-node.wallet.test/rpc", "https://second.example.test/rpc"];
+    const { harness, configs } = setup({ config: { bridges, registryRpcUrls, chainQuorum: 2, discovery: "snapshot" } });
+    await harness.ready;
+    const discovery = (configs[0] as NoxClientConfig).kps?.discovery;
+    expect(discovery?.bridges).toEqual(bridges);
+    expect(discovery?.registryRpcUrls).toEqual(registryRpcUrls);
+    expect(discovery?.chainQuorum).toBe(2);
+    expect(discovery?.chain).toBe(false);
+  });
+
+  it("fails with snapshot-invalid when the embedded bootstrap does not verify", async () => {
+    const pinned = makePinned();
+    const { harness, run } = setup({ deps: { bootstrap: makeBootstrap(pinned, { chainId: 1 }) } });
+    await run;
+    expect(harness.failures.map((failure) => failure.code)).toEqual(["snapshot-invalid"]);
+    expect(harness.failures[0]?.message).toMatch(/discovery bootstrap/u);
   });
 
   it("fails with snapshot-invalid when the embedded snapshot does not verify", async () => {
@@ -211,7 +241,7 @@ describe("boot", () => {
         new TextEncoder().encode(JSON.stringify({ snapshot, block: 1, removed, at: fresh })),
       );
       const scripted = scriptedConnect(new FakeClient(pinned));
-      void runNoxWorker(harness.api, { snapshot: pinned, loadWasm: async () => ({}), connect: scripted.connect });
+      void runNoxWorker(harness.api, { snapshot: pinned, bootstrap: makeBootstrap(pinned), loadWasm: async () => ({}), connect: scripted.connect });
       await harness.ready;
       expect(scripted.configs[0]?.kps?.deprioritize).toEqual(expected);
     }
@@ -424,7 +454,7 @@ describe("logging policy", () => {
       throw new Error("log sink down");
     };
     const api = { ...harness.api, log: { debug: throwing, info: throwing, warn: throwing, error: throwing } };
-    void runNoxWorker(api, { snapshot: pinned, loadWasm: async () => ({}), connect: scriptedConnect(new FakeClient(pinned)).connect });
+    void runNoxWorker(api, { snapshot: pinned, bootstrap: makeBootstrap(pinned), loadWasm: async () => ({}), connect: scriptedConnect(new FakeClient(pinned)).connect });
     await harness.ready;
     expect(harness.readyCount).toBe(1);
   });

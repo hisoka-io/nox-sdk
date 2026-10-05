@@ -10,6 +10,8 @@
 import {
   computeTopologyFingerprint,
   encodeServiceRequest,
+  kpsAddrFromMetadataUrl,
+  type PinnedMember,
   type PinnedSnapshot,
   type ServiceRequest,
   type TopologySnapshot,
@@ -71,13 +73,24 @@ export class FakeNoxNetwork {
   /** Member addresses every served topology leaves out (gone from the registry). */
   readonly omitted = new Set<string>();
   readonly conns: { address: string; open: boolean }[] = [];
+  /** Member each KPS address serves for (its `/metadata.json` node); starts with the pinned addresses. */
+  readonly nodeAt = new Map<string, string>();
+  /** The registry the nodes observe (default: the pinned members), for discovery tests. */
+  registryView: (() => PinnedMember[]) | undefined;
+  /** Block the nodes report having observed (default: one after the snapshot). */
+  observedBlock: (() => number) | undefined;
   private readonly buffered = new Map<string, { id: string; data: number[] }>();
   private next = 1;
 
   constructor(
     private readonly pinned: PinnedSnapshot,
     public exit: FakeExit,
-  ) {}
+  ) {
+    for (const member of pinned.members) {
+      const address = kpsAddrFromMetadataUrl(member.metadataUrl);
+      if (address !== null) this.nodeAt.set(address, member.address);
+    }
+  }
 
   /** The `anonRpcWorker.kps` capability. */
   readonly kps: KpsApi = {
@@ -87,13 +100,14 @@ export class FakeNoxNetwork {
 
   /** A node-served schema v2 topology consistent with the pinned snapshot, minus `omitted`. */
   topology(): TopologySnapshot {
-    const nodes = this.pinned.members.filter((member) => !this.omitted.has(member.address)).map(relayerOf);
+    const members = this.registryView?.() ?? this.pinned.members;
+    const nodes = members.filter((member) => !this.omitted.has(member.address)).map(relayerOf);
     const now = Math.floor(Date.now() / 1000);
     return {
       nodes,
       fingerprint: computeTopologyFingerprint(nodes),
       schema_version: 2,
-      block_number: this.pinned.blockNumber + 1,
+      block_number: this.observedBlock?.() ?? this.pinned.blockNumber + 1,
       timestamp: now,
       pow_difficulty: 1,
       liveness: nodes.map((node) => ({
@@ -119,7 +133,7 @@ export class FakeNoxNetwork {
       remoteAddress: { ip: address.slice(0, address.indexOf(":")), port: 15005 },
       openStream: async () => {
         if (!state.open) throw Object.assign(new Error("closed"), { code: "closed" });
-        return this.stream();
+        return this.stream(address);
       },
       acceptStream: () => new Promise(() => undefined),
       sendDatagram: async () => undefined,
@@ -133,14 +147,14 @@ export class FakeNoxNetwork {
     return conn;
   }
 
-  private stream(): KpsStream {
+  private stream(address: string): KpsStream {
     const up = new TransformStream<Uint8Array, Uint8Array>();
     const down = new TransformStream<Uint8Array, Uint8Array>();
     let settle!: (info: { ok: boolean }) => void;
     const closed = new Promise<{ ok: boolean }>((resolve) => {
       settle = resolve;
     });
-    void this.serve(up.readable, down.writable.getWriter());
+    void this.serve(address, up.readable, down.writable.getWriter());
     return {
       readable: down.readable,
       writable: up.writable,
@@ -152,11 +166,16 @@ export class FakeNoxNetwork {
     };
   }
 
-  private async serve(readable: ReadableStream<Uint8Array>, writer: WritableStreamDefaultWriter<Uint8Array>): Promise<void> {
+  private async serve(address: string, readable: ReadableStream<Uint8Array>, writer: WritableStreamDefaultWriter<Uint8Array>): Promise<void> {
     const raw = await readAll(readable);
     if (raw === null) return;
     const request = parseHttpRequest(raw);
-    const { status, body } = await this.answer(request);
+    const node = this.nodeAt.get(address);
+    const { status, body } = request.method === "GET" && request.path === "/metadata.json"
+      ? node === undefined
+        ? { status: 404, body: encoder.encode("no node") }
+        : { status: 200, body: encoder.encode(JSON.stringify({ protocol: "nox-kps-http/1", node })) }
+      : await this.answer(request);
     try {
       await writer.write(encoder.encode(`HTTP/1.1 ${status} X\r\ncontent-type: application/json\r\ncontent-length: ${body.length}\r\n\r\n`));
       if (body.length > 0) await writer.write(body);

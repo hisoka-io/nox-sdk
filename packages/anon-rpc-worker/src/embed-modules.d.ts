@@ -7,3 +7,9 @@ declare module "nox-embed:snapshot" {
   const snapshot: unknown;
   export default snapshot;
 }
+
+declare module "nox-embed:bootstrap" {
+  /** The discovery bootstrap (`nox-anon-rpc-bootstrap/1`), parsed JSON; verified at boot. */
+  const bootstrap: unknown;
+  export default bootstrap;
+}

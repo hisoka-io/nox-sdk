@@ -13,13 +13,21 @@
  *   3. `make-snapshot.mjs` at the registration block (anvil has no finalized
  *      history, so --allow-unsafe-block), which reads the chain, cross-checks
  *      the fingerprint and runs the SDK's on-chain verification;
- *   4. `build.mjs --snapshot <that file> --outfile <out>`.
+ *   4. a discovery bootstrap for the bed (`nox-anon-rpc-bootstrap/1`): the
+ *      registry's implementation, the bed's RPC providers (the upstream anvil
+ *      and a forwarder in front of it), default anchors (published KPS
+ *      addresses of the first nodes) and the production policy with the bed's
+ *      chain check interval and state age, checked with the SDK's verifier;
+ *   5. `build.mjs --snapshot <that file> --bootstrap <that file> --outfile <out>`.
+ *
+ * `--snapshot-block <n>` pins the snapshot at another block than the last
+ * registration (the S1 spec pins it before a member joins).
  *
  * The snapshot, networks and capability files land next to the bundle, so a
  * run keeps every input of the bundle it tested. Never used for a release:
  * the release snapshot is snapshot/nox-snapshot.json from the live registry.
  *
- * Usage: node scripts/build-test-worker.mjs --testbed <testbed.json> --out <bundle.js>
+ * Usage: node scripts/build-test-worker.mjs --testbed <testbed.json> --out <bundle.js> [--snapshot-block <n>]
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -27,6 +35,8 @@ import { parseArgs } from "node:util";
 import { main as buildMain } from "./build.mjs";
 import { isMain, runMain } from "./lib/cli.mjs";
 import { main as snapshotMain } from "./make-snapshot.mjs";
+import { canonicalJson } from "./lib/snapshot-format.mjs";
+import { DISCOVERY_POLICY_DEFAULTS, verifyBootstrap } from "@hisoka-io/nox-client";
 
 export const TEST_NETWORK = "local-testbed";
 /** Deadline for reading one node's served topology. */
@@ -35,7 +45,7 @@ const TOPOLOGY_TIMEOUT_MS = 5_000;
 export class TestWorkerError extends Error {
   /**
    * @param {string} message
-   * @param {"usage" | "testbed" | "topology" | "snapshot" | "build"} code
+   * @param {"usage" | "testbed" | "topology" | "snapshot" | "bootstrap" | "build"} code
    */
   constructor(message, code) {
     super(message);
@@ -78,6 +88,52 @@ export function testbedRegistry(info) {
 }
 
 /**
+ * @typedef {object} TestbedDiscovery
+ * @property {string[]} providers
+ * @property {string[]} anchors
+ * @property {number} chainRefreshSeconds
+ * @property {number} maxStateAgeSeconds
+ */
+
+/**
+ * The discovery bootstrap for a bed: chain and registry of the snapshot, the
+ * registry implementation, the bed's providers and anchors, and the
+ * production policy with the bed's check interval and state age.
+ * @param {unknown} info testbed.json
+ * @param {{ chainId: number, registry: string }} snapshot
+ */
+export function bootstrapFromTestbed(info, snapshot) {
+  const mesh = /** @type {{ mesh?: { registry?: { implementation?: unknown }, discovery?: Partial<TestbedDiscovery> } }} */ (info).mesh;
+  const implementation = mesh?.registry?.implementation;
+  const discovery = mesh?.discovery;
+  if (typeof implementation !== "string" || !/^0x[0-9a-f]{40}$/u.test(implementation)) {
+    throw new TestWorkerError("testbed.json has no mesh.registry.implementation (lowercase 0x address)", "testbed");
+  }
+  if (
+    discovery === undefined ||
+    !Array.isArray(discovery.providers) ||
+    !Array.isArray(discovery.anchors) ||
+    !Number.isSafeInteger(discovery.chainRefreshSeconds) ||
+    !Number.isSafeInteger(discovery.maxStateAgeSeconds)
+  ) {
+    throw new TestWorkerError("testbed.json has no mesh.discovery {providers, anchors, chainRefreshSeconds, maxStateAgeSeconds}", "testbed");
+  }
+  return {
+    format: "nox-anon-rpc-bootstrap/1",
+    chainId: snapshot.chainId,
+    registry: snapshot.registry,
+    registryImpl: implementation,
+    anchors: [...discovery.anchors],
+    registryRpcUrls: [...discovery.providers],
+    policy: {
+      ...DISCOVERY_POLICY_DEFAULTS,
+      chainRefreshSeconds: discovery.chainRefreshSeconds,
+      maxStateAgeSeconds: discovery.maxStateAgeSeconds,
+    },
+  };
+}
+
+/**
  * Capability hints from a served topology's liveness section, in the
  * `nox-capabilities/1` shape make-snapshot reads.
  * @param {unknown} topology
@@ -105,11 +161,12 @@ export async function main(argv) {
     options: {
       testbed: { type: "string" },
       out: { type: "string" },
+      "snapshot-block": { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
-    process.stdout.write("usage: build-test-worker.mjs --testbed <testbed.json> --out <bundle.js>\n");
+    process.stdout.write("usage: build-test-worker.mjs --testbed <testbed.json> --out <bundle.js> [--snapshot-block <n>]\n");
     return 0;
   }
   if (values.testbed === undefined || values.out === undefined) {
@@ -118,7 +175,12 @@ export async function main(argv) {
   const out = resolve(values.out);
   const dir = dirname(out);
   mkdirSync(dir, { recursive: true });
-  const { registry, topologyUrls } = testbedRegistry(JSON.parse(readFileSync(resolve(values.testbed), "utf8")));
+  const info = JSON.parse(readFileSync(resolve(values.testbed), "utf8"));
+  const { registry, topologyUrls } = testbedRegistry(info);
+  const snapshotBlock = values["snapshot-block"] === undefined ? registry.registeredBlock : Number(values["snapshot-block"]);
+  if (!Number.isSafeInteger(snapshotBlock) || snapshotBlock < registry.deployBlock) {
+    throw new TestWorkerError(`--snapshot-block must be a block at or after the registry deployment (${registry.deployBlock})`, "usage");
+  }
 
   const networksPath = join(dir, "networks.json");
   writeFileSync(
@@ -157,13 +219,22 @@ export async function main(argv) {
     "--rpc", registry.rpcUrl,
     "--network", TEST_NETWORK,
     "--networks", networksPath,
-    "--block", String(registry.registeredBlock),
+    "--block", String(snapshotBlock),
     "--allow-unsafe-block",
     "--capabilities", capabilitiesPath,
     "--out", snapshotPath,
   ]);
   if (snapshotCode !== 0) throw new TestWorkerError(`make-snapshot exited with ${snapshotCode}`, "snapshot");
-  const buildCode = await buildMain(["--snapshot", snapshotPath, "--outfile", out]);
+  const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8"));
+  const bootstrap = bootstrapFromTestbed(info, snapshot);
+  try {
+    verifyBootstrap(bootstrap, snapshot);
+  } catch (error) {
+    throw new TestWorkerError(`the bed's discovery bootstrap does not verify: ${error instanceof Error ? error.message : String(error)}`, "bootstrap");
+  }
+  const bootstrapPath = join(dir, "nox-bootstrap.json");
+  writeFileSync(bootstrapPath, canonicalJson(bootstrap));
+  const buildCode = await buildMain(["--snapshot", snapshotPath, "--bootstrap", bootstrapPath, "--outfile", out]);
   if (buildCode !== 0) throw new TestWorkerError(`build exited with ${buildCode}`, "build");
   return 0;
 }

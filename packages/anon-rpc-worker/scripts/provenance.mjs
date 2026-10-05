@@ -7,7 +7,7 @@
  *   dist/anon-rpc-worker.provenance.json
  *   { package, version, gitCommit, gitTreeClean,
  *     toolchain: { rustc, wasmPack, wasmBindgen, wasmOpt, wasmPinsChecked, node, pnpm, esbuild, pins },
- *     inputs: { snapshotKeccak, snapshotBlock, wasmSha256, wasmKeccak, lockfileSha256 },
+ *     inputs: { snapshotKeccak, snapshotBlock, bootstrapKeccak, wasmSha256, wasmKeccak, lockfileSha256 },
  *     output: { bytes, sha256, keccak256 },
  *     builder: { os, arch } }
  *
@@ -204,6 +204,21 @@ export function makeProvenance(options) {
   const snapshot = JSON.parse(snapshotBytes.toString("utf8"));
   const snapshotBlock = isRecord(snapshot) && typeof snapshot["blockNumber"] === "number" ? snapshot["blockNumber"] : null;
 
+  // The bootstrap the build embedded, when it embedded one, checked against the file.
+  const recordedBootstrap = record["bootstrap"];
+  let bootstrapKeccak = null;
+  if (isRecord(recordedBootstrap)) {
+    const bootstrapPath = join(packageDir, String(recordedBootstrap["path"]));
+    const bootstrapBytes = readFileSync(bootstrapPath);
+    bootstrapKeccak = keccak256Hex(bootstrapBytes);
+    if (bootstrapKeccak !== recordedBootstrap["keccak256"]) {
+      throw new ProvenanceError(
+        `${bootstrapPath} (keccak256 ${bootstrapKeccak}) is not the bootstrap the bundle embeds (${String(recordedBootstrap["keccak256"])}); rebuild`,
+        "inconsistent",
+      );
+    }
+  }
+
   const toolchainText = readFileSync(options.toolchainPath ?? TOOLCHAIN_PATH, "utf8");
 
   return {
@@ -224,6 +239,7 @@ export function makeProvenance(options) {
     inputs: {
       snapshotKeccak: keccak256Hex(snapshotBytes),
       snapshotBlock,
+      bootstrapKeccak,
       wasmSha256: wasm["sha256"],
       wasmKeccak: wasm["keccak256"],
       lockfileSha256: sha256Hex(readFileSync(join(repoDir, "pnpm-lock.yaml"))),

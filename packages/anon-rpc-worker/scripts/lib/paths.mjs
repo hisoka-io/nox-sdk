@@ -13,6 +13,8 @@ export const EMBED_DIR = join(PACKAGE_DIR, "scripts", "embed");
 export const SNAPSHOT_DIR = join(PACKAGE_DIR, "snapshot");
 /** The pinned snapshot the worker bundles. */
 export const SNAPSHOT_PATH = join(SNAPSHOT_DIR, "nox-snapshot.json");
+/** The discovery bootstrap the worker bundles next to the snapshot (`nox-anon-rpc-bootstrap/1`). */
+export const BOOTSTRAP_PATH = join(SNAPSHOT_DIR, "nox-bootstrap.json");
 /** JSON Schema of the snapshot document. */
 export const SNAPSHOT_SCHEMA_PATH = join(SNAPSHOT_DIR, "nox-snapshot.schema.json");
 /** Reviewed capability hints per member. */

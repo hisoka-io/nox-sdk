@@ -1,0 +1,25 @@
+{
+  "anchors": [
+    "100.56.0.72:15005:uEiBVDwIs40bsslDkM-BYb2AOHw3PHe70_bj5U_09r7vdIQ",
+    "3.232.137.146:15005:uEiDGVPDwsQ96ri9T5WLR6jZov_9LW-gRAgs-DN9FyKuHuw",
+    "18.215.18.61:15005:uEiCStd3rfGTo0ts0lSUw5f22u93O3PLCZVWWQIv_MXHm7w"
+  ],
+  "chainId": 421614,
+  "format": "nox-anon-rpc-bootstrap/1",
+  "policy": {
+    "chainQuorum": 2,
+    "chainRefreshSeconds": 600,
+    "maxStateAgeSeconds": 3600,
+    "minMembersPerLayer": 2,
+    "minRemovalSources": 2,
+    "probationMaxPerRoute": 1,
+    "probationSeconds": 1209600
+  },
+  "registry": "0xf7bff88a1412054a001dc4b8acbddad6f9b26cb6",
+  "registryImpl": "0x7285125cfdcb6337aaed2d56d4fe99f870ede2a2",
+  "registryRpcUrls": [
+    "https://sepolia-rollup.arbitrum.io/rpc",
+    "https://arbitrum-sepolia.gateway.tenderly.co",
+    "https://arbitrum-sepolia-testnet.api.pocket.network"
+  ]
+}

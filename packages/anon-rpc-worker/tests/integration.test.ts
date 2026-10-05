@@ -8,7 +8,7 @@ import { NoxClient, type ServiceRequest } from "@hisoka-io/nox-client";
 import { runNoxWorker } from "../src/core.js";
 import { FakeHarness } from "./helpers/fake-harness.js";
 import { FakeNoxNetwork, fakeWasm } from "./helpers/fake-nox-network.js";
-import { exitReply, kpsAddressFor, makePinned } from "./helpers/fixtures.js";
+import { exitReply, kpsAddressFor, makeBootstrap, makePinned } from "./helpers/fixtures.js";
 
 const ambientFetch = vi.fn(() => {
   throw new Error("the worker must never call the global fetch");
@@ -39,6 +39,7 @@ function boot(config: unknown, exit: (request: ServiceRequest) => Uint8Array) {
   const harness = new FakeHarness(config, network.kps);
   void runNoxWorker(harness.api, {
     snapshot: pinned,
+    bootstrap: makeBootstrap(pinned),
     loadWasm: async () => fakeWasm(),
     connect: async (clientConfig) => {
       const client = await NoxClient.connect(clientConfig);
@@ -99,6 +100,7 @@ describe("worker on the real SDK in KPS mode", () => {
     const harness = new FakeHarness({ topologySources: 1 }, network.kps);
     void runNoxWorker(harness.api, {
       snapshot: pinned,
+      bootstrap: makeBootstrap(pinned),
       loadWasm: async () => fakeWasm(),
       connect: async (config) => {
         const client = await NoxClient.connect(config);
@@ -132,6 +134,7 @@ describe("worker liveness versus registry evidence (real SDK, two anchors)", () 
     const harness = new FakeHarness(anchors, network.kps);
     void runNoxWorker(harness.api, {
       snapshot: pinned,
+      bootstrap: makeBootstrap(pinned),
       loadWasm: async () => fakeWasm(),
       connect: async (clientConfig) => {
         const client = await NoxClient.connect({ ...clientConfig, topologyRefreshMs: 40 });

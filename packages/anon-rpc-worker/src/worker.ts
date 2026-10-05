@@ -2,10 +2,13 @@
 // the anon-rpc harness runs with `anonRpcWorker` installed (SPEC §7).
 //
 // The bundle build resolves "@hisoka-io/nox-wasm" to an init that compiles the
-// embedded nox-wasm bytes (no .wasm fetch) and "nox-embed:snapshot" to the
-// pinned registry snapshot. Everything else lives in core.ts.
+// embedded nox-wasm bytes (no .wasm fetch), "nox-embed:snapshot" to the
+// pinned registry snapshot and "nox-embed:bootstrap" to the discovery
+// bootstrap (default anchors, RPC providers, policy). Everything else lives in
+// core.ts.
 import { NoxClient, type NoxWasmBindings } from "@hisoka-io/nox-client";
 import initNoxWasm, * as noxWasm from "@hisoka-io/nox-wasm";
+import bootstrap from "nox-embed:bootstrap";
 import snapshot from "nox-embed:snapshot";
 import { installUnhandledRejectionLog, runNoxWorker } from "./core.js";
 import type { AnonRpcWorkerApi } from "./spec-types.js";
@@ -16,6 +19,7 @@ installUnhandledRejectionLog(anonRpcWorker, globalThis);
 
 void runNoxWorker(anonRpcWorker, {
   snapshot,
+  bootstrap,
   loadWasm: async () => {
     await initNoxWasm();
     return noxWasm as unknown as NoxWasmBindings;

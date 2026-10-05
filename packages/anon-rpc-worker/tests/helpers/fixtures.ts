@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import {
   computeTopologyFingerprint,
   primaryLayerForRole,
+  type KpsBootstrap,
   type HttpRequestOptions,
   type NoxClientConfig,
   type PinnedMember,
@@ -72,6 +73,35 @@ export function makePinned(roles: (1 | 2)[] = [1, 1, 1, 1, 1, 2, 2, 2]): PinnedS
     relayerCount: members.length,
     powDifficulty: 1,
     members,
+  };
+}
+
+/** RPC endpoints of the fixture bootstrap: three different organisations. */
+export const FIXTURE_PROVIDERS = [
+  "https://rpc.provider-a.test/rpc",
+  "https://gateway.provider-b.test/",
+  "https://api.provider-c.test/v1",
+];
+
+/** A `nox-anon-rpc-bootstrap/1` for `pinned` with no default anchors unless given. */
+export function makeBootstrap(pinned: PinnedSnapshot, overrides: Partial<KpsBootstrap> = {}): KpsBootstrap {
+  return {
+    format: "nox-anon-rpc-bootstrap/1",
+    chainId: pinned.chainId,
+    registry: pinned.registry,
+    registryImpl: "0x7285125cfdcb6337aaed2d56d4fe99f870ede2a2",
+    anchors: [],
+    registryRpcUrls: [...FIXTURE_PROVIDERS],
+    policy: {
+      chainQuorum: 2,
+      maxStateAgeSeconds: 3_600,
+      chainRefreshSeconds: 600,
+      probationMaxPerRoute: 1,
+      probationSeconds: 1_209_600,
+      minRemovalSources: 2,
+      minMembersPerLayer: 2,
+    },
+    ...overrides,
   };
 }
 
