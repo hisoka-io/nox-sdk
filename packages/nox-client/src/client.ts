@@ -1100,7 +1100,7 @@ export class NoxClient {
       live: boolean;
     }
 
-    const outcome = await new Promise<{ response: Uint8Array; exit: TopologyNode }>((resolve, reject) => {
+    const outcome = new Promise<{ response: Uint8Array; exit: TopologyNode }>((resolve, reject) => {
       const attempts: Attempt[] = [];
       let settled = false;
       let routeResendUsed = false;
@@ -1249,8 +1249,12 @@ export class NoxClient {
         }, delay);
       }
     });
-    if (extras?.background !== true) this._noteForegroundCall();
-    return outcome;
+    try {
+      return await outcome;
+    } finally {
+      // Settled either way: deferred background work (the first chain check) may start.
+      if (extras?.background !== true) this._noteForegroundCall();
+    }
   }
 
   /** Active resend policy (`RESEND_LEGACY` until a connect resolves one). */
