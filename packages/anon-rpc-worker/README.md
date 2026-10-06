@@ -125,19 +125,25 @@ were read at, and when each member outside the snapshot was first seen. At most 
 days. A cache that fails any check (another registry, too many records, one malformed record) is ignored whole, and
 a learned address is used only after the node's `/metadata.json` names the same member.
 
-## Release 0.2.0
+## Release 0.3.0
 
 | | |
 |---|---|
-| `workerHash` (keccak-256 of `dist/anon-rpc-worker.js`) | `0x0a58f9915f686950072a4786249d396ecbf2194a39ac835effe8ea1a7c76f324` |
-| Size | 924,847 bytes; 268,945 bytes with `gzip -9 -n` |
-| Specifier | Ethereum Sepolia `0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6` (`ImmutableWorkerSpecifier`, resolvers in [specifier/README.md](./specifier/README.md#deployments)) |
+| `workerHash` (keccak-256 of `dist/anon-rpc-worker.js`) | `0x24604525d220bcc7e39f2dbc22966a814600a63ada51baafad5dd0bcc1d28549` |
+| Size | 961,799 bytes; 279,515 bytes with `gzip -9 -n` |
+| sha256 | `0458b19258dffcfb9ce23d584096f3df06532080390d34ee71b201b6b78dbbac` |
+| Specifier | Ethereum Sepolia `0x29B51ca9Ad80E9c0B0D111C8748E6a7908b82eDB` (`ImmutableWorkerSpecifier`, resolvers in [specifier/README.md](./specifier/README.md#deployments)) |
 | Snapshot | NoxRegistry at Arbitrum Sepolia block 316,207,920, keccak-256 `0xa351960e…94fbb2` |
 | nox-wasm module | 188,708 bytes, sha256 `5171416972ea4499fd4b4ea8bcadf002f4c10f10ed42cafb0d5a426121da9c4f` |
-| Built from | `nox-sdk` commit `ef019a716d7994820d7d63d6de3e60ae8f71e80d`, rustc 1.95.0, wasm-pack 0.13.1, wasm-bindgen 0.2.114, binaryen 117, esbuild 0.27.3 |
+| Built from | `nox-sdk` commit `6bddd851c5b1f4e5508f4718e2ea9b4db626b17f`, rustc 1.95.0, wasm-pack 0.13.1, wasm-bindgen 0.2.114, binaryen 117, esbuild 0.27.3 |
 
-Two builds in fresh containers of the pinned images (at two different paths) and a host build give these exact
-bytes (`scripts/verify-reproducible.sh --native`). Run it from the repository root as
+The npm package carries the bundle and provenance file of the first pinned container build.
+
+Release 0.2.0: `workerHash` `0x0a58f9915f686950072a4786249d396ecbf2194a39ac835effe8ea1a7c76f324` (924,847 bytes, commit
+`ef019a7`), specifier `0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6`.
+
+Two builds in fresh containers of the pinned images (at two different paths) give these exact bytes
+(`scripts/verify-reproducible.sh --ref 6bddd85`). Run it from the repository root as
 `packages/anon-rpc-worker/scripts/verify-reproducible.sh` (or `pnpm verify:reproducible` inside the package); host builds (`--native`,
 `--local`) use rustc 1.95.0, so set `RUSTUP_TOOLCHAIN=1.95.0` when the host default differs.
 
