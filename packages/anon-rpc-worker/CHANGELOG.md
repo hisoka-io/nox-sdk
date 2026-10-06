@@ -2,7 +2,7 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-10-06)
 
 Built on `@hisoka-io/nox-client` 0.6.0 (`kps.discovery`). Every 0.1.0 config stays valid.
 
@@ -21,6 +21,11 @@ Built on `@hisoka-io/nox-client` 0.6.0 (`kps.discovery`). Every 0.1.0 config sta
 - Build: `--bootstrap`, bootstrap digest in the build record and provenance; the test-bed build writes a bed
   bootstrap (local providers, anchors, short check interval).
 
+- Release snapshot of NoxRegistry at Arbitrum Sepolia block 316207920 (10 members; nox-1, nox-2 and nox-8 publish
+  their KPS addresses), read and re-verified byte for byte through two RPC providers.
+- `verify-reproducible.sh --native` (a third build with host tools next to the two container builds) and `--bwrap`
+  (host builds at the container paths for hosts without a container runtime).
+
 ### Changed
 
 - `gateways` no longer has to be a pinned member's published address; gateways are tried first in place of the
@@ -29,6 +34,12 @@ Built on `@hisoka-io/nox-client` 0.6.0 (`kps.discovery`). Every 0.1.0 config sta
   which the worker treats as the only addresses it ever dials.
 - A gateway or bridge must answer `/metadata.json` with the node it serves (nox-kps `node_address`), and that node
   must be a member in the bundle's snapshot.
+
+### Fixed
+
+- Reproducible WASM across checkout paths: `reproducible-rustc.sh` strips the cargo home, sysroot and workspace
+  prefixes only at the start of a source path. A checkout at a path such as `/src` used to rewrite the
+  `registry/src/` part of every dependency path, which changed each crate's `-C metadata` and the module bytes.
 
 ## 0.1.0
 

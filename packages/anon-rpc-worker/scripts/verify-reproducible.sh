@@ -2,7 +2,8 @@
 # Build the worker twice from clean exports of one commit and compare bytes.
 #
 # Usage: packages/anon-rpc-worker/scripts/verify-reproducible.sh [--ref <git-ref>]
-#          [--runtime docker|podman] [--local [--allow-unpinned]] [--keep]
+#          [--runtime docker|podman] [--native] [--local [--allow-unpinned] [--bwrap]]
+#          [--keep]
 #
 # Default (containers): each build is a fresh `git archive` of the commit,
 # built in fresh containers from the digest-pinned images in
@@ -12,13 +13,24 @@
 # installs with the frozen lockfile and bundles. The second build runs at a
 # different absolute path inside its containers, so path leaks show up too.
 #
-# --local          the same two clean exports, built with the host's tools at
-#                  two different host paths (no containers). The tools must
-#                  match scripts/toolchain.env unless --allow-unpinned is
-#                  given, in which case only the two local builds are compared.
+# --local          the same two clean exports, built on the host at two
+#                  different host paths (no containers): the host's rustc and
+#                  Node, and the pinned wasm-pack, wasm-bindgen and binaryen
+#                  (downloaded and digest-checked as for containers, put first
+#                  on PATH). rustc must match scripts/toolchain.env unless
+#                  --allow-unpinned is given, in which case only the two local
+#                  builds are compared.
+# --native         container mode: also build a third clean export with the
+#                  host's pinned tools (as --local does) and require its WASM
+#                  and bundle to match the container builds, so the canonical
+#                  bytes do not depend on the container images either (its
+#                  provenance records the host toolchain and may differ).
+# --bwrap          local mode: run the two host builds inside bubblewrap mount
+#                  namespaces at the container paths (/src and
+#                  /work/second-build/nox-sdk), for hosts without docker.
 # --keep           keep the build directories for inspection.
 #
-# Prints, for both builds: nox_wasm_bg.wasm sha256, worker keccak256 and
+# Prints, for every build: nox_wasm_bg.wasm sha256, worker keccak256 and
 # sha256, provenance sha256. Exits 1 on any difference.
 set -euo pipefail
 
@@ -33,6 +45,8 @@ ref="HEAD"
 runtime="docker"
 mode="container"
 allow_unpinned=0
+native=0
+use_bwrap=0
 keep=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,6 +54,8 @@ while [[ $# -gt 0 ]]; do
     --runtime) runtime="${2:?--runtime needs docker or podman}"; shift 2 ;;
     --local) mode="local"; shift ;;
     --allow-unpinned) allow_unpinned=1; shift ;;
+    --native) native=1; shift ;;
+    --bwrap) use_bwrap=1; shift ;;
     --keep) keep=1; shift ;;
     *) echo "verify-reproducible.sh: unknown option $1 (see the header for usage)" >&2; exit 2 ;;
   esac
@@ -134,14 +150,30 @@ container_build() {
 }
 
 local_build() {
-  local dir="$1"
+  local dir="$1" inner="${2:-}"
   local release_args=(--release)
   [[ "$allow_unpinned" -eq 1 ]] && release_args=()
-  (
-    cd "$dir/src"
+  local build_cmd=(env "PATH=$tools_dir/bin:$tools_dir/binaryen/bin:$PATH" bash -euo pipefail -c '
     pnpm install --frozen-lockfile --prefer-offline >/dev/null
-    bash "$PACKAGE_REL/scripts/build-worker.sh" ${release_args[@]+"${release_args[@]}"} --source-commit "$commit"
-  )
+    bash "$0" "$@"' "$PACKAGE_REL/scripts/build-worker.sh" ${release_args[@]+"${release_args[@]}"} --source-commit "$commit")
+  if [[ -z "$inner" ]]; then
+    (cd "$dir/src" && "${build_cmd[@]}")
+    return
+  fi
+  # bubblewrap: a fresh mount namespace whose root is a tmpfs holding the
+  # host's top-level directories plus the export mounted at the container path.
+  local bw=(bwrap --die-with-parent --proc /proc --dev-bind /dev /dev) entry name
+  for entry in /*; do
+    name="${entry#/}"
+    case "$name" in proc|dev|src|work) continue ;; esac
+    if [[ -L "$entry" ]]; then
+      bw+=(--symlink "$(readlink "$entry")" "$entry")
+    elif [[ -d "$entry" ]]; then
+      bw+=(--bind "$entry" "$entry")
+    fi
+  done
+  bw+=(--bind "$dir/src" "$inner" --chdir "$inner")
+  "${bw[@]}" "${build_cmd[@]}"
 }
 
 # Print and return the digests of one build as "wasm worker_keccak worker_sha provenance_sha".
@@ -155,14 +187,19 @@ digests() {
 }
 
 echo "verify-reproducible: commit $commit, mode $mode, host $arch"
+tools_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nox-anon-rpc-worker/tools-$arch"
+fetch_tools "$tools_dir"
 if [[ "$mode" == "container" ]]; then
   command -v "$runtime" >/dev/null || fail "$runtime is not installed; install it or use --local"
-  tools_dir="${XDG_CACHE_HOME:-$HOME/.cache}/nox-anon-rpc-worker/tools-$arch"
-  fetch_tools "$tools_dir"
   build_paths=(/src /work/second-build/nox-sdk)
 else
   build_paths=("" "")
+  if [[ "$use_bwrap" -eq 1 ]]; then
+    command -v bwrap >/dev/null || fail "bwrap is not installed; install bubblewrap or drop --bwrap"
+    build_paths=(/src /work/second-build/nox-sdk)
+  fi
 fi
+[[ "$native" -eq 1 && "$mode" != "container" ]] && fail "--native adds a host build to container mode; --local already builds on the host"
 
 results=()
 for index in 0 1; do
@@ -174,21 +211,52 @@ for index in 0 1; do
   if [[ "$mode" == "container" ]]; then
     container_build "$dir" "${build_paths[$index]}" "$tools_dir"
   else
-    local_build "$dir"
+    local_build "$dir" "${build_paths[$index]}"
   fi
   results+=("$(digests "$dir")")
 done
 
-read -r wasm1 keccak1 sha1 prov1 <<<"${results[0]}"
-read -r wasm2 keccak2 sha2 prov2 <<<"${results[1]}"
-printf '\n%-24s %-66s %s\n' "artifact" "build 1" "build 2"
-printf '%-24s %-66s %s\n' "nox_wasm_bg.wasm sha256" "$wasm1" "$wasm2"
-printf '%-24s %-66s %s\n' "worker keccak256" "$keccak1" "$keccak2"
-printf '%-24s %-66s %s\n' "worker sha256" "$sha1" "$sha2"
-printf '%-24s %-66s %s\n' "provenance sha256" "$prov1" "$prov2"
+if [[ "$native" -eq 1 ]]; then
+  dir="$work_root/native/build-3"
+  mkdir -p "$dir"
+  export_tree "$dir"
+  echo "--- build 3 (host tools) in $dir/src"
+  local_build "$dir"
+  results+=("$(digests "$dir")")
+fi
 
-if [[ "${results[0]}" == "${results[1]}" ]]; then
-  echo "REPRODUCIBLE: both builds of $commit give worker keccak256 $keccak1"
+labels=("nox_wasm_bg.wasm sha256" "worker keccak256" "worker sha256" "provenance sha256")
+printf '\n%-24s' "artifact"
+for index in "${!results[@]}"; do printf ' %-66s' "build $((index + 1))"; done
+printf '\n'
+for field in 0 1 2 3; do
+  printf '%-24s' "${labels[$field]}"
+  for result in "${results[@]}"; do
+    read -r -a values <<<"$result"
+    printf ' %-66s' "${values[$field]}"
+  done
+  printf '\n'
+done
+
+# Every build must give the same WASM and bundle. The provenance records the
+# toolchain it ran with, so it is compared between the canonical (pinned) builds
+# only: the host build of --native may record another Node version.
+same=1
+read -r -a first_fields <<<"${results[0]}"
+for index in "${!results[@]}"; do
+  read -r -a fields <<<"${results[$index]}"
+  for field in 0 1 2; do
+    [[ "${fields[$field]}" == "${first_fields[$field]}" ]] || same=0
+  done
+  if [[ "$index" -lt 2 && "${fields[3]}" != "${first_fields[3]}" ]]; then same=0; fi
+done
+if [[ "$native" -eq 1 && "$same" -eq 1 ]]; then
+  read -r -a host_fields <<<"${results[2]}"
+  [[ "${host_fields[3]}" == "${first_fields[3]}" ]] || echo "note: the host build's provenance differs from the container builds' (it records the host toolchain); WASM and bundle bytes match"
+fi
+if [[ "$same" -eq 1 ]]; then
+  read -r -a first <<<"${results[0]}"
+  echo "REPRODUCIBLE: all ${#results[@]} builds of $commit give worker keccak256 ${first[1]}"
   exit 0
 fi
 echo "NOT REPRODUCIBLE: the builds of $commit differ (rerun with --keep and diff the two trees)" >&2

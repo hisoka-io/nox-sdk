@@ -1,6 +1,6 @@
 {
-  "blockHash": "0x602a6bd6b0215f8f4a6446aeaaa8d02a6b744f4f2e57a12bd7df522a59055f6f",
-  "blockNumber": 315527209,
+  "blockHash": "0x07fc8617ed9093b422abe0c407d3ddc365b866e2425f1a35529f14442d9d7e63",
+  "blockNumber": 316207920,
   "chainId": 421614,
   "fingerprint": "14ca3b69d6defe50fe55b6d332e6c9734db74f460ce5a8ac280c651724147c75",
   "format": "nox-anon-rpc-snapshot/1",
@@ -29,12 +29,12 @@
       "frozen": false,
       "ingressUrl": "https://nox-8.hisoka.io",
       "layer": 0,
-      "metadataUrl": "",
+      "metadataUrl": "kps:18.215.18.61:15005:uEiCStd3rfGTo0ts0lSUw5f22u93O3PLCZVWWQIv_MXHm7w/metadata.json",
       "role": 1,
       "sphinxKey": "75be9d18699ff203954de69d4c01d910e0145a857247a8a97ed03c4c96f8a218",
       "stake": "0",
       "status": 1,
-      "url": "/ip4/34.237.170.1/tcp/15000/p2p/12D3KooWHRrstZES9nWvSuCDwDwxSYw6LaPS17wDG5LSrE3auZqf"
+      "url": "/ip4/18.215.18.61/tcp/15000/p2p/12D3KooWHRrstZES9nWvSuCDwDwxSYw6LaPS17wDG5LSrE3auZqf"
     },
     {
       "address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
@@ -91,12 +91,12 @@
       "frozen": false,
       "ingressUrl": "https://nox-1.hisoka.io",
       "layer": 0,
-      "metadataUrl": "",
+      "metadataUrl": "kps:100.56.0.72:15005:uEiBVDwIs40bsslDkM-BYb2AOHw3PHe70_bj5U_09r7vdIQ/metadata.json",
       "role": 1,
       "sphinxKey": "fa2271baee00cf2530e77d53a87e7805e2b2e09fffbd64fa14fed4aff308c54e",
       "stake": "0",
       "status": 1,
-      "url": "/ip4/3.236.170.102/tcp/15000/p2p/12D3KooWQreA53yq2jzkPNsDkADdJ8Nf3kKvGH4tUKqyJ8aMo2h3"
+      "url": "/ip4/100.56.0.72/tcp/15000/p2p/12D3KooWQreA53yq2jzkPNsDkADdJ8Nf3kKvGH4tUKqyJ8aMo2h3"
     },
     {
       "address": "0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463",
@@ -121,12 +121,12 @@
       "frozen": false,
       "ingressUrl": "https://nox-2.hisoka.io",
       "layer": 1,
-      "metadataUrl": "",
+      "metadataUrl": "kps:3.232.137.146:15005:uEiDGVPDwsQ96ri9T5WLR6jZov_9LW-gRAgs-DN9FyKuHuw/metadata.json",
       "role": 1,
       "sphinxKey": "5f08041dd05df4d1ad1018d67e51d2061aaf2f5cf40b7fb040cc8515836bf453",
       "stake": "0",
       "status": 1,
-      "url": "/ip4/18.214.97.24/tcp/15000/p2p/12D3KooWEe1c5hFTjuzxvmjFtwHpTvFWwUrYbkdnSAdVr1TUTLQd"
+      "url": "/ip4/3.232.137.146/tcp/15000/p2p/12D3KooWEe1c5hFTjuzxvmjFtwHpTvFWwUrYbkdnSAdVr1TUTLQd"
     },
     {
       "address": "0xbeb31ac0c57b3765cb855fa02081eadb9edb2426",
