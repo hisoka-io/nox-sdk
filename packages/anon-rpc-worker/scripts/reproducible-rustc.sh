@@ -73,12 +73,43 @@ done
 # Normalise machine-specific prefixes out of the source path. Registry paths
 # carry the crate version (…/getrandom-0.2.16/src/lib.rs), which is exactly the
 # discriminator we need between multiple versions of one crate.
+#
+# Each prefix is stripped only at the start of the path and only at a path
+# component boundary. A plain `${var//prefix/x}` would replace every
+# occurrence anywhere in the path, so a checkout at /src rewrote the
+# `/registry/src/` and `/src/lib.rs` parts of every dependency path, and the
+# keys (and the WASM bytes) depended on the checkout path. Longest prefix
+# wins: the first match ends the normalisation.
 norm_src="$src"
 cargo_home="${CARGO_HOME:-$HOME/.cargo}"
 sysroot="$("$rustc_bin" --print sysroot 2>/dev/null || true)"
-norm_src="${norm_src//$cargo_home//cargo-home}"
-[ -n "$sysroot" ] && norm_src="${norm_src//$sysroot//sysroot}"
-[ -n "${NOX_WORKSPACE_ROOT:-}" ] && norm_src="${norm_src//$NOX_WORKSPACE_ROOT//workspace}"
+strip_prefix() {
+  # $1 = prefix, $2 = replacement; prints nothing and fails when $norm_src
+  # does not start with "$1/".
+  local prefix="${1%/}"
+  [ -n "$prefix" ] || return 1
+  case "$norm_src" in
+    "$prefix"/*) printf '%s%s' "$2" "${norm_src#"$prefix"}" ;;
+    *) return 1 ;;
+  esac
+}
+prefixes=()
+while IFS=$'\t' read -r _len prefix replacement; do
+  prefixes+=("$prefix" "$replacement")
+done < <(
+  for pair in "$cargo_home|/cargo-home" "$sysroot|/sysroot" "${NOX_WORKSPACE_ROOT:-}|/workspace"; do
+    p="${pair%|*}"
+    [ -n "$p" ] && printf '%d\t%s\t%s\n' "${#p}" "$p" "${pair##*|}"
+  done | LC_ALL=C sort -t$'\t' -k1,1nr
+)
+i=0
+while [ "$i" -lt "${#prefixes[@]}" ]; do
+  if stripped="$(strip_prefix "${prefixes[$i]}" "${prefixes[$((i + 1))]}")"; then
+    norm_src="$stripped"
+    break
+  fi
+  i=$((i + 2))
+done
 
 # Sort cfgs: cargo's ordering is stable in practice, but this costs nothing and
 # removes it as a variable.
