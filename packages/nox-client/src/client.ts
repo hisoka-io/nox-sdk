@@ -2015,7 +2015,7 @@ export class NoxClient {
   }
 
   /**
-   * `request.timing` (debug): upload (until the entry accepted the packet),
+   * `request.timing` (info): upload (until the entry accepted the packet),
    * wait (accepted until the delivering claim was sent; 0 when a long-poll
    * claim was already open), claim (claim sent until its response head),
    * download (head until the body was read), decode (decrypt, reassemble,
@@ -2040,7 +2040,7 @@ export class NoxClient {
       fields["claimBytes"] = claim.bytes;
       fields["format"] = claim.format;
     }
-    emitLog(this._log, "debug", "request.timing", fields);
+    emitLog(this._log, "info", "request.timing", fields);
   }
 
   private async _handleNeedMoreSurbs(

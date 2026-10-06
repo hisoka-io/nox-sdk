@@ -101,7 +101,7 @@ describe("boot", () => {
       sameEntryFallback: true,
       transportResends: 2,
     });
-    expect(config.kps?.claimLane).toBe(true);
+    expect(config.kps?.claimLane).toBe(false);
     expect(config.kps?.standby).toBe(true);
     expect(config.kps?.discovery?.firstCheckDeferMs).toBe(15_000);
   });

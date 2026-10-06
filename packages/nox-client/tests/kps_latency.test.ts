@@ -272,13 +272,13 @@ describe("claims over KPS against v1 and v2 entries", () => {
 });
 
 describe("request timing", () => {
-  it("logs upload, wait, claim, download and decode durations per request (debug, no IDs)", async () => {
+  it("logs upload, wait, claim, download and decode durations per request (info, no IDs)", async () => {
     const t = bed();
     t.mixnet.claimProtocol = "v2";
     const client = await connect(t.config());
     await get(client);
     const timing = events(t.logs, "request.timing")[0];
-    expect(timing?.level).toBe("debug");
+    expect(timing?.level).toBe("info");
     for (const field of ["totalMs", "uploadMs", "waitMs", "claimMs", "downloadMs", "decodeMs", "claimBytes"]) {
       expect(typeof timing?.fields?.[field]).toBe("number");
     }

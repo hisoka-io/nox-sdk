@@ -12,7 +12,7 @@ Every 0.2.0 config stays valid. Works against entries on nox 0.4.0-rc.6 and on n
   about the observed p95 reply time; the first reply wins.
 - The client runs with the low-latency settings: binary, retaining, long-polling claims where the entry supports
   them; concurrent claims with data blocks first; immediate resend on a lost reply; two transport-failure resends;
-  same-entry resends for a single bridge; claims on their own KPS connection; a standby entry kept connected.
+  same-entry resends for a single bridge; a standby entry kept connected (claims share the primary connection).
 - Wallet calls first: the first registry check waits for the first call to settle (at most 15 s).
 
 ## 0.2.0 (2026-10-06)

@@ -302,8 +302,10 @@ class NoxWorker {
         pinned,
         topologySources: cfg.topologySources,
         claimIntervalMs: cfg.claimIntervalMs,
-        // Reply downloads on their own connection; a warm standby entry.
-        claimLane: true,
+        // A warm standby entry. Claims share the primary connection: a second
+        // claim connection per entry measured mixed live and doubles per-IP
+        // connections at the relay.
+        claimLane: false,
         standby: true,
         discovery: this.discoveryOptions(cfg, bootstrap, learned),
         ...(deprioritize.length === 0 ? {} : { deprioritize }),

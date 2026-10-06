@@ -26,7 +26,7 @@ nox 0.4.0-rc.6 (claim protocol v1) and on nodes with claim protocol v2 alike.
   `dialMs`, `onConnectionClosed`.
 - `kps.discovery.firstCheckDeferMs`: the first chain check waits for the first wallet call (bounded).
 - Logs: `claim.failed`, `claim.recovered`, `claim.mode`, `reply.lost`, `call.resend`, `entry.failover`, and
-  `request.timing` (debug: upload, wait, claim, download and decode durations of each request).
+  `request.timing` (info: upload, wait, claim, download and decode durations of each request).
 
 ### Changed
 
