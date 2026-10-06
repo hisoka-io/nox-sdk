@@ -83,8 +83,10 @@ export interface KpsTransportSettings {
    * warm-up target connects, the transport sends this much padding as a few
    * paced, growing `POST /api/v1/responses/claim` bodies that claim nothing,
    * so the browser's SCTP congestion window has grown before the first
-   * packet. It stops as soon as any other exchange is in flight on the
-   * connection, or when a round is slower than `warmupAbortRtts` round trips.
+   * packet. It pauses while a packet upload is in flight on the connection
+   * (small exchanges such as topology reads interleave with it) and resumes
+   * after, and stops when a round is slower than `warmupAbortRtts` round
+   * trips or after `KPS_WARMUP_MAX_MS`.
    */
   warmupBytes: number;
   /** Ceiling on warm-up bytes across all connections in any 60 s window. */
@@ -144,6 +146,9 @@ export const KPS_WARMUP_TARGET = "/api/v1/responses/claim";
 
 /** Settings that may be 0 (feature off). */
 const ZERO_ALLOWED_SETTINGS: ReadonlySet<string> = new Set(["warmupBytes"]);
+
+/** A warm-up that has paused for packet uploads this long gives up. */
+export const KPS_WARMUP_MAX_MS = 15_000;
 
 /** Window over which `warmupMaxBytesPerMinute` is counted. */
 const WARMUP_BUDGET_WINDOW_MS = 60_000;
@@ -241,8 +246,8 @@ interface PoolEntry {
   warmWanted: boolean;
   /** The connection whose warm-up has started, so each connection is warmed once. */
   warmedConn: KpsConnLike | null;
-  /** Warm-up exchanges in flight (they do not count as traffic the warm-up yields to). */
-  warmInFlight: number;
+  /** Uploads in flight (requests above `KPS_RTT_SAMPLE_MAX_BYTES`, warm-up excluded): the warm-up yields to them. */
+  uploads: number;
 }
 
 /** Notified when a connection closes (`clean` as `kps.conn.closed` logs it). */
@@ -423,7 +428,7 @@ export class KpsHttpTransport {
         rttMs: undefined,
         warmWanted: false,
         warmedConn: null,
-        warmInFlight: 0,
+        uploads: 0,
       };
       this.pool.set(key, entry);
     }
@@ -444,7 +449,12 @@ export class KpsHttpTransport {
     return primary;
   }
 
-  private async request(input: string, init: RequestInit | undefined, lane: KpsLane): Promise<Response> {
+  private async request(
+    input: string,
+    init: RequestInit | undefined,
+    lane: KpsLane,
+    warmup = false,
+  ): Promise<Response> {
     const endpoint = parseKpsEndpoint(String(input));
     if (endpoint === null) {
       const text = String(input);
@@ -474,6 +484,8 @@ export class KpsHttpTransport {
     if (isAborted(callerSignal)) throw abortReason(callerSignal);
 
     const started = Date.now();
+    const upload = !warmup && requestBytes.length > KPS_RTT_SAMPLE_MAX_BYTES;
+    if (upload) entry.uploads += 1;
     const exchange = new AbortController();
     const fail = (error: unknown): void => {
       if (!exchange.signal.aborted) exchange.abort(error);
@@ -560,6 +572,7 @@ export class KpsHttpTransport {
       clearTimeout(exchangeTimer);
       callerSignal?.removeEventListener("abort", onCallerAbort);
       removeTeardown();
+      if (upload) entry.uploads -= 1;
       if (acquired) this.release(entry);
     }
   }
@@ -761,18 +774,26 @@ export class KpsHttpTransport {
     const open: { at: number; done: boolean }[] = [];
     const exchanges: Promise<void>[] = [];
     let sent = 0;
+    let yielded = 0;
     let stop = "done";
     for (const [index, size] of rounds.entries()) {
       if (index > 0) await sleep(clampGap(entry.rttMs ?? this.settings.warmupRoundGapMs));
-      const now = Date.now();
       if (this.closed || entry.conn !== conn) {
         stop = "closed";
         break;
       }
-      if (entry.active > entry.warmInFlight) {
-        stop = "yielded";
+      // Pause while a packet uploads; resume once it is out.
+      let paused = false;
+      while (entry.uploads > 0 && entry.conn === conn && !this.closed && Date.now() - started < KPS_WARMUP_MAX_MS) {
+        paused = true;
+        await sleep(clampGap(entry.rttMs ?? this.settings.warmupRoundGapMs));
+      }
+      if (paused) yielded += 1;
+      if (entry.uploads > 0 || Date.now() - started >= KPS_WARMUP_MAX_MS) {
+        stop = "deadline";
         break;
       }
+      const now = Date.now();
       const rtt = entry.rttMs;
       if (rtt !== undefined && open.some((round) => !round.done && now - round.at > rtt * this.settings.warmupAbortRtts)) {
         stop = "slow";
@@ -785,21 +806,19 @@ export class KpsHttpTransport {
       this.warmupSent.push({ at: now, bytes: size });
       const round = { at: now, done: false };
       open.push(round);
-      entry.warmInFlight += 1;
       sent += size;
       exchanges.push(
         this.request(`kps:${entry.address}${KPS_WARMUP_TARGET}`, {
           method: "POST",
           headers: { "content-type": "application/json" },
           body: warmupBody(size),
-        }, "primary").then(
+        }, "primary", true).then(
           (response) => {
             void response.arrayBuffer().catch(noop);
           },
           noop,
         ).finally(() => {
           round.done = true;
-          entry.warmInFlight -= 1;
         }),
       );
     }
@@ -808,6 +827,7 @@ export class KpsHttpTransport {
       entry: entry.label,
       bytes: sent,
       rounds: exchanges.length,
+      yielded,
       stop,
       ms: Date.now() - started,
     });

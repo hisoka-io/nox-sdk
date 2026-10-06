@@ -118,18 +118,43 @@ describe("send-window warm-up", () => {
     await kps.close();
   });
 
-  it("yields to an exchange already in flight", async () => {
+  it("keeps going while only small exchanges are in flight", async () => {
     const network = new FakeKpsNetwork();
-    network.route(A, (request) => (request.path === "/api/v1/packets" ? { hang: true } : { status: 204 }));
+    network.route(A, (request) => (request.path === "/topology" ? { hang: true } : { status: 204 }));
     const kps = transport(network.dial, { warmupRoundGapMs: 5, exchangeTimeoutMs: 1_000 });
     await kps.warm(A);
-    const held = kps.fetch(`kps:${A}/api/v1/packets`, { method: "POST", body: new Uint8Array(10) }).catch(() => undefined);
+    const held = kps.fetch(`kps:${A}/topology`).catch(() => undefined);
+    await sleep(10);
+    kps.warmUp([A]);
+    await until(() => warmupClaims(network.requests).length === 4);
+    await kps.close();
+    await held;
+  });
+
+  it("pauses for a packet upload in flight and resumes after it", async () => {
+    const network = new FakeKpsNetwork();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    network.route(A, async (request) => {
+      if (request.path === "/api/v1/packets") {
+        await gate;
+        return { status: 202 };
+      }
+      return { status: 204 };
+    });
+    const kps = transport(network.dial, { warmupRoundGapMs: 5 });
+    await kps.warm(A);
+    const held = kps.fetch(`kps:${A}/api/v1/packets`, { method: "POST", body: new Uint8Array(32_768) });
     await sleep(10);
     kps.warmUp([A]);
     await sleep(60);
     expect(warmupClaims(network.requests)).toHaveLength(0);
+    release();
+    expect((await held).status).toBe(202);
+    await until(() => warmupClaims(network.requests).length === 4);
     await kps.close();
-    await held;
   });
 
   it("stops at warmupMaxBytesPerMinute", async () => {
