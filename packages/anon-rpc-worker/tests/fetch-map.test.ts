@@ -6,12 +6,15 @@ import {
   mapClientError,
   prepareRequest,
   redirectedRequest,
+  defaultReplyEncoding,
+  inflateReply,
   sendPrepared,
   toAnonResponse,
   type FetchSettings,
   type NoxHttpPort,
 } from "../src/fetch-map.js";
 import type { AnonRequestInit } from "../src/spec-types.js";
+import { gzipSync } from "node:zlib";
 import { exitReply } from "./helpers/fixtures.js";
 
 const SETTINGS: FetchSettings = { attemptTimeoutMs: 12_000, maxRequestBytes: 1_024, maxResponseBytes: 65_536 };
@@ -55,7 +58,7 @@ describe("request mapping", () => {
     await expectCode(prepare("https://example.test/", { method: "connect" }), "unsupported");
   });
 
-  it("keeps header order and duplicates, drops hop and identifying fields, forces identity encoding", async () => {
+  it("keeps header order and duplicates, drops hop and identifying fields, sets the reply encoding", async () => {
     const request = await prepare("https://example.test/", {
       method: "POST",
       headers: [
@@ -76,8 +79,13 @@ describe("request mapping", () => {
       ["x-a", "2"],
       ["Content-Type", "application/json"],
       ["Authorization", "Bearer t"],
-      ["accept-encoding", "identity"],
+      ["accept-encoding", "gzip"],
     ]);
+    const identity = await prepareRequest("https://example.test/", { headers: [["Accept-Encoding", "br"]] }, {
+      ...SETTINGS,
+      acceptEncoding: "identity",
+    }, signal());
+    expect(identity.headers).toEqual([["accept-encoding", "identity"]]);
   });
 
   it("refuses invalid header names and values", async () => {
@@ -242,6 +250,64 @@ describe("response mapping", () => {
     expect(() => toAnonResponse({ ...base, status: 101 }, request, SETTINGS)).toThrow(expect.objectContaining({ code: "protocol-error" }));
     expect(() => toAnonResponse({ ...base, status: 600 }, request, SETTINGS)).toThrow(expect.objectContaining({ code: "protocol-error" }));
     expect(toAnonResponse({ ...base, headers: [["content-encoding", "identity"]] }, request, SETTINGS).headers).toEqual([]);
+  });
+});
+
+describe("gzip replies", () => {
+  const request = { url: "https://rpc.test/" };
+  const budget = { signal: new AbortController().signal, remainingMs: () => 25_000 };
+  const logs = encoder.encode(JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    result: Array.from({ length: 200 }, (_, i) => ({ address: "0x" + "ab".repeat(20), topics: ["0x" + i.toString(16).padStart(64, "0")], data: "0x" })),
+  }));
+
+  it("asks upstreams for gzip where the runtime can inflate", () => {
+    expect(typeof DecompressionStream).toBe("function");
+    expect(defaultReplyEncoding()).toBe("gzip");
+  });
+
+  it("inflates a gzip body end to end and drops content-encoding", async () => {
+    const packed = gzipSync(logs);
+    expect(packed.length * 5).toBeLessThan(logs.length);
+    const target: NoxHttpPort = {
+      httpRequest: async () => exitReply(200, [["Content-Encoding", "gzip"], ["content-type", "application/json"]], packed),
+    };
+    const prepared = await prepareRequest("https://rpc.test/", {
+      method: "POST",
+      headers: [["content-type", "application/json"]],
+      body: encoder.encode('{"jsonrpc":"2.0","id":1,"method":"eth_getLogs","params":[{}]}'),
+    }, SETTINGS, new AbortController().signal);
+    const response = await sendPrepared(prepared, target, { ...SETTINGS, maxResponseBytes: 1_000_000 }, budget);
+    expect(response.body).toEqual(logs);
+    expect(response.headers).toEqual([["content-type", "application/json"]]);
+  });
+
+  it("leaves identity replies unchanged and drops the header on an empty gzip body", async () => {
+    const plain = { status: 200, headers: [["x", "1"]] as [string, string][], body: logs, truncated: false };
+    expect(await inflateReply(plain, 1_000_000)).toBe(plain);
+    const empty = await inflateReply({ ...plain, headers: [["content-encoding", "gzip"]], body: new Uint8Array(0) }, 10);
+    expect(empty.headers).toEqual([]);
+  });
+
+  it("stops inflating past maxResponseBytes (a small reply cannot expand without bound)", async () => {
+    const bomb = gzipSync(new Uint8Array(4_000_000));
+    expect(bomb.length).toBeLessThan(10_000);
+    await expect(inflateReply(
+      { status: 200, headers: [["content-encoding", "gzip"]], body: bomb, truncated: false },
+      65_536,
+    )).rejects.toMatchObject({ code: "too-large" });
+  });
+
+  it("refuses a corrupt gzip body and codings it cannot inflate", async () => {
+    const corrupt = gzipSync(logs).slice(0, 40);
+    await expect(inflateReply(
+      { status: 200, headers: [["content-encoding", "gzip"]], body: corrupt, truncated: false },
+      1_000_000,
+    )).rejects.toMatchObject({ code: "protocol-error" });
+    const target: NoxHttpPort = { httpRequest: async () => exitReply(200, [["content-encoding", "br"]], "x") };
+    const prepared = await prepareRequest("https://rpc.test/", undefined, SETTINGS, new AbortController().signal);
+    await expect(sendPrepared(prepared, target, SETTINGS, budget)).rejects.toMatchObject({ code: "protocol-error" });
   });
 });
 
