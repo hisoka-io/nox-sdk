@@ -239,6 +239,23 @@ Trust: RPC providers are data sources reached anonymously through exits; they se
 reads. Until TLS runs inside the client, the exits terminate HTTPS, so the quorum is attested by the exits;
 probation and the snapshot floor bound what a forged answer can change.
 
+#### Send path (`kps.writeChunkBytes`, `kps.warmupBytes`, `kps.spreadCalls`)
+
+A browser data channel hands at most four SCTP packets to the network per send call and starts each connection
+with a congestion window of about 12 KB, so one 32 KB packet written at once took two to three round trips even
+on a warm connection. Three settings shorten that:
+
+| `kps` field | Default | Meaning |
+|---|---|---|
+| `writeChunkBytes` | 4,600 | Largest single stream write: a packet goes out as about eight writes of four SCTP packets each |
+| `warmupBytes` | 96,000 | Padding sent once per pinned-entry or standby connection right after it opens, as four growing `POST /api/v1/responses/claim` bodies that claim nothing (12, 18, 27 and 39 KB, about one round trip apart), so the window has grown before the first packet. It pauses while a packet uploads and stops when a round is slower than three round trips. 0 turns it off |
+| `warmupMaxBytesPerMinute` | 400,000 | Ceiling on warm-up bytes over all connections in any 60 s |
+| `spreadCalls` | true | With `standby`: a call goes through the standby entry when the pinned entry is uploading more packets, so a burst uploads over two windows. A single call and each host batch stay one packet through one entry |
+
+Bandwidth: about 96 KB per connection when it opens (192 KB at boot with a standby), nothing while idle; a redial
+warms its new connection again, within `warmupMaxBytesPerMinute`. Every node release answers a claim that names
+no reply at once, so the warm-up needs no node change.
+
 ### Cover traffic
 
 Send dummy packets at a configurable rate to hide when you're actually using the network:
@@ -296,7 +313,10 @@ client.disconnect();
 Replies are claimed by SURB ID with claim protocol v2 where the entry supports it, and v1 JSON otherwise; the
 response's `Content-Type` decides. Several claims may be in flight per entry, and one SURB ID is never in two at
 once. A request claims its first reply block; once a fragment names the data shard count it claims every data
-block, and its parity blocks only after `parityFallbackMs` or after a claim carrying it failed.
+block, and its parity blocks only after `parityFallbackMs` or after a claim carrying it failed. Where the entry
+speaks claim v2 and holds long-polls (`firstArrival`), a request claims its first two blocks at once: a
+one-fragment reply travels as a data item and a parity replica over independent mix delays, and the held claim
+answers with whichever reaches the entry first; the other is acked.
 
 | `replyClaims` field | Default (KPS / classic) | Meaning |
 |---|---|---|
@@ -309,6 +329,10 @@ block, and its parity blocks only after `parityFallbackMs` or after a claim carr
 | `binary`, `retain` | true, true | Ask for the binary batch; keep replies re-claimable until acked |
 | `parityFallbackMs` | 2,000 | When parity blocks are claimed too |
 | `lostReplyGraceMs` | 1,500 | After a failed claim, when a reply still missing is reported lost (`reply.lost`) |
+| `firstArrival` | true | Claim a request's first two blocks together on entries that hold long-polls (see above) |
+
+A failed `/metadata.json` capability probe is retried after 5 s, doubling up to 60 s (`claim.probe.retry`), so one
+lost exchange does not leave the session polling; a relay that answers 404 has no `claim-v2`.
 
 `ethRpcUrl` and `registryAddress` are required together. Connection fails before fetching a seed if either is
 missing. `dangerouslySkipFingerprintCheck: true` is accepted only when every seed URL is loopback.
