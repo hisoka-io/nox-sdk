@@ -2,7 +2,7 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
-## Unreleased
+## 0.3.0 (2026-10-06)
 
 Every 0.2.0 config stays valid. Works against entries on nox 0.4.0-rc.6 and on nodes with claim protocol v2.
 

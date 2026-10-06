@@ -341,12 +341,12 @@ export async function inflateReply(reply: DecodedHttpResponse, maxBytes: number)
       controller.enqueue(source);
       controller.close();
     },
-  }).pipeThrough(new DecompressionStream("gzip") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>);
+  }).pipeThrough(new DecompressionStream("gzip") as unknown as TransformStream<Uint8Array, Uint8Array>);
   const reader = inflated.getReader();
   const chunks: Uint8Array[] = [];
   let total = 0;
   for (;;) {
-    let result: ReadableStreamReadResult<Uint8Array>;
+    let result: Awaited<ReturnType<typeof reader.read>>;
     try {
       result = await reader.read();
     } catch (error) {

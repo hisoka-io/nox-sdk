@@ -2,7 +2,7 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
-## Unreleased
+## 0.7.0 (2026-10-06)
 
 Additive; every 0.6.0 configuration behaves as before except where noted under Changed. Works against entries on
 nox 0.4.0-rc.6 (claim protocol v1) and on nodes with claim protocol v2 alike.
