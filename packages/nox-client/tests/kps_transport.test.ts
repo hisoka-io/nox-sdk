@@ -86,6 +86,66 @@ describe("KpsHttpTransport", () => {
     await kps.close();
   });
 
+  it("carries Accept next to Content-Type (claims ask for the binary batch) and nothing else", async () => {
+    const network = new FakeKpsNetwork();
+    network.route(A, () => ({ status: 204, contentLength: false }));
+    const kps = transport(network);
+    await kps.fetch(`kps:${A}/api/v1/responses/claim`, {
+      method: "POST",
+      headers: [["accept", "application/vnd.nox.claim-batch"], ["Content-Type", "application/json"], ["Cookie", "x"]],
+      body: "{}",
+    });
+    expect(network.requests[0]?.headers).toEqual([
+      ["host", A.slice(A.lastIndexOf(":") + 1)],
+      ["content-type", "application/json"],
+      ["accept", "application/vnd.nox.claim-batch"],
+      ["content-length", "2"],
+    ]);
+    await kps.close();
+  });
+
+  it("measures the round trip of small exchanges and reports dial time", async () => {
+    const network = new FakeKpsNetwork();
+    network.route(A, () => ({ status: 200, body: "ok" }));
+    const kps = transport(network);
+    expect(kps.rttMs(A)).toBeUndefined();
+    await kps.fetch(`kps:${A}/health`);
+    expect(kps.rttMs(A)).toBeGreaterThanOrEqual(0);
+    expect(kps.dialMs(A)).toBeGreaterThanOrEqual(0);
+    await kps.close();
+  });
+
+  it("dials a claims-lane connection in the background and uses it once up", async () => {
+    const network = new FakeKpsNetwork();
+    network.route(A, () => ({ status: 204, contentLength: false }));
+    const kps = transport(network);
+    const claims = kps.fetchOn("claims");
+    // The first claim dials and rides the primary connection; the lane is dialled
+    // only once the primary is up (never two dials at once to one address).
+    await claims(`kps:${A}/api/v1/responses/claim`, { method: "POST", body: "{}" });
+    expect(network.dials).toEqual([A]);
+    await claims(`kps:${A}/api/v1/responses/claim`, { method: "POST", body: "{}" });
+    await vi.waitFor(() => expect(network.dials).toEqual([A, A]));
+    await vi.waitFor(() => expect(kps.isConnected(A)).toBe(true));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    await claims(`kps:${A}/api/v1/responses/claim`, { method: "POST", body: "{}" });
+    expect(network.connections[0]!.streamsOpened).toBe(2);
+    expect(network.connections[1]!.streamsOpened).toBe(1);
+    await kps.close();
+  });
+
+  it("notifies connection listeners when a connection closes", async () => {
+    const network = new FakeKpsNetwork();
+    network.route(A, () => ({ status: 200, body: "ok" }));
+    const kps = transport(network);
+    const closed: [string, string, boolean][] = [];
+    kps.onConnectionClosed((address, lane, clean) => closed.push([address, lane, clean]));
+    await kps.fetch(`kps:${A}/health`);
+    network.connections[0]!.kill();
+    await vi.waitFor(() => expect(closed).toEqual([[A, "primary", false]]));
+    await kps.close();
+  });
+
   it("reuses one connection and opens one stream per request", async () => {
     const network = new FakeKpsNetwork();
     network.route(undefined, () => json(200, []));

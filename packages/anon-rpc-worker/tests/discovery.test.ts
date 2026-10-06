@@ -95,6 +95,20 @@ async function untilLogged(harness: FakeHarness, event: string): Promise<void> {
   await vi.waitFor(() => expect(logged(harness, event)).toBeGreaterThan(0), { timeout: 10_000, interval: 20 });
 }
 
+/**
+ * One wallet call. The worker defers its first registry check until the
+ * first call settles (wallet calls first), so tests that wait for a check make
+ * the call a wallet would.
+ */
+async function walletCall(harness: FakeHarness): Promise<void> {
+  const response = await harness.fetch("https://rpc.example.test/", {
+    method: "POST",
+    headers: [["content-type", "application/json"]],
+    body: new TextEncoder().encode('{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'),
+  });
+  expect(response.status).toBe(200);
+}
+
 function runCheck(client: NoxClient): Promise<boolean> {
   return (Reflect.get(client, "_runChainCheck") as (reason: string, force: boolean) => Promise<boolean>).call(client, "test", true);
 }
@@ -108,6 +122,8 @@ describe("worker discovery", () => {
     });
     await bed.harness.ready;
     expect(bed.network.dials[0]).toBe(anchor);
+    expect(logged(bed.harness, "discovery.verified")).toBe(0);
+    await walletCall(bed.harness);
     await untilLogged(bed.harness, "discovery.verified");
     expect(bed.rpc.requests).toBeGreaterThanOrEqual(3);
     expect(bed.harness.failures).toEqual([]);
@@ -122,6 +138,7 @@ describe("worker discovery", () => {
     first.network.nodeAt.set(moved, memberAddress(2));
     first.rpc.update(memberAddress(2), { metadataUrl: `kps:${moved}/metadata.json` });
     first.rpc.advance();
+    await walletCall(first.harness);
     await untilLogged(first.harness, "discovery.verified");
     expect(await runCheck(first.client())).toBe(true);
     await vi.waitFor(() => {
@@ -193,6 +210,7 @@ describe("worker discovery", () => {
       },
     });
     await bed.harness.ready;
+    await walletCall(bed.harness);
     await untilLogged(bed.harness, "discovery.verified");
     expect(new Set(bed.network.dials)).toEqual(new Set([bridge, bridgeB]));
   });

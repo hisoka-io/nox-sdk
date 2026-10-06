@@ -10,9 +10,7 @@ import type {
 import { hexToBytes, bytesToHex, secureRandomIndex } from "./utils.js";
 import { defaultFetch, jsonRpcCall, jsonRpcCalls, type JsonRpcCall } from "./rpc.js";
 
-import sha3 from "js-sha3"; // CJS — no named ESM exports
-import { Interface, sha256, toUtf8Bytes } from "ethers";
-const keccak_256 = sha3.keccak_256;
+import { Interface, keccak256, sha256, toUtf8Bytes } from "ethers";
 
 const REGISTRY_INTERFACE = new Interface([
   "function topologyFingerprint() view returns (bytes32)",
@@ -147,7 +145,7 @@ export function computeTopologyFingerprint(nodes: RelayerNode[]): string {
   for (const node of nodes) {
     const addrHex = node.address.replace(/^0x/i, "").toLowerCase();
     const addrBytes = hexToBytes(addrHex);
-    const hash = new Uint8Array(keccak_256.arrayBuffer(addrBytes));
+    const hash = hexToBytes(keccak256(addrBytes).slice(2));
     for (let i = 0; i < 32; i++) {
       xor[i]! ^= hash[i]!;
     }
@@ -508,7 +506,7 @@ function recordMismatch(
 
 function diagnosticValue(field: string, value: unknown): string {
   if (field === "url" || field === "ingressUrl" || field === "metadataUrl") {
-    return `keccak256:${keccak_256(String(value)).slice(0, 16)}`;
+    return `keccak256:${keccak256(toUtf8Bytes(String(value))).slice(2, 18)}`;
   }
   return boundedValue(value);
 }

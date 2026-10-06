@@ -105,6 +105,15 @@ export const DISCOVERY_LIMITS = Object.freeze({
 /** Pairings a chain check tries before it gives up until the next run. */
 export const DISCOVERY_PAIRING_BUDGET = 3;
 
+/**
+ * Longest wait of the first chain check after ready for the first wallet call
+ * to settle (wallet calls first); `discovery.firstCheckDeferMs` overrides it.
+ */
+export const DISCOVERY_FIRST_CHECK_MAX_DEFER_MS = 15_000;
+
+/** Reply blocks of a registry read: one data block and one parity block. */
+export const DISCOVERY_MIN_SURBS = 2;
+
 /** Shortest gap between two chain checks that a trigger (not the timer) starts. */
 export const DISCOVERY_TRIGGER_MIN_GAP_MS = 30_000;
 

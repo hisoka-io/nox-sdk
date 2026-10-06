@@ -281,6 +281,12 @@ export interface KpsDiscoveryOptions {
   firstSeen?: readonly MemberFirstSeen[];
   /** Called after each chain check the client applied. */
   onVerified?: (state: VerifiedDiscovery) => void;
+  /**
+   * Wallet calls first: the first chain check after ready waits up to this
+   * long for the first call to settle, so it does not compete with it.
+   * Default 0 (check at once); the anon-rpc worker uses 15 s.
+   */
+  firstCheckDeferMs?: number;
 }
 
 /** KPS mode inputs. There is no seed, no RPC and no HTTP(S) entry in this mode. */
@@ -318,6 +324,82 @@ export interface KpsModeOptions {
   maxBodyBytes?: number;
   /** Clock skew tolerated on served topology timestamps. Default 600 s. */
   clockSkewToleranceSeconds?: number;
+  /**
+   * Claim replies over a second connection to the entry, dialled in the
+   * background, so reply downloads and packet submissions do not share one
+   * association's send queue and congestion window. Until it is up, claims use
+   * the primary connection. Default false.
+   */
+  claimLane?: boolean;
+  /**
+   * Keep a second entry connected as a standby (keepalives below the 120 s
+   * `nox-kps` idle timeout) and move the pinned entry to it when the pinned
+   * connection closes, so a redial is not on a call's path. Default false.
+   */
+  standby?: boolean;
+}
+
+/** Reply claim tuning (`NoxClientConfig.replyClaims`). */
+export interface ReplyClaimSettings {
+  /** Tick period: how often IDs not in flight are claimed. KPS mode uses `kps.claimIntervalMs`. Default 200 ms. */
+  readonly intervalMs: number;
+  /** Bound on one claim exchange with one ID, on top of `waitMs`. Default 10 s. */
+  readonly claimTimeoutMs: number;
+  /** Added to the bound for every further ID in the claim. Default 2.5 s. */
+  readonly claimTimeoutPerIdMs: number;
+  /** Most IDs in one claim, which bounds the response to that many replies. Default 4. */
+  readonly maxIdsPerClaim: number;
+  /** Claims in flight at once per entry. Default 4. */
+  readonly maxClaimsInFlight: number;
+  /**
+   * `maxIdsPerClaim` for entries that answer v1 JSON (or have not answered
+   * yet): a JSON reply is about 115 KB, so one per claim keeps each transfer
+   * short. Default 1 (KPS) / 128 (classic).
+   */
+  readonly jsonMaxIdsPerClaim: number;
+  /** `maxClaimsInFlight` for entries that answer v1 JSON (or have not answered yet). Default 2 (KPS) / 4 (classic). */
+  readonly jsonMaxClaimsInFlight: number;
+  /** Long-poll hold asked of the entry (`wait_ms`); 0 = answer at once. Default 4 s in KPS mode, 0 in classic mode. */
+  readonly waitMs: number;
+  /** Ask for the binary claim batch (JSON answers are read either way). Default true. */
+  readonly binary: boolean;
+  /**
+   * Ask v2 entries to keep returned replies re-claimable until acked (their
+   * claim grace), and ack what arrived. Required for long-poll. Default true.
+   */
+  readonly retain: boolean;
+  /** After this long without the reply, parity reply blocks are claimed too. Default 2 s. */
+  readonly parityFallbackMs: number;
+  /** After a failed claim, how long a request may stay without a reply before it is reported lost. Default 1.5 s. */
+  readonly lostReplyGraceMs: number;
+}
+
+/**
+ * When a request is sent again (`NoxClientConfig.resend`). The default is the
+ * 0.6 behaviour: one resend on another route after a response timeout, or
+ * after a transport failure. Every resend shares the request's reply budget
+ * limits; a call sends at most `2 + transportResends` copies.
+ */
+export interface ResendPolicy {
+  /**
+   * Resendable requests only: when no reply arrived after this long, send a
+   * second copy on another route while the first keeps waiting; the first
+   * reply wins. Uses the timeout resend. 0 turns hedging off. Default 0.
+   */
+  readonly hedgeAfterMs: number;
+  /** Raise the hedge delay to the observed p95 reply time (bounded by the attempt timeout). Default false. */
+  readonly hedgeAdaptive: boolean;
+  /** Hedged copies in flight at once across the client. Default 2. */
+  readonly maxHedgesInFlight: number;
+  /**
+   * Resends after transport failures, counted apart from the timeout resend.
+   * 0: a transport failure uses the single resend. Default 0.
+   */
+  readonly transportResends: number;
+  /** Resend a resendable request at once when its reply is presumed lost (a failed claim). Default false. */
+  readonly resendOnLostReply: boolean;
+  /** When no other entry can carry a resend, resend through the same entry on another mix and exit. Default false. */
+  readonly sameEntryFallback: boolean;
 }
 
 /** WebAssembly bindings with the exports of `@hisoka-io/nox-wasm`, already initialised. */
@@ -391,14 +473,19 @@ export interface NoxClientConfig {
   surbFormat?: SurbFormat;
   /** Network primitives. Defaults to the runtime's global `fetch` and `WebSocket`. */
   transport?: NoxTransport;
+  /** Reply claim tuning. See `ReplyClaimSettings`. */
+  replyClaims?: Partial<ReplyClaimSettings>;
+  /** Resend policy. See `ResendPolicy`. */
+  resend?: Partial<ResendPolicy>;
 }
 
 /**
  * Resolved client settings: the `NoxClientConfig` tuning fields (every field
- * except `transport`, `mode`, `kps`, `wasm` and `log`).
+ * except `transport`, `mode`, `kps`, `wasm`, `log`, `replyClaims` and `resend`,
+ * which are resolved on their own).
  */
 export type NoxClientSettings = Required<
-  Omit<NoxClientConfig, "transport" | "mode" | "kps" | "wasm" | "log">
+  Omit<NoxClientConfig, "transport" | "mode" | "kps" | "wasm" | "log" | "replyClaims" | "resend">
 >;
 
 /**

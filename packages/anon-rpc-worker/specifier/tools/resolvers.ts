@@ -35,6 +35,41 @@ export type ResolverPolicy = {
 
 export const DEFAULT_RESOLVER_POLICY: ResolverPolicy = { minResolvers: 2, allowUnknownKinds: false };
 
+/**
+ * Order of a published resolver list. Harnesses try resolvers in list order
+ * (anon-rpc SPEC §4.1), so the first one that answers decides boot time.
+ *
+ * - `https-first` (default): every `https:` entry, then every `kps:` entry,
+ *   then anything else, each group in the given order. CDN and raw-file hosts
+ *   serve the ~0.9 MB bundle over TCP from nearby points of presence; a `kps:`
+ *   resolver downloads it over one WebRTC data channel from the node, which
+ *   measured 14-37 s slower from India (2026-10-06 forensics: kps-first boots
+ *   26.5-45.1 s to ready, https-first 7.8-8.5 s). The `kps:` entries stay as
+ *   the censorship-resistant fallback when every `https:` host is blocked.
+ * - `as-given`: publish the list exactly as passed.
+ */
+export type ResolverOrder = "https-first" | "as-given";
+
+export const DEFAULT_RESOLVER_ORDER: ResolverOrder = "https-first";
+
+/** Rank of a resolver kind under `https-first`. */
+const KIND_RANK: Readonly<Record<ResolverKind, number>> = { https: 0, kps: 1, unsupported: 2 };
+
+function resolverKind(entry: string): ResolverKind {
+  if (entry.startsWith("https:")) return "https";
+  if (entry.startsWith("kps:")) return "kps";
+  return "unsupported";
+}
+
+/** The list in `order` (a stable reorder: entries of one kind keep their relative order). */
+export function orderResolvers(entries: readonly string[], order: ResolverOrder = DEFAULT_RESOLVER_ORDER): string[] {
+  if (order === "as-given") return [...entries];
+  return entries
+    .map((entry, index) => ({ entry, index, rank: KIND_RANK[resolverKind(entry)] }))
+    .sort((left, right) => left.rank - right.rank || left.index - right.index)
+    .map(({ entry }) => entry);
+}
+
 const KECCAK_PATH = /\/keccak\/([0-9a-f]{2})\/([0-9a-f]{62})(?:$|[/?#])/;
 /** Package path layouts of the npm CDNs: jsDelivr serves /npm/<pkg>[@<version>]/..., unpkg /<pkg>[@<version>]/.... */
 const NPM_CDN_PATHS: Readonly<Record<string, RegExp>> = {
@@ -187,6 +222,14 @@ export function checkResolvers(
   for (const entry of entries) {
     if (seen.has(entry)) errors.push(`duplicate resolver: ${entry}`);
     seen.add(entry);
+  }
+  const firstHttps = checks.findIndex((check) => check.kind === "https");
+  const firstKps = checks.findIndex((check) => check.kind === "kps");
+  if (firstKps >= 0 && firstHttps > firstKps) {
+    warnings.push(
+      `resolver ${firstKps} (kps:) comes before resolver ${firstHttps} (https:): harnesses try resolvers in order, ` +
+        "so boot waits on a WebRTC bundle download before trying a CDN; order https: entries first (--resolver-order https-first)",
+    );
   }
   const totalBytes = entries.reduce((sum, e) => sum + Buffer.byteLength(e, "utf8"), 0);
   return { checks, errors, warnings, totalBytes };

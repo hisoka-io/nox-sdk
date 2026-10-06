@@ -31,6 +31,12 @@ export interface NoxWorkerConfig {
   readonly logLevel: LogLevel;
   /** Per attempt for small and medium reads. */
   readonly attemptTimeoutMs: number;
+  /**
+   * Resendable reads: a second copy goes out on another route when no reply
+   * arrived after this long (raised to the observed p95 reply time); the
+   * first reply wins. 0 turns hedging off.
+   */
+  readonly hedgeAfterMs: number;
   /** Whole call, from acceptance: waiting for ready, sending, attempts. */
   readonly callDeadlineMs: number;
   readonly maxConcurrentCalls: number;
@@ -55,6 +61,7 @@ export const CONFIG_DEFAULTS: NoxWorkerConfig = Object.freeze({
   trust: "auto",
   logLevel: "info",
   attemptTimeoutMs: 12_000,
+  hedgeAfterMs: 3_000,
   callDeadlineMs: 25_000,
   maxConcurrentCalls: 16,
   maxRequestBytes: 1_048_576,
@@ -69,6 +76,7 @@ export const CONFIG_DEFAULTS: NoxWorkerConfig = Object.freeze({
 /** Inclusive integer ranges of the numeric fields. */
 export const CONFIG_RANGES = Object.freeze({
   attemptTimeoutMs: [3_000, 60_000],
+  hedgeAfterMs: [0, 60_000],
   callDeadlineMs: [3_000, 120_000],
   maxConcurrentCalls: [1, 64],
   maxRequestBytes: [1_024, 4_194_304],

@@ -288,6 +288,27 @@ client.disconnect();
 | `retryOnTimeout` | `boolean` | `true` | Resend idempotent requests once on another route after a timeout (worst case about 2x `timeoutMs`) |
 | `surbFormat` | `"auto" \| "v1" \| "v2"` | `"auto"` | Reply block format. `auto` uses v2 only when every hop of the route advertises `surb_v2`; `v2` requires it and throws `SURB_V2_UNAVAILABLE` otherwise |
 | `transport` | `{ fetch?, WebSocket? }` | runtime globals | Network primitives; `WebSocket: null` uses HTTP polling |
+| `replyClaims` | `Partial<ReplyClaimSettings>` | see below | Reply claim tuning: concurrent claims, binary batch, retain and ack, long-poll, data blocks before parity |
+| `resend` | `Partial<ResendPolicy>` | `RESEND_LEGACY` | Hedged copies, resend on a lost reply, transport-failure resends, same-entry resends. `RESEND_FAST` is the anon-rpc worker's policy |
+
+### Reply claims
+
+Replies are claimed by SURB ID with claim protocol v2 where the entry supports it, and v1 JSON otherwise; the
+response's `Content-Type` decides. Several claims may be in flight per entry, and one SURB ID is never in two at
+once. A request claims its first reply block; once a fragment names the data shard count it claims every data
+block, and its parity blocks only after `parityFallbackMs` or after a claim carrying it failed.
+
+| `replyClaims` field | Default (KPS / classic) | Meaning |
+|---|---|---|
+| `intervalMs` | `kps.claimIntervalMs` (200) / 200 | How often IDs not in flight are claimed |
+| `claimTimeoutMs`, `claimTimeoutPerIdMs` | 10,000, 2,500 | Bound on one claim: base plus per further ID, plus the wait |
+| `maxIdsPerClaim` | 4 / 128 | Bounds one claim response to that many replies (entries that answered claim protocol v2) |
+| `maxClaimsInFlight` | 4 | Claims open at once per entry |
+| `jsonMaxIdsPerClaim`, `jsonMaxClaimsInFlight` | 1, 2 / 128, 4 | The same limits for entries that answer v1 JSON (about 115 KB per reply) or have not answered yet |
+| `waitMs` | 4,000 / 0 | Long-poll hold asked of v2 entries: over KPS only when the relay's `/metadata.json` lists `claim-v2` (capped by its `limits.claimWaitMaxMs`), directly once the entry sent `x-nox-claim-wait-max-ms` (capped by it) |
+| `binary`, `retain` | true, true | Ask for the binary batch; keep replies re-claimable until acked |
+| `parityFallbackMs` | 2,000 | When parity blocks are claimed too |
+| `lostReplyGraceMs` | 1,500 | After a failed claim, when a reply still missing is reported lost (`reply.lost`) |
 
 `ethRpcUrl` and `registryAddress` are required together. Connection fails before fetching a seed if either is
 missing. `dangerouslySkipFingerprintCheck: true` is accepted only when every seed URL is loopback.

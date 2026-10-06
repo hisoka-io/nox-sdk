@@ -1049,41 +1049,41 @@ describe("replies through a non-pinned entry", () => {
     pool.registry.set("aa".repeat(16), { requestId: 1n, recoveryJson: "{}", version: 1 });
     pool.registry.set("bb".repeat(16), { requestId: 2n, recoveryJson: "{}", version: 2 });
     Reflect.set(client, "surbPool", pool);
-    Reflect.set(client, "_auxEntries", new Map());
     Reflect.set(client, "pending", new Map([[1n, {}], [2n, {}]]));
     Reflect.set(client, "_wasm", null);
+    Reflect.set(client, "_webSocketImpl", null);
+    Reflect.set(client, "responseWs", null);
+    Reflect.set(client, "_wsEntryUrl", null);
+    Reflect.set(client, "_entryUrl", "https://entry-a.test");
     const urls: string[] = [];
-    const bodies: string[] = [];
+    const bodies: { surb_ids: string[] }[] = [];
     Reflect.set(client, "_fetchImpl", async (url: string, init?: RequestInit) => {
       urls.push(url);
-      bodies.push(String(init?.body));
+      bodies.push(JSON.parse(String(init?.body)) as { surb_ids: string[] });
       return new Response(JSON.stringify([]), { status: 200 });
     });
-
-    const watch = Reflect.get(client, "_watchAuxEntry") as (u: string, r: bigint) => void;
-    watch.call(client, "https://entry-b.test", 2n);
+    (Reflect.get(client, "_startResponseStream") as () => void).call(client);
+    const claims = Reflect.get(client, "_claims") as {
+      track(id: bigint, entry: string, ids: string[]): void;
+      tick(): void;
+    };
     try {
-      const pinnedIds = (Reflect.get(client, "_pinnedEntrySurbIds") as () => string[]).call(client);
-      expect(pinnedIds).toEqual(["aa".repeat(16)]);
+      claims.track(1n, "https://entry-a.test", ["aa".repeat(16)]);
+      claims.track(2n, "https://entry-b.test", ["bb".repeat(16)]);
+      await vi.waitFor(() => expect(urls).toHaveLength(2));
+      const byEntry = new Map(urls.map((url, index) => [url, bodies[index]!.surb_ids]));
+      expect(byEntry.get("https://entry-a.test/api/v1/responses/claim")).toEqual(["aa".repeat(16)]);
+      expect(byEntry.get("https://entry-b.test/api/v1/responses/claim")).toEqual(["bb".repeat(16)]);
 
-      await (Reflect.get(client, "_pollAuxEntry") as (u: string) => Promise<void>).call(
-        client,
-        "https://entry-b.test",
-      );
-      expect(urls).toEqual(["https://entry-b.test/api/v1/responses/claim"]);
-      expect(JSON.parse(bodies[0]!)).toEqual({ surb_ids: ["bb".repeat(16)] });
-
-      // Settled requests stop the watcher.
+      // Settled requests are no longer claimed anywhere.
       (Reflect.get(client, "pending") as Map<bigint, unknown>).delete(2n);
-      await (Reflect.get(client, "_pollAuxEntry") as (u: string) => Promise<void>).call(
-        client,
-        "https://entry-b.test",
-      );
-      expect((Reflect.get(client, "_auxEntries") as Map<string, unknown>).size).toBe(0);
+      urls.length = 0;
+      claims.tick();
+      await vi.waitFor(() => expect(urls.length).toBeGreaterThan(0));
+      expect(urls.every((url) => url.startsWith("https://entry-a.test"))).toBe(true);
     } finally {
-      for (const { timer } of (Reflect.get(client, "_auxEntries") as Map<string, { timer: ReturnType<typeof setInterval> }>).values()) {
-        clearInterval(timer);
-      }
+      (Reflect.get(client, "_claims") as { close(): void }).close();
+      clearInterval(Reflect.get(client, "stallTimer") as ReturnType<typeof setInterval>);
     }
   });
 });

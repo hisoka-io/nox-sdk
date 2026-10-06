@@ -85,6 +85,27 @@ describe("worker on the real SDK in KPS mode", () => {
     expect(ambientFetch).not.toHaveBeenCalled();
   });
 
+  it("answers 5 concurrent eth_getBalance calls", async () => {
+    const { harness } = boot({ topologySources: 1 }, (request) => {
+      if (request.tag !== "HttpRequest") throw new Error("unexpected request");
+      const call = JSON.parse(new TextDecoder().decode(request.body)) as { id: number };
+      return exitReply(200, [["content-type", "application/json"]], JSON.stringify({ jsonrpc: "2.0", id: call.id, result: "0x2a" }));
+    });
+    await harness.ready;
+    const responses = await Promise.all([1, 2, 3, 4, 5].map((id) =>
+      harness.fetch("https://rpc.example.test/", {
+        method: "POST",
+        headers: [["content-type", "application/json"]],
+        body: new TextEncoder().encode(
+          JSON.stringify({ jsonrpc: "2.0", id, method: "eth_getBalance", params: ["0x" + "11".repeat(20), "latest"] }),
+        ),
+      })
+    ));
+    expect(responses.map((response) => response.status)).toEqual([200, 200, 200, 200, 200]);
+    const ids = responses.map((response) => (JSON.parse(new TextDecoder().decode(response.body as Uint8Array)) as { id: number }).id);
+    expect(ids).toEqual([1, 2, 3, 4, 5]);
+  });
+
   it("restricts entries to configured gateways", async () => {
     const gateways = [kpsAddressFor(3)];
     const { network, harness } = boot({ gateways, topologySources: 1 }, () => exitReply(200, [], "{}"));

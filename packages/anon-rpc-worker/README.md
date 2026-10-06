@@ -41,6 +41,7 @@ optional, and every config valid for 0.1.0 stays valid:
 | `checkpoint` | | | reserved; any value fails with `bad-config` |
 | `logLevel` | `"debug"`, `"info"`, `"warn"`, `"error"` | `"info"` | |
 | `attemptTimeoutMs` | integer | 12,000 | 3,000-60,000 |
+| `hedgeAfterMs` | integer | 3,000 | 0-60,000. Resendable reads send a second copy on another route when no reply arrived after this long, raised to the observed p95 reply time and kept below `attemptTimeoutMs`; the first reply wins. 0 turns hedging off |
 | `callDeadlineMs` | integer | 25,000 | at least `attemptTimeoutMs`, at most 120,000 |
 | `maxConcurrentCalls` | integer | 16 | 1-64 |
 | `maxRequestBytes` | integer | 1,048,576 | 1,024-4,194,304 |
