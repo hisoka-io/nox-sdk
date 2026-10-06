@@ -1391,8 +1391,9 @@ export class NoxClient {
    */
   private _startStandby(): void {
     const kps = this._kps;
-    if (kps === undefined || !kps.options.standby) return;
+    if (kps === undefined) return;
     this._refreshStandby();
+    if (!kps.options.standby) return;
     kps.unlisten = kps.transport.onConnectionClosed((address, lane) => {
       if (lane !== "primary" || this._kps !== kps || this.topologyTimer === null) return;
       if (address === kpsAddressOfEntry(this._entryUrl)) this._failOverFromClosedEntry();
@@ -1423,11 +1424,19 @@ export class NoxClient {
       .map(({ node }) => node);
   }
 
-  /** Retain the pinned entry and its standby; dial the standby in the background when it is down. */
+  /**
+   * Retain the pinned entry and its standby and warm their send windows;
+   * dial the standby in the background when it is down. Without `standby`,
+   * only the pinned entry is warmed.
+   */
   private _refreshStandby(): void {
     const kps = this._kps;
-    if (kps === undefined || !kps.options.standby) return;
+    if (kps === undefined) return;
     const pinned = kpsAddressOfEntry(this._entryUrl);
+    if (!kps.options.standby) {
+      kps.transport.warmUp(pinned === null ? [] : [pinned]);
+      return;
+    }
     // With gateways or bridges set, a standby is never dialled outside them.
     const userAnchors = kps.options.discovery?.userAnchors;
     const standby = this._rankedOtherEntries().find((node) => {
@@ -1435,7 +1444,9 @@ export class NoxClient {
       return address !== null && (userAnchors === undefined || userAnchors.has(address) || kps.transport.isConnected(address));
     });
     const standbyAddress = standby === undefined ? null : kpsAddressOfEntry(standby.address);
-    kps.transport.retain([pinned, standbyAddress].filter((address): address is string => address !== null));
+    const kept = [pinned, standbyAddress].filter((address): address is string => address !== null);
+    kps.transport.retain(kept);
+    kps.transport.warmUp(kept);
     if (standbyAddress !== null && !kps.transport.isConnected(standbyAddress)) kps.transport.prewarm(standbyAddress);
   }
 
@@ -2655,6 +2666,7 @@ export class NoxClient {
         this._kps.pinnedEntryFailures = 0;
       }
       this._entryUrl = pickEntryUrl(nodes, this._entryRule());
+      if (this._kps !== undefined) this._refreshStandby();
       // Reconnect WS to new entry node; requests sent through the old one keep being claimed there.
       if (this.responseWs !== null) {
         this.responseWs.close();

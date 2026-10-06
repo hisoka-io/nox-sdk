@@ -338,7 +338,7 @@ describe("concurrent calls", () => {
     let open = 0;
     let peak = 0;
     t.network.route(entryAddress, async (request) => {
-      if (request.path !== "/api/v1/responses/claim") return t.mixnet.handler(request);
+      if (request.path !== "/api/v1/responses/claim" || isWarmupClaim(request.body)) return t.mixnet.handler(request);
       open += 1;
       peak = Math.max(peak, open);
       await new Promise((resolve) => setTimeout(resolve, 30));
@@ -359,7 +359,7 @@ describe("claim size per entry protocol", () => {
     let open = 0;
     let peak = 0;
     t.network.route(entryAddress, async (request) => {
-      if (request.path !== "/api/v1/responses/claim") return t.mixnet.handler(request);
+      if (request.path !== "/api/v1/responses/claim" || isWarmupClaim(request.body)) return t.mixnet.handler(request);
       open += 1;
       peak = Math.max(peak, open);
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -566,3 +566,9 @@ describe("connections", () => {
     expect(t.network.dials.filter((address) => address === other)).toHaveLength(dialsBefore);
   });
 });
+
+/** The transport's send-window warm-up pads claims that name no reply; they are not scheduler claims. */
+function isWarmupClaim(body: Uint8Array): boolean {
+  const text = new TextDecoder().decode(body);
+  return body.length >= 1_000 && /^\{"surb_ids":\[\]\}\s*$/u.test(text);
+}

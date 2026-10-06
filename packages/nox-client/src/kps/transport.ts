@@ -71,6 +71,28 @@ export interface KpsTransportSettings {
   maintenanceIntervalMs: number;
   /** Claim-lane connections kept open (with keepalives) while idle; others close after `idleCloseMs`. */
   claimLaneConnectionsKept: number;
+  /**
+   * Largest single stream write. A browser data channel releases at most four
+   * SCTP packets per send call, so a 32 KB packet written at once needs extra
+   * round trips even when the congestion window has room; writes of this size
+   * (about four packets each) let a warm window carry the packet in one flight.
+   */
+  writeChunkBytes: number;
+  /**
+   * Send-window warm-up per connection, in bytes (0 = off): right after a
+   * warm-up target connects, the transport sends this much padding as a few
+   * paced, growing `POST /api/v1/responses/claim` bodies that claim nothing,
+   * so the browser's SCTP congestion window has grown before the first
+   * packet. It stops as soon as any other exchange is in flight on the
+   * connection, or when a round is slower than `warmupAbortRtts` round trips.
+   */
+  warmupBytes: number;
+  /** Ceiling on warm-up bytes across all connections in any 60 s window. */
+  warmupMaxBytesPerMinute: number;
+  /** Gap between warm-up rounds when no round trip has been measured yet. */
+  warmupRoundGapMs: number;
+  /** A warm-up round still open after this many measured round trips stops the warm-up (a lossy path). */
+  warmupAbortRtts: number;
 }
 
 /**
@@ -98,7 +120,47 @@ export const KPS_TRANSPORT_DEFAULTS: Readonly<KpsTransportSettings> = Object.fre
   maxStreamsPerConnection: 32,
   maintenanceIntervalMs: 5_000,
   claimLaneConnectionsKept: 1,
+  writeChunkBytes: 4_600,
+  warmupBytes: 96_000,
+  warmupMaxBytesPerMinute: 400_000,
+  warmupRoundGapMs: 280,
+  warmupAbortRtts: 3,
 });
+
+/** First warm-up round: about the browser's initial SCTP window (10 packets). */
+export const KPS_WARMUP_FIRST_ROUND_BYTES = 12_000;
+
+/** Each warm-up round is this much larger than the one before (slow start grows about 1.5x per round trip with delayed acks). */
+export const KPS_WARMUP_GROWTH = 1.5;
+
+/** Largest warm-up round: below the 64 KiB claim body limit of every `nox-kps` release. */
+export const KPS_WARMUP_MAX_ROUND_BYTES = 60_000;
+
+/** Smallest warm-up round worth sending. */
+const KPS_WARMUP_MIN_ROUND_BYTES = 1_000;
+
+/** Route the warm-up pads: a claim that names no reply is answered at once by every node release. */
+export const KPS_WARMUP_TARGET = "/api/v1/responses/claim";
+
+/** Settings that may be 0 (feature off). */
+const ZERO_ALLOWED_SETTINGS: ReadonlySet<string> = new Set(["warmupBytes"]);
+
+/** Window over which `warmupMaxBytesPerMinute` is counted. */
+const WARMUP_BUDGET_WINDOW_MS = 60_000;
+
+/** Warm-up round sizes for a total of `bytes` (empty when off). */
+export function kpsWarmupRounds(bytes: number): number[] {
+  const rounds: number[] = [];
+  let left = bytes;
+  let next = KPS_WARMUP_FIRST_ROUND_BYTES;
+  while (left >= KPS_WARMUP_MIN_ROUND_BYTES) {
+    const size = Math.min(left, Math.round(next), KPS_WARMUP_MAX_ROUND_BYTES);
+    rounds.push(size);
+    left -= size;
+    next *= KPS_WARMUP_GROWTH;
+  }
+  return rounds;
+}
 
 /** Smoothing of the per-address round-trip estimate (exponential moving average weight of a new sample). */
 export const KPS_RTT_EMA_ALPHA = 0.3;
@@ -137,8 +199,12 @@ export function resolveKpsTransportSettings(
       throw new NoxClientError(`${key} is not a KPS transport setting`, NoxClientErrorCode.InvalidConfig);
     }
     if (value === undefined) continue;
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
-      throw new NoxClientError(`kps.${key} must be a positive safe integer`, NoxClientErrorCode.InvalidConfig);
+    const min = ZERO_ALLOWED_SETTINGS.has(key) ? 0 : 1;
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < min) {
+      throw new NoxClientError(
+        `kps.${key} must be ${min === 0 ? "a non-negative" : "a positive"} safe integer`,
+        NoxClientErrorCode.InvalidConfig,
+      );
     }
     (settings as unknown as Record<string, number>)[key] = value;
   }
@@ -171,6 +237,12 @@ interface PoolEntry {
   dialMs: number | undefined;
   /** Smoothed round trip of small exchanges on this address. */
   rttMs: number | undefined;
+  /** Warm the send window of every connection to this address (see `warmUp`). */
+  warmWanted: boolean;
+  /** The connection whose warm-up has started, so each connection is warmed once. */
+  warmedConn: KpsConnLike | null;
+  /** Warm-up exchanges in flight (they do not count as traffic the warm-up yields to). */
+  warmInFlight: number;
 }
 
 /** Notified when a connection closes (`clean` as `kps.conn.closed` logs it). */
@@ -198,6 +270,8 @@ export class KpsHttpTransport {
   private retained: ReadonlySet<string> = new Set();
   private readonly listeners = new Set<KpsConnectionListener>();
   private readonly laneFetches = new Map<KpsLane, NoxFetch>();
+  /** Warm-up bytes sent, with their send time, for `warmupMaxBytesPerMinute`. */
+  private readonly warmupSent: { at: number; bytes: number }[] = [];
 
   constructor(
     private readonly dial: KpsDial,
@@ -232,6 +306,25 @@ export class KpsHttpTransport {
    */
   retain(addresses: Iterable<string>): void {
     this.retained = new Set(addresses);
+  }
+
+  /**
+   * Warm the browser's send window on connections to these addresses (the
+   * pinned entry and its standby; other addresses stop being targets): now
+   * when connected, else when the dial completes, and again after a redial.
+   * Each connection is warmed once; see `KpsTransportSettings.warmupBytes`.
+   */
+  warmUp(addresses: Iterable<string>): void {
+    if (this.closed || this.settings.warmupBytes === 0) return;
+    const wanted = new Set([...addresses].map((address) => parseKpsAddress(address).address));
+    for (const entry of this.pool.values()) {
+      if (entry.lane === "primary" && !wanted.has(entry.address)) entry.warmWanted = false;
+    }
+    for (const address of wanted) {
+      const entry = this.entry(address, "primary");
+      entry.warmWanted = true;
+      if (entry.conn !== null) this.startWarmup(entry);
+    }
   }
 
   /** Listen for connection closes; returns the unsubscribe function. */
@@ -328,6 +421,9 @@ export class KpsHttpTransport {
         keepaliveInFlight: false,
         dialMs: undefined,
         rttMs: undefined,
+        warmWanted: false,
+        warmedConn: null,
+        warmInFlight: 0,
       };
       this.pool.set(key, entry);
     }
@@ -428,7 +524,7 @@ export class KpsHttpTransport {
         { once: true },
       );
       phase = "write";
-      await raceSignal(writer.write(requestBytes), exchange.signal);
+      await raceSignal(writeChunked(writer, requestBytes, this.settings.writeChunkBytes), exchange.signal);
       this.counters.bytesOut += requestBytes.length;
       // Closing the writable is closeWrite (SPEC §10.2): the request ends at EOF.
       await raceSignal(writer.close(), exchange.signal);
@@ -569,6 +665,7 @@ export class KpsHttpTransport {
         conn.closed.then(onClosed, onClosed);
         this.emit("info", "kps.dial.ok", { entry: entry.label, lane: entry.lane, ms: entry.dialMs });
         this.startMaintenance();
+        if (entry.warmWanted) queueMicrotask(() => this.startWarmup(entry));
         return conn;
       },
       (error: unknown) => {
@@ -635,6 +732,85 @@ export class KpsHttpTransport {
       clearTimeout(timer);
       signal.removeEventListener("abort", onAbort);
     }
+  }
+
+  private startWarmup(entry: PoolEntry): void {
+    const conn = entry.conn;
+    if (this.closed || conn === null || entry.lane !== "primary" || entry.warmedConn === conn) return;
+    entry.warmedConn = conn;
+    void this.runWarmup(entry, conn);
+  }
+
+  /** Bytes still allowed by `warmupMaxBytesPerMinute` now. */
+  private warmupAllowance(now: number): number {
+    while (this.warmupSent.length > 0 && now - (this.warmupSent[0]?.at ?? now) >= WARMUP_BUDGET_WINDOW_MS) {
+      this.warmupSent.shift();
+    }
+    const used = this.warmupSent.reduce((sum, sent) => sum + sent.bytes, 0);
+    return this.settings.warmupMaxBytesPerMinute - used;
+  }
+
+  /**
+   * Paced, growing padding rounds on `conn` (see `warmupBytes`). Rounds are
+   * not awaited one by one: the browser's own acknowledgement clock paces
+   * them, and the gap only spreads them over about one round trip each.
+   */
+  private async runWarmup(entry: PoolEntry, conn: KpsConnLike): Promise<void> {
+    const rounds = kpsWarmupRounds(this.settings.warmupBytes);
+    const started = Date.now();
+    const open: { at: number; done: boolean }[] = [];
+    const exchanges: Promise<void>[] = [];
+    let sent = 0;
+    let stop = "done";
+    for (const [index, size] of rounds.entries()) {
+      if (index > 0) await sleep(clampGap(entry.rttMs ?? this.settings.warmupRoundGapMs));
+      const now = Date.now();
+      if (this.closed || entry.conn !== conn) {
+        stop = "closed";
+        break;
+      }
+      if (entry.active > entry.warmInFlight) {
+        stop = "yielded";
+        break;
+      }
+      const rtt = entry.rttMs;
+      if (rtt !== undefined && open.some((round) => !round.done && now - round.at > rtt * this.settings.warmupAbortRtts)) {
+        stop = "slow";
+        break;
+      }
+      if (this.warmupAllowance(now) < size) {
+        stop = "budget";
+        break;
+      }
+      this.warmupSent.push({ at: now, bytes: size });
+      const round = { at: now, done: false };
+      open.push(round);
+      entry.warmInFlight += 1;
+      sent += size;
+      exchanges.push(
+        this.request(`kps:${entry.address}${KPS_WARMUP_TARGET}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: warmupBody(size),
+        }, "primary").then(
+          (response) => {
+            void response.arrayBuffer().catch(noop);
+          },
+          noop,
+        ).finally(() => {
+          round.done = true;
+          entry.warmInFlight -= 1;
+        }),
+      );
+    }
+    await Promise.all(exchanges);
+    this.emit("debug", "kps.warmup", {
+      entry: entry.label,
+      bytes: sent,
+      rounds: exchanges.length,
+      stop,
+      ms: Date.now() - started,
+    });
   }
 
   private acquire(entry: PoolEntry, signal: AbortSignal): Promise<void> {
@@ -796,6 +972,41 @@ export function kpsFailurePhase(error: unknown): KpsFailurePhase | undefined {
     current = (current as { cause?: unknown }).cause;
   }
   return undefined;
+}
+
+/**
+ * Write `bytes` as writes of at most `chunk` bytes, queued at once (the
+ * stream keeps their order), so each becomes its own data-channel send.
+ */
+async function writeChunked(writer: WritableStreamDefaultWriter<Uint8Array>, bytes: Uint8Array, chunk: number): Promise<void> {
+  if (bytes.length <= chunk) {
+    await writer.write(bytes);
+    return;
+  }
+  const writes: Promise<void>[] = [];
+  for (let offset = 0; offset < bytes.length; offset += chunk) {
+    const write = writer.write(bytes.subarray(offset, Math.min(bytes.length, offset + chunk)));
+    write.catch(noop);
+    writes.push(write);
+  }
+  await Promise.all(writes);
+}
+
+/** A claim body that names no reply, padded with JSON whitespace to `size` bytes. */
+function warmupBody(size: number): Uint8Array<ArrayBuffer> {
+  const head = '{"surb_ids":[]}';
+  const body = new Uint8Array(Math.max(size, head.length)).fill(0x20);
+  body.set(new TextEncoder().encode(head));
+  return body;
+}
+
+/** Warm-up round gap: about one round trip, kept within sane bounds. */
+function clampGap(ms: number): number {
+  return Math.min(Math.max(Math.round(ms), 20), 1_000);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Read through a function so TypeScript keeps no stale narrowing. */

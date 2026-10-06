@@ -322,6 +322,19 @@ export interface KpsModeOptions {
   maxHeadBytes?: number;
   /** Largest accepted response body. Default 16 MiB. */
   maxBodyBytes?: number;
+  /**
+   * Largest single stream write; a 32 KB packet goes out as writes of this
+   * size so a warm browser send window carries it in one flight. Default 4,600.
+   */
+  writeChunkBytes?: number;
+  /**
+   * Send-window warm-up per pinned-entry or standby connection, in bytes
+   * (0 = off): a few paced padding rounds right after the connection opens,
+   * stopped by any real exchange. Default 96,000 (once per connection).
+   */
+  warmupBytes?: number;
+  /** Ceiling on warm-up bytes across all connections in any 60 s window. Default 400,000. */
+  warmupMaxBytesPerMinute?: number;
   /** Clock skew tolerated on served topology timestamps. Default 600 s. */
   clockSkewToleranceSeconds?: number;
   /**
