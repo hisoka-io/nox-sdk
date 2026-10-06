@@ -15,6 +15,8 @@
  * learned-anchor cache.
  */
 import {
+  DISCOVERY_FIRST_CHECK_MAX_DEFER_MS,
+  RESEND_FAST,
   eligiblePinnedMembers,
   pinnedKpsAddresses,
   verifyBootstrap,
@@ -291,11 +293,18 @@ class NoxWorker {
       log: this.sdkLogSink(),
       timeoutMs: cfg.attemptTimeoutMs,
       surbFormat: cfg.surbFormat,
+      // Interactive latency: hedge at about p95, resend at once on a lost
+      // reply, transport resends of their own, same-entry resends for a
+      // single bridge (ARCHITECTURE §4.7).
+      resend: { ...RESEND_FAST, hedgeAfterMs: cfg.hedgeAfterMs },
       kps: {
         dial: kpsDial,
         pinned,
         topologySources: cfg.topologySources,
         claimIntervalMs: cfg.claimIntervalMs,
+        // Reply downloads on their own connection; a warm standby entry.
+        claimLane: true,
+        standby: true,
         discovery: this.discoveryOptions(cfg, bootstrap, learned),
         ...(deprioritize.length === 0 ? {} : { deprioritize }),
       },
@@ -340,6 +349,8 @@ class NoxWorker {
     return {
       bootstrap,
       chain: cfg.discovery === "chain",
+      // Wallet calls first: the first registry check waits for the first call (bounded).
+      firstCheckDeferMs: DISCOVERY_FIRST_CHECK_MAX_DEFER_MS,
       onVerified: (state) => this.onVerified(state),
       ...(cfg.gateways === undefined ? {} : { gateways: cfg.gateways }),
       ...(cfg.bridges === undefined ? {} : { bridges: cfg.bridges }),

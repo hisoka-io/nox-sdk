@@ -90,6 +90,22 @@ describe("boot", () => {
     expect(config.kps?.topologySources).toBe(1);
   });
 
+  it("asks the client for the low-latency policy: hedge, lost-reply resend, claim lane, standby, wallet calls first", async () => {
+    const { harness, configs } = setup({ config: { hedgeAfterMs: 2_500 } });
+    await harness.ready;
+    const config = configs[0] as NoxClientConfig;
+    expect(config.resend).toMatchObject({
+      hedgeAfterMs: 2_500,
+      hedgeAdaptive: true,
+      resendOnLostReply: true,
+      sameEntryFallback: true,
+      transportResends: 2,
+    });
+    expect(config.kps?.claimLane).toBe(true);
+    expect(config.kps?.standby).toBe(true);
+    expect(config.kps?.discovery?.firstCheckDeferMs).toBe(15_000);
+  });
+
   it("retries transient connect failures with back-off and never signals failure for them", async () => {
     const { harness, configs } = setup({
       failures: [{ code: "KPS_UNAVAILABLE" }, { code: "TRANSPORT_FAILED" }, { code: "TOPOLOGY_FETCH_FAILED" }],

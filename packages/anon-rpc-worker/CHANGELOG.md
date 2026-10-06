@@ -2,6 +2,19 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
+## Unreleased
+
+Every 0.2.0 config stays valid. Works against entries on nox 0.4.0-rc.6 and on nodes with claim protocol v2.
+
+### Added
+
+- Config `hedgeAfterMs` (default 3,000, 0 turns it off): resendable reads send a second copy on another route at
+  about the observed p95 reply time; the first reply wins.
+- The client runs with the low-latency settings: binary, retaining, long-polling claims where the entry supports
+  them; concurrent claims with data blocks first; immediate resend on a lost reply; two transport-failure resends;
+  same-entry resends for a single bridge; claims on their own KPS connection; a standby entry kept connected.
+- Wallet calls first: the first registry check waits for the first call to settle (at most 15 s).
+
 ## 0.2.0 (2026-10-06)
 
 Built on `@hisoka-io/nox-client` 0.6.0 (`kps.discovery`). Every 0.1.0 config stays valid.

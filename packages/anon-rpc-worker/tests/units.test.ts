@@ -32,11 +32,12 @@ describe("config", () => {
     const raw = JSON.parse(
       '{"v":1,"gateways":["' + kpsAddressFor(2) + '"],"logLevel":"warn","attemptTimeoutMs":5000,' +
         '"callDeadlineMs":20000,"maxConcurrentCalls":8,"maxRequestBytes":2048,"maxResponseBytes":100000,' +
-        '"surbFormat":"v2","claimIntervalMs":100,"bootRetryMaxMs":10000,"topologySources":3,"warmup":true}',
+        '"surbFormat":"v2","claimIntervalMs":100,"bootRetryMaxMs":10000,"topologySources":3,"warmup":true,' +
+        '"hedgeAfterMs":0}',
     ) as Record<string, unknown>;
     const snapshot = JSON.stringify(raw);
     const config = parseConfig(raw);
-    expect(config).toMatchObject({ gateways: [kpsAddressFor(2)], logLevel: "warn", surbFormat: "v2", warmup: true, topologySources: 3 });
+    expect(config).toMatchObject({ gateways: [kpsAddressFor(2)], logLevel: "warn", surbFormat: "v2", warmup: true, topologySources: 3, hedgeAfterMs: 0 });
     expect(Object.isFrozen(config)).toBe(true);
     expect(JSON.stringify(raw)).toBe(snapshot);
   });
@@ -52,6 +53,8 @@ describe("config", () => {
     ["log level", { logLevel: "trace" }, /logLevel/u],
     ["surb format", { surbFormat: "v3" }, /surbFormat/u],
     ["warmup", { warmup: "yes" }, /warmup/u],
+    ["hedge above range", { hedgeAfterMs: 60_001 }, /hedgeAfterMs must be an integer in 0\.\.60000/u],
+    ["hedge negative", { hedgeAfterMs: -1 }, /hedgeAfterMs/u],
     ["gateways empty", { gateways: [] }, /gateways must be a list of 1\.\.16/u],
     ["gateway malformed", { gateways: ["1.2.3.4:15005"] }, /not a KPS address/u],
     ["gateway repeated", { gateways: [kpsAddressFor(1), kpsAddressFor(1)] }, /repeats/u],
