@@ -30,7 +30,24 @@ given.
 `0xc4c54384…7b5f`) as the WorkerSpecifier deployments on Ethereum mainnet behind the passthrough, tor-js and Nym
 workers; `test/ReferenceBytecode.t.sol` keeps it that way.
 
-The address of the Nox worker's specifier and its update policy are listed here once the worker is published.
+## Deployments
+
+| Worker | Chain | Specifier | Contract | Deployment |
+|---|---|---|---|---|
+| `@hisoka-io/anon-rpc-worker` 0.2.0, `workerHash` `0x0a58f9915f686950072a4786249d396ecbf2194a39ac835effe8ea1a7c76f324` | Ethereum Sepolia (11155111) | [`0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6`](https://sepolia.etherscan.io/address/0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6) | `ImmutableWorkerSpecifier`, source verified on Sourcify (exact match) | tx [`0x5e5c7cb6…aa30e`](https://sepolia.etherscan.io/tx/0x5e5c7cb6ef38efc6ad5a0683f31036558ca7c8893f80bb1b0e0e985fd17aa30e), block 11,852,795, 1,032,240 gas |
+
+The specifier is immutable: a new worker version ships as a new specifier at a new address. Its resolvers, in order:
+
+1. `kps:100.56.0.72:15005:uEiBVDwIs40bsslDkM-BYb2AOHw3PHe70_bj5U_09r7vdIQ/keccak/0a/58f9…f324` (nox-1)
+2. `kps:3.232.137.146:15005:uEiDGVPDwsQ96ri9T5WLR6jZov_9LW-gRAgs-DN9FyKuHuw/keccak/0a/58f9…f324` (nox-2)
+3. `kps:18.215.18.61:15005:uEiCStd3rfGTo0ts0lSUw5f22u93O3PLCZVWWQIv_MXHm7w/keccak/0a/58f9…f324` (nox-8)
+4. `https://raw.githubusercontent.com/hisoka-io/anon-rpc/keccak/0a/58f9…f324`
+5. `https://cdn.jsdelivr.net/npm/@hisoka-io/anon-rpc-worker@0.2.0/dist/anon-rpc-worker.js`
+6. `https://unpkg.com/@hisoka-io/anon-rpc-worker@0.2.0/dist/anon-rpc-worker.js`
+
+Each served the exact bytes (keccak256 = `workerHash`) when the specifier was deployed: the three `kps:` entries over
+QUIC and WebRTC, the three `https:` entries through the harness's `fetchAndVerifyBundle`
+(`pnpm inspect -- --rpc-url <sepolia rpc> 0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6 --fetch`).
 
 ## Requirements
 
