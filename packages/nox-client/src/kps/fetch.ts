@@ -26,6 +26,9 @@ export function kpsTransportSettingsFrom(options: KpsModeOptions): KpsTransportS
   if (options.keepaliveMs !== undefined) overrides.keepaliveMs = options.keepaliveMs;
   if (options.maxHeadBytes !== undefined) overrides.maxHeadBytes = options.maxHeadBytes;
   if (options.maxBodyBytes !== undefined) overrides.maxBodyBytes = options.maxBodyBytes;
+  if (options.writeChunkBytes !== undefined) overrides.writeChunkBytes = options.writeChunkBytes;
+  if (options.warmupBytes !== undefined) overrides.warmupBytes = options.warmupBytes;
+  if (options.warmupMaxBytesPerMinute !== undefined) overrides.warmupMaxBytesPerMinute = options.warmupMaxBytesPerMinute;
   return resolveKpsTransportSettings(overrides);
 }
 

@@ -80,7 +80,7 @@ describe("worker on the real SDK in KPS mode", () => {
       ["Content-Type", "application/json"],
       ["X-Trace", "a"],
       ["x-trace", "b"],
-      ["accept-encoding", "identity"],
+      ["accept-encoding", "gzip"],
     ]);
     expect(ambientFetch).not.toHaveBeenCalled();
   });

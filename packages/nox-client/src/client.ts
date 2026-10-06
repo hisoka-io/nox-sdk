@@ -271,6 +271,7 @@ interface ResolvedKpsOptions {
   readonly clockSkewToleranceSeconds: number;
   readonly claimLane: boolean;
   readonly standby: boolean;
+  readonly spreadCalls: boolean;
 }
 
 /** Live KPS mode state. */
@@ -281,6 +282,8 @@ interface KpsState {
   members: RelayerNode[];
   /** Unsubscribes the connection-close listener (standby failover). */
   unlisten: (() => void) | undefined;
+  /** Entry URL of the current standby, when one is chosen. */
+  standbyEntry: string | undefined;
   /** Consecutive transport failures on the pinned entry. */
   pinnedEntryFailures: number;
   /** Base membership: eligible floor members, or the last chain-verified set. */
@@ -380,6 +383,8 @@ export class NoxClient {
   private _resendPolicy: ResendPolicy | undefined;
   private _latency: LatencyTracker | undefined;
   private _hedgesInFlight = 0;
+  /** Packet uploads not yet accepted, per entry URL (see `_leastBusyWarmEntry`). */
+  private readonly _uploadsInFlight = new Map<string, number>();
   /** Resolves once the first wallet (non-background) call settles. */
   private _firstCall: { done: boolean; waiters: (() => void)[] } = { done: false, waiters: [] };
 
@@ -551,6 +556,7 @@ export class NoxClient {
         transport,
         members: working.members,
         unlisten: undefined,
+        standbyEntry: undefined,
         pinnedEntryFailures: 0,
         membership,
         anchorMembers,
@@ -1391,8 +1397,9 @@ export class NoxClient {
    */
   private _startStandby(): void {
     const kps = this._kps;
-    if (kps === undefined || !kps.options.standby) return;
+    if (kps === undefined) return;
     this._refreshStandby();
+    if (!kps.options.standby) return;
     kps.unlisten = kps.transport.onConnectionClosed((address, lane) => {
       if (lane !== "primary" || this._kps !== kps || this.topologyTimer === null) return;
       if (address === kpsAddressOfEntry(this._entryUrl)) this._failOverFromClosedEntry();
@@ -1423,11 +1430,19 @@ export class NoxClient {
       .map(({ node }) => node);
   }
 
-  /** Retain the pinned entry and its standby; dial the standby in the background when it is down. */
+  /**
+   * Retain the pinned entry and its standby and warm their send windows;
+   * dial the standby in the background when it is down. Without `standby`,
+   * only the pinned entry is warmed.
+   */
   private _refreshStandby(): void {
     const kps = this._kps;
-    if (kps === undefined || !kps.options.standby) return;
+    if (kps === undefined) return;
     const pinned = kpsAddressOfEntry(this._entryUrl);
+    if (!kps.options.standby) {
+      kps.transport.warmUp(pinned === null ? [] : [pinned]);
+      return;
+    }
     // With gateways or bridges set, a standby is never dialled outside them.
     const userAnchors = kps.options.discovery?.userAnchors;
     const standby = this._rankedOtherEntries().find((node) => {
@@ -1435,7 +1450,10 @@ export class NoxClient {
       return address !== null && (userAnchors === undefined || userAnchors.has(address) || kps.transport.isConnected(address));
     });
     const standbyAddress = standby === undefined ? null : kpsAddressOfEntry(standby.address);
-    kps.transport.retain([pinned, standbyAddress].filter((address): address is string => address !== null));
+    kps.standbyEntry = standby?.address;
+    const kept = [pinned, standbyAddress].filter((address): address is string => address !== null);
+    kps.transport.retain(kept);
+    kps.transport.warmUp(kept);
     if (standbyAddress !== null && !kps.transport.isConnected(standbyAddress)) kps.transport.prewarm(standbyAddress);
   }
 
@@ -1519,7 +1537,7 @@ export class NoxClient {
     if (mode === "v2") return this._planStrictV2(selectedExit, avoid, undefined);
     const route = selectRoute(
       this._nodes,
-      entryOverride ?? this._pinnedEntry(),
+      entryOverride ?? this._leastBusyWarmEntry(avoid),
       selectedExit,
       avoid,
       this._entryRule(),
@@ -1571,6 +1589,28 @@ export class NoxClient {
       );
     }
     return { route, version: 2 };
+  }
+
+  /**
+   * KPS `spreadCalls` (with `standby`): the pinned entry, unless it is
+   * uploading more packets than the connected standby; then the standby.
+   * Each entry has its own connection and send window, so a burst of calls
+   * uploads in parallel instead of queueing in one window. A single call,
+   * and each host batch (one packet), still takes the pinned entry.
+   */
+  private _leastBusyWarmEntry(avoid: ReadonlySet<string>): TopologyNode | undefined {
+    const pinned = this._pinnedEntry();
+    const kps = this._kps;
+    if (kps === undefined || !kps.options.standby || !kps.options.spreadCalls || pinned === undefined) return pinned;
+    const standbyUrl = kps.standbyEntry;
+    if (standbyUrl === undefined || standbyUrl === pinned.address) return pinned;
+    const standby = this._nodes.find((node) => node.address === standbyUrl);
+    const standbyAddress = kpsAddressOfEntry(standbyUrl);
+    if (standby === undefined || standbyAddress === null || avoid.has(standby.id) || !kps.transport.isConnected(standbyAddress)) {
+      return pinned;
+    }
+    const busy = (url: string): number => this._uploadsInFlight.get(url) ?? 0;
+    return busy(standbyUrl) < busy(pinned.address) ? standby : pinned;
   }
 
   /** Resend plan after a v2 timeout: v2 again, through a different entry. */
@@ -1728,12 +1768,17 @@ export class NoxClient {
       return responsePromise;
     }
 
+    this._uploadsInFlight.set(entryUrl, (this._uploadsInFlight.get(entryUrl) ?? 0) + 1);
     const sendAll = Promise.all(
       packets.map((pkt) => postPacket(entryUrl, pkt, undefined, this.fetch)),
     );
-    sendAll.then(() => {
+    void sendAll.then(() => {
       timing.uploadedAt = Date.now();
-    }, noop);
+    }, noop).finally(() => {
+      const left = (this._uploadsInFlight.get(entryUrl) ?? 1) - 1;
+      if (left <= 0) this._uploadsInFlight.delete(entryUrl);
+      else this._uploadsInFlight.set(entryUrl, left);
+    });
     sendAll.catch((err: unknown) => {
       const req = this.pending.get(requestId);
       if (req !== undefined) {
@@ -1825,7 +1870,14 @@ export class NoxClient {
     const address = kpsAddressOfEntry(entryUrl);
     const kps = this._kps;
     if (address === null || kps === undefined) return 0;
-    const metadata = await fetchRelayMetadata(address, kps.options.exchangeTimeoutMs, this.fetch);
+    let metadata: Record<string, unknown>;
+    try {
+      metadata = await fetchRelayMetadata(address, kps.options.exchangeTimeoutMs, this.fetch);
+    } catch (error) {
+      // A relay without the document has no claim-v2; anything else is retried by the scheduler.
+      if ((error as { cause?: { status?: unknown } }).cause?.status === 404) return 0;
+      throw error;
+    }
     const capabilities = metadata["capabilities"];
     const limits = metadata["limits"] as Record<string, unknown> | undefined;
     const waitMax = limits?.["claimWaitMaxMs"];
@@ -2655,6 +2707,7 @@ export class NoxClient {
         this._kps.pinnedEntryFailures = 0;
       }
       this._entryUrl = pickEntryUrl(nodes, this._entryRule());
+      if (this._kps !== undefined) this._refreshStandby();
       // Reconnect WS to new entry node; requests sent through the old one keep being claimed there.
       if (this.responseWs !== null) {
         this.responseWs.close();
@@ -3248,6 +3301,10 @@ const KPS_OPTION_KEYS = new Set([
   "clockSkewToleranceSeconds",
   "claimLane",
   "standby",
+  "spreadCalls",
+  "writeChunkBytes",
+  "warmupBytes",
+  "warmupMaxBytesPerMinute",
 ]);
 
 /** `mode`, and the classic/KPS field split (ARCHITECTURE §3.9). */
@@ -3370,6 +3427,7 @@ function resolveKpsOptions(config: NoxClientConfig): ResolvedKpsOptions {
     claimIntervalMs: boundedInteger(options.claimIntervalMs, KPS_CLIENT_DEFAULTS.claimIntervalMs, 1, 60_000, "kps.claimIntervalMs"),
     claimLane: optionalBoolean(options.claimLane, false, "kps.claimLane"),
     standby: optionalBoolean(options.standby, false, "kps.standby"),
+    spreadCalls: optionalBoolean(options.spreadCalls, true, "kps.spreadCalls"),
     clockSkewToleranceSeconds: boundedInteger(
       options.clockSkewToleranceSeconds,
       KPS_CLIENT_DEFAULTS.clockSkewToleranceSeconds,
@@ -3655,7 +3713,9 @@ async function fetchRelayMetadata(address: string, timeoutMs: number, fetchImpl:
   try {
     const response = await fetchImpl(`kps:${address}/metadata.json`, { signal: controller.signal });
     if (!response.ok) {
-      throw new NoxClientError(`relay metadata answered HTTP ${response.status}`, NoxClientErrorCode.TopologyFetchFailed);
+      throw new NoxClientError(`relay metadata answered HTTP ${response.status}`, NoxClientErrorCode.TopologyFetchFailed, {
+        status: response.status,
+      });
     }
     text = await response.text();
   } catch (error) {

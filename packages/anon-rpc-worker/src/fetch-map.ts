@@ -32,6 +32,24 @@ export interface FetchSettings {
   readonly attemptTimeoutMs: number;
   readonly maxRequestBytes: number;
   readonly maxResponseBytes: number;
+  /**
+   * `accept-encoding` sent upstream. Default: `gzip` where the runtime has
+   * `DecompressionStream`, else `identity`.
+   */
+  readonly acceptEncoding?: ReplyEncoding;
+}
+
+/** Reply encodings the worker can ask upstreams for. */
+export type ReplyEncoding = "gzip" | "identity";
+
+/**
+ * `gzip` when this runtime can inflate replies itself. Exits pass bodies
+ * through as the upstream sent them (their HTTP client has no decompression),
+ * so a gzip reply crosses the mixnet compressed: a 414 KB `eth_getLogs` reply
+ * takes about 2 reply packets instead of 14.
+ */
+export function defaultReplyEncoding(): ReplyEncoding {
+  return typeof DecompressionStream === "function" ? "gzip" : "identity";
 }
 
 /** A validated request, ready for the mixnet. */
@@ -74,7 +92,7 @@ const CROSS_ORIGIN_DROPPED_HEADERS = new Set(["authorization", "cookie"]);
  * Request headers never forwarded: the exit drops `host` and `user-agent`
  * itself, framing and hop-by-hop fields belong to the exit's own connection,
  * and cookies, origin and referer would tie calls together or to a page.
- * `accept-encoding` is replaced (see `FORCED_REQUEST_HEADERS`).
+ * `accept-encoding` is replaced (see `defaultReplyEncoding`).
  */
 const DROPPED_REQUEST_HEADERS = new Set([
   "host",
@@ -93,8 +111,8 @@ const DROPPED_REQUEST_HEADERS = new Set([
   "accept-encoding",
 ]);
 
-/** The exit's HTTP client has no decompression, so bodies must come back as sent. */
-const FORCED_REQUEST_HEADERS: readonly [string, string][] = [["accept-encoding", "identity"]];
+/** Content codings the worker inflates. */
+const GZIP_CODINGS: ReadonlySet<string> = new Set(["gzip", "x-gzip"]);
 
 /** Response fields that describe the exit's hop, or that a worker must not hand on. */
 const DROPPED_RESPONSE_HEADERS = new Set([
@@ -126,7 +144,7 @@ export async function prepareRequest(
   if (redirect !== "follow" && redirect !== "manual" && redirect !== "error") {
     throw callError(CALL_CODES.unsupported, 'redirect must be "follow", "manual" or "error"');
   }
-  const headers = prepareHeaders(init?.headers);
+  const headers = prepareHeaders(init?.headers, settings.acceptEncoding ?? defaultReplyEncoding());
   const body = await readBody(init?.body, settings.maxRequestBytes, signal);
   if ((method === "GET" || method === "HEAD") && body.length > 0) {
     throw callError(CALL_CODES.unsupported, `A ${method} request cannot carry a body`);
@@ -180,7 +198,7 @@ export async function sendPrepared(
     const reply = await exchange(current, port, settings, budget);
     checkStatus(reply);
     if (!REDIRECT_STATUSES.has(reply.status) || current.redirect === "manual") {
-      return toAnonResponse(reply, current, settings);
+      return finishResponse(reply, current, settings);
     }
     if (current.redirect === "error") {
       throw callError(
@@ -190,9 +208,9 @@ export async function sendPrepared(
     }
     const location = reply.headers.find(([name]) => name.toLowerCase() === "location")?.[1];
     // fetch returns a redirect status without a Location as an ordinary response.
-    if (location === undefined) return toAnonResponse(reply, current, settings);
+    if (location === undefined) return finishResponse(reply, current, settings);
     const next = redirectedRequest(current, reply.status, location);
-    if (next === null) return toAnonResponse(reply, current, settings);
+    if (next === null) return finishResponse(reply, current, settings);
     if (hop + 1 > MAX_REDIRECT_HOPS) {
       throw callError(CALL_CODES.networkError, `Too many redirects: more than ${MAX_REDIRECT_HOPS} hops`);
     }
@@ -290,6 +308,67 @@ function checkStatus(reply: DecodedHttpResponse): void {
   }
 }
 
+/** Inflate a gzip reply (see `inflateReply`), then map it with `toAnonResponse`. */
+export async function finishResponse(
+  reply: DecodedHttpResponse,
+  request: Pick<PreparedRequest, "url">,
+  settings: Pick<FetchSettings, "maxResponseBytes">,
+): Promise<AnonFetchResponse> {
+  checkStatus(reply);
+  if (reply.truncated) {
+    throw callError(CALL_CODES.tooLarge, "The exit cut the response body at its response size limit");
+  }
+  return toAnonResponse(await inflateReply(reply, settings.maxResponseBytes), request, settings);
+}
+
+/**
+ * The reply with a `gzip` body inflated and its `content-encoding` removed;
+ * any other reply unchanged. Inflation stops past `maxBytes` (`too-large`),
+ * so a small compressed reply cannot expand without bound; a corrupt body is
+ * a `protocol-error`.
+ */
+export async function inflateReply(reply: DecodedHttpResponse, maxBytes: number): Promise<DecodedHttpResponse> {
+  const coding = reply.headers.find(([name]) => name.toLowerCase() === "content-encoding")?.[1]?.trim().toLowerCase();
+  if (coding === undefined || !GZIP_CODINGS.has(coding)) return reply;
+  const headers = reply.headers.filter(([name]) => name.toLowerCase() !== "content-encoding");
+  if (reply.body.length === 0) return { ...reply, headers };
+  if (typeof DecompressionStream !== "function") {
+    throw callError(CALL_CODES.protocolError, "The upstream sent a gzip body and this runtime cannot inflate it");
+  }
+  const source = reply.body;
+  const inflated = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(source);
+      controller.close();
+    },
+  }).pipeThrough(new DecompressionStream("gzip") as unknown as ReadableWritablePair<Uint8Array, Uint8Array>);
+  const reader = inflated.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    let result: ReadableStreamReadResult<Uint8Array>;
+    try {
+      result = await reader.read();
+    } catch (error) {
+      throw callError(CALL_CODES.protocolError, "The upstream's gzip body is corrupt", error);
+    }
+    if (result.done) break;
+    total += result.value.length;
+    if (total > maxBytes) {
+      void reader.cancel().catch(() => undefined);
+      throw callError(CALL_CODES.tooLarge, `The response body inflates past ${maxBytes} bytes`);
+    }
+    chunks.push(result.value);
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return { ...reply, headers, body };
+}
+
 /** Map the exit's decoded reply to an `AnonFetchResponse`; `request.url` becomes `url`. */
 export function toAnonResponse(
   reply: DecodedHttpResponse,
@@ -312,7 +391,7 @@ export function toAnonResponse(
     if (lower === "content-encoding" && value.trim().toLowerCase() !== "identity") {
       throw callError(
         CALL_CODES.protocolError,
-        "The upstream sent an encoded body although the request asked for identity; exits cannot decode it",
+        `The upstream sent a ${value.trim()} body; this worker accepts identity and gzip`,
       );
     }
     if (DROPPED_RESPONSE_HEADERS.has(lower) || !TOKEN_RE.test(name) || !FIELD_VALUE_RE.test(value)) continue;
@@ -403,9 +482,9 @@ function normalizeMethod(method: unknown): string {
   return NORMALIZED_METHODS.has(upper) ? upper : method;
 }
 
-/** Keep order and duplicates (the wire type is a list), drop and force per policy. */
-function prepareHeaders(list: HeaderList | undefined): [string, string][] {
-  if (list === undefined) return FORCED_REQUEST_HEADERS.map(([name, value]): [string, string] => [name, value]);
+/** Keep order and duplicates (the wire type is a list), drop per policy, then set `accept-encoding`. */
+function prepareHeaders(list: HeaderList | undefined, encoding: ReplyEncoding): [string, string][] {
+  if (list === undefined) return [["accept-encoding", encoding]];
   if (!Array.isArray(list)) throw callError(CALL_CODES.unsupported, "headers must be a list of [name, value] pairs");
   const out: [string, string][] = [];
   let bytes = 0;
@@ -427,7 +506,7 @@ function prepareHeaders(list: HeaderList | undefined): [string, string][] {
     }
     out.push([name, value]);
   }
-  for (const [name, value] of FORCED_REQUEST_HEADERS) out.push([name, value]);
+  out.push(["accept-encoding", encoding]);
   return out;
 }
 

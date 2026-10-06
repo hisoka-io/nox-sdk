@@ -27,6 +27,12 @@ nox 0.4.0-rc.6 (claim protocol v1) and on nodes with claim protocol v2 alike.
 - `kps.discovery.firstCheckDeferMs`: the first chain check waits for the first wallet call (bounded).
 - Logs: `claim.failed`, `claim.recovered`, `claim.mode`, `reply.lost`, `call.resend`, `entry.failover`, and
   `request.timing` (info: upload, wait, claim, download and decode durations of each request).
+- KPS send path: `kps.writeChunkBytes` (packets written as about eight sends of four SCTP packets), a send-window
+  warm-up per pinned-entry and standby connection (`kps.warmupBytes`, `kps.warmupMaxBytesPerMinute`,
+  `KpsHttpTransport.warmUp`), and `kps.spreadCalls` (concurrent calls over the pinned and standby entries).
+- `replyClaims.firstArrival`: on entries that hold long-polls, a request claims its data block and its replica
+  together and takes whichever arrives first.
+- A failed relay capability probe is retried with backoff (`claim.probe.retry`).
 
 ### Changed
 

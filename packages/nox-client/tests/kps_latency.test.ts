@@ -287,6 +287,102 @@ describe("request timing", () => {
   });
 });
 
+describe("first-arrival claims", () => {
+  it("long-polls the data block and its replica together on a v2 entry, so a lost data item costs no parity wait", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    t.mixnet.relayClaimV2 = true;
+    t.mixnet.claimWaitMaxMs = 2_000;
+    t.mixnet.parity = true;
+    const client = await connect(t.config({ replyClaims: { waitMs: 2_000, parityFallbackMs: 2_000 } }));
+    await get(client, "/warm", { minSurbs: 2, expectedResponseBytes: 1_000 });
+    t.mixnet.dropData = true;
+    t.mixnet.replyDelayMs = 100;
+    t.mixnet.claimLog.length = 0;
+    const started = Date.now();
+    expect(body(await get(client, "/", { minSurbs: 2, expectedResponseBytes: 1_000, retry: "none" }))).toBe(OK_BODY);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    const first = t.mixnet.claimLog.find((claim) => claim.ids.length > 0);
+    expect(first?.ids).toHaveLength(2);
+    expect(Number(first?.body["wait_ms"])).toBeGreaterThan(0);
+    // The block that was not needed is acked on a later claim.
+    await vi.waitFor(() => {
+      const acked = new Set(t.mixnet.claimLog.flatMap((claim) => claim.ack));
+      expect(first!.ids.every((id) => acked.has(id))).toBe(true);
+    });
+  });
+
+  it("keeps data-first on entries that do not hold claims (v1, or a relay without claim-v2)", async () => {
+    for (const relay of [false, true]) {
+      const t = bed();
+      t.mixnet.claimProtocol = relay ? "v2" : "v1";
+      t.mixnet.parity = true;
+      const client = await connect(t.config({ replyClaims: { waitMs: 2_000 } }));
+      await get(client, "/1", { minSurbs: 2, expectedResponseBytes: 1_000 });
+      t.mixnet.claimLog.length = 0;
+      await get(client, "/2", { minSurbs: 2, expectedResponseBytes: 1_000 });
+      expect(Math.max(...t.mixnet.claimLog.map((claim) => claim.ids.length))).toBe(1);
+    }
+  });
+
+  it("can be turned off with replyClaims.firstArrival", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    t.mixnet.relayClaimV2 = true;
+    t.mixnet.parity = true;
+    const client = await connect(t.config({ replyClaims: { waitMs: 2_000, firstArrival: false } }));
+    await get(client, "/1", { minSurbs: 2, expectedResponseBytes: 1_000 });
+    t.mixnet.claimLog.length = 0;
+    await get(client, "/2", { minSurbs: 2, expectedResponseBytes: 1_000 });
+    expect(Math.max(...t.mixnet.claimLog.map((claim) => claim.ids.length))).toBe(1);
+  });
+});
+
+describe("relay capability probe", () => {
+  it("retries a failed /metadata.json probe instead of polling for the rest of the session", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    t.mixnet.relayClaimV2 = true;
+    t.mixnet.claimWaitMaxMs = 1_500;
+    let metadataRequests = 0;
+    t.network.route(undefined, (request) => {
+      if (request.path === "/metadata.json") {
+        metadataRequests += 1;
+        if (metadataRequests === 1) return { status: 503, body: "busy" };
+      }
+      return t.mixnet.handler(request);
+    });
+    const client = await connect(t.config({ replyClaims: { waitMs: 2_000 } }));
+    await get(client, "/1");
+    expect(events(t.logs, "claim.probe.retry")).toHaveLength(1);
+    await new Promise((resolve) => setTimeout(resolve, 5_200));
+    await get(client, "/2");
+    t.mixnet.claimLog.length = 0;
+    await get(client, "/3");
+    expect(metadataRequests).toBe(2);
+    expect(t.mixnet.claimLog.some((claim) => Number(claim.body["wait_ms"] ?? 0) > 0)).toBe(true);
+  }, 15_000);
+
+  it("treats a relay without /metadata.json as one without claim-v2 (no retries)", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    let metadataRequests = 0;
+    t.network.route(undefined, (request) => {
+      if (request.path === "/metadata.json") {
+        metadataRequests += 1;
+        return { status: 404, body: "not found" };
+      }
+      return t.mixnet.handler(request);
+    });
+    const client = await connect(t.config({ replyClaims: { waitMs: 2_000 } }));
+    await get(client, "/1");
+    await get(client, "/2");
+    expect(metadataRequests).toBe(1);
+    expect(events(t.logs, "claim.probe.retry")).toHaveLength(0);
+    expect(t.mixnet.claimLog.every((claim) => claim.body["wait_ms"] === undefined)).toBe(true);
+  });
+});
+
 describe("data-first claims", () => {
   it("claims only the data block while the reply is on time; parity stays unclaimed", async () => {
     const t = bed();
@@ -338,7 +434,7 @@ describe("concurrent calls", () => {
     let open = 0;
     let peak = 0;
     t.network.route(entryAddress, async (request) => {
-      if (request.path !== "/api/v1/responses/claim") return t.mixnet.handler(request);
+      if (request.path !== "/api/v1/responses/claim" || isWarmupClaim(request.body)) return t.mixnet.handler(request);
       open += 1;
       peak = Math.max(peak, open);
       await new Promise((resolve) => setTimeout(resolve, 30));
@@ -359,7 +455,7 @@ describe("claim size per entry protocol", () => {
     let open = 0;
     let peak = 0;
     t.network.route(entryAddress, async (request) => {
-      if (request.path !== "/api/v1/responses/claim") return t.mixnet.handler(request);
+      if (request.path !== "/api/v1/responses/claim" || isWarmupClaim(request.body)) return t.mixnet.handler(request);
       open += 1;
       peak = Math.max(peak, open);
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -566,3 +662,49 @@ describe("connections", () => {
     expect(t.network.dials.filter((address) => address === other)).toHaveLength(dialsBefore);
   });
 });
+
+describe("spreading calls over warm entries", () => {
+  async function slowUploads(spreadCalls: boolean | undefined) {
+    const t = bed();
+    const kps: Record<string, unknown> = { standby: true, entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 };
+    if (spreadCalls !== undefined) kps["spreadCalls"] = spreadCalls;
+    const client = await connect(t.config({}, kps));
+    const first = client.entryUrl.slice("kps:".length);
+    const other = first === kpsAddressFor(1) ? kpsAddressFor(2) : kpsAddressFor(1);
+    await vi.waitFor(() => expect(t.network.connections.some((conn) => conn.address === other && conn.open)).toBe(true));
+    t.network.route(undefined, async (request) => {
+      if (request.path === "/api/v1/packets") await new Promise((resolve) => setTimeout(resolve, 60));
+      return t.mixnet.handler(request);
+    });
+    await Promise.all([1, 2, 3, 4].map((i) => get(client, `/${i}`, { retry: "none" })));
+    return { t, first, other };
+  }
+
+  it("sends concurrent calls through the standby while the pinned entry is uploading", async () => {
+    const { t, first, other } = await slowUploads(undefined);
+    expect(t.mixnet.packetsByAddress.get(first)).toBe(2);
+    expect(t.mixnet.packetsByAddress.get(other)).toBe(2);
+  });
+
+  it("keeps every call on the pinned entry with spreadCalls false", async () => {
+    const { t, first, other } = await slowUploads(false);
+    expect(t.mixnet.packetsByAddress.get(first)).toBe(4);
+    expect(t.mixnet.packetsByAddress.get(other) ?? 0).toBe(0);
+  });
+
+  it("keeps a lone call on the pinned entry", async () => {
+    const t = bed();
+    const client = await connect(
+      t.config({}, { standby: true, entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 }),
+    );
+    const first = client.entryUrl.slice("kps:".length);
+    for (const path of ["/1", "/2", "/3"]) await get(client, path);
+    expect(t.mixnet.packetsByAddress.get(first)).toBe(3);
+  });
+});
+
+/** The transport's send-window warm-up pads claims that name no reply; they are not scheduler claims. */
+function isWarmupClaim(body: Uint8Array): boolean {
+  const text = new TextDecoder().decode(body);
+  return body.length >= 1_000 && /^\{"surb_ids":\[\]\}\s*$/u.test(text);
+}

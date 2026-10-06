@@ -14,6 +14,17 @@ Every 0.2.0 config stays valid. Works against entries on nox 0.4.0-rc.6 and on n
   them; concurrent claims with data blocks first; immediate resend on a lost reply; two transport-failure resends;
   same-entry resends for a single bridge; a standby entry kept connected (claims share the primary connection).
 - Wallet calls first: the first registry check waits for the first call to settle (at most 15 s).
+- Compressed replies: upstream requests carry `accept-encoding: gzip` where the runtime has `DecompressionStream`,
+  and the worker inflates gzip bodies itself, capped at `maxResponseBytes`. A 414 KB `eth_getLogs` reply crosses the
+  mixnet as about 41 KB (2 reply packets instead of 14), a full block of 490 KB as about 81 KB (3 instead of 16).
+- Worker-local answers: `eth_chainId` and `net_version` per upstream URL once a second, independently routed
+  request agrees. Reads addressed by block hash (`eth_getBlockByHash`, `eth_getBlockReceipts`, `eth_getLogs`
+  with `blockHash`, EIP-1898 `{blockHash}` state reads, kept once two calls returned the same result) are behind
+  the `LocalAnswers` option `blockHashReads`, off in the worker until answers are checked against the hash. A hit answers at
+  once with the caller's JSON-RPC `id` and sends nothing. `Cache-Control: no-cache` or `no-store` skips it. An
+  empty log or receipt list is always fetched again, since an upstream behind the chain head answers `[]`.
+- The client's send-path settings: chunked packet writes, a send-window warm-up after each entry connection
+  opens, and concurrent calls spread over the pinned and standby entries.
 
 ## 0.2.0 (2026-10-06)
 

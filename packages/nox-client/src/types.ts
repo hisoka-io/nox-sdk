@@ -322,6 +322,19 @@ export interface KpsModeOptions {
   maxHeadBytes?: number;
   /** Largest accepted response body. Default 16 MiB. */
   maxBodyBytes?: number;
+  /**
+   * Largest single stream write; a 32 KB packet goes out as writes of this
+   * size so a warm browser send window carries it in one flight. Default 4,600.
+   */
+  writeChunkBytes?: number;
+  /**
+   * Send-window warm-up per pinned-entry or standby connection, in bytes
+   * (0 = off): a few paced padding rounds right after the connection opens,
+   * stopped by any real exchange. Default 96,000 (once per connection).
+   */
+  warmupBytes?: number;
+  /** Ceiling on warm-up bytes across all connections in any 60 s window. Default 400,000. */
+  warmupMaxBytesPerMinute?: number;
   /** Clock skew tolerated on served topology timestamps. Default 600 s. */
   clockSkewToleranceSeconds?: number;
   /**
@@ -337,6 +350,13 @@ export interface KpsModeOptions {
    * connection closes, so a redial is not on a call's path. Default false.
    */
   standby?: boolean;
+  /**
+   * With `standby`: send a call through the standby entry when the pinned
+   * entry is uploading more packets than the standby, so a burst of calls
+   * uses two send windows. Each call (and each host batch) is still one
+   * packet through one entry. Default true.
+   */
+  spreadCalls?: boolean;
 }
 
 /** Reply claim tuning (`NoxClientConfig.replyClaims`). */
@@ -372,6 +392,13 @@ export interface ReplyClaimSettings {
   readonly parityFallbackMs: number;
   /** After a failed claim, how long a request may stay without a reply before it is reported lost. Default 1.5 s. */
   readonly lostReplyGraceMs: number;
+  /**
+   * Where the entry speaks claim v2 and holds long-polls, claim a request's
+   * first two reply blocks at once (a one-fragment reply and its parity
+   * replica), so the held claim answers with whichever reaches the entry
+   * first; the other is acked. Default true.
+   */
+  readonly firstArrival: boolean;
 }
 
 /**
