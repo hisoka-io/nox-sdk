@@ -160,7 +160,7 @@ describe("worker-local answers in the worker", () => {
     expect(client.requests).toHaveLength(2);
     const local = await chainId(7);
     expect(client.requests).toHaveLength(2);
-    const body = await new Response(local.body as BodyInit).json();
+    const body = await new Response(local.body as ConstructorParameters<typeof Response>[0]).json();
     expect(body).toEqual({ jsonrpc: "2.0", id: 7, result: "0xaa36a7" });
   });
 });

@@ -254,7 +254,6 @@ describe("response mapping", () => {
 });
 
 describe("gzip replies", () => {
-  const request = { url: "https://rpc.test/" };
   const budget = { signal: new AbortController().signal, remainingMs: () => 25_000 };
   const logs = encoder.encode(JSON.stringify({
     jsonrpc: "2.0",
