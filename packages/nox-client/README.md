@@ -302,8 +302,9 @@ block, and its parity blocks only after `parityFallbackMs` or after a claim carr
 |---|---|---|
 | `intervalMs` | `kps.claimIntervalMs` (200) / 200 | How often IDs not in flight are claimed |
 | `claimTimeoutMs`, `claimTimeoutPerIdMs` | 10,000, 2,500 | Bound on one claim: base plus per further ID, plus the wait |
-| `maxIdsPerClaim` | 4 / 128 | Bounds one claim response to that many replies |
+| `maxIdsPerClaim` | 4 / 128 | Bounds one claim response to that many replies (entries that answered claim protocol v2) |
 | `maxClaimsInFlight` | 4 | Claims open at once per entry |
+| `jsonMaxIdsPerClaim`, `jsonMaxClaimsInFlight` | 1, 2 / 128, 4 | The same limits for entries that answer v1 JSON (about 115 KB per reply) or have not answered yet |
 | `waitMs` | 4,000 / 0 | Long-poll hold asked of v2 entries: over KPS only when the relay's `/metadata.json` lists `claim-v2` (capped by its `limits.claimWaitMaxMs`), directly once the entry sent `x-nox-claim-wait-max-ms` (capped by it) |
 | `binary`, `retain` | true, true | Ask for the binary batch; keep replies re-claimable until acked |
 | `parityFallbackMs` | 2,000 | When parity blocks are claimed too |

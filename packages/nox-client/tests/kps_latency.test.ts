@@ -306,7 +306,7 @@ describe("concurrent calls", () => {
   it("keeps at most replyClaims.maxClaimsInFlight claims open per entry", async () => {
     const t = bed();
     t.mixnet.replyDelayMs = 200;
-    const client = await connect(t.config({ replyClaims: { maxClaimsInFlight: 2, maxIdsPerClaim: 1 } }));
+    const client = await connect(t.config({ replyClaims: { jsonMaxClaimsInFlight: 2, jsonMaxIdsPerClaim: 1 } }));
     const entryAddress = client.entryUrl.slice("kps:".length);
     let open = 0;
     let peak = 0;
@@ -320,6 +320,39 @@ describe("concurrent calls", () => {
     });
     await Promise.all([1, 2, 3, 4].map((i) => get(client, `/${i}`, { retry: "none" })));
     expect(peak).toBeLessThanOrEqual(2);
+  });
+});
+
+describe("claim size per entry protocol", () => {
+  it("v1 entry: one ID per claim and at most two claims in flight (115 KB JSON replies)", async () => {
+    const t = bed();
+    t.mixnet.replyDelayMs = 150;
+    const client = await connect(t.config());
+    const entryAddress = client.entryUrl.slice("kps:".length);
+    let open = 0;
+    let peak = 0;
+    t.network.route(entryAddress, async (request) => {
+      if (request.path !== "/api/v1/responses/claim") return t.mixnet.handler(request);
+      open += 1;
+      peak = Math.max(peak, open);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      open -= 1;
+      return t.mixnet.handler(request);
+    });
+    await Promise.all([1, 2, 3, 4, 5].map((i) => get(client, `/${i}`, { retry: "none" })));
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(Math.max(...t.mixnet.claimLog.map((claim) => claim.ids.length))).toBe(1);
+  });
+
+  it("v2 entry: batches IDs once the entry answered v2", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    t.mixnet.replyDelayMs = 150;
+    const client = await connect(t.config());
+    await get(client, "/warm");
+    t.mixnet.claimLog.length = 0;
+    await Promise.all([1, 2, 3, 4, 5].map((i) => get(client, `/${i}`, { retry: "none" })));
+    expect(Math.max(...t.mixnet.claimLog.map((claim) => claim.ids.length))).toBeGreaterThan(1);
   });
 });
 

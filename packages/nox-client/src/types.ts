@@ -351,6 +351,14 @@ export interface ReplyClaimSettings {
   readonly maxIdsPerClaim: number;
   /** Claims in flight at once per entry. Default 4. */
   readonly maxClaimsInFlight: number;
+  /**
+   * `maxIdsPerClaim` for entries that answer v1 JSON (or have not answered
+   * yet): a JSON reply is about 115 KB, so one per claim keeps each transfer
+   * short. Default 1 (KPS) / 128 (classic).
+   */
+  readonly jsonMaxIdsPerClaim: number;
+  /** `maxClaimsInFlight` for entries that answer v1 JSON (or have not answered yet). Default 2 (KPS) / 4 (classic). */
+  readonly jsonMaxClaimsInFlight: number;
   /** Long-poll hold asked of the entry (`wait_ms`); 0 = answer at once. Default 4 s in KPS mode, 0 in classic mode. */
   readonly waitMs: number;
   /** Ask for the binary claim batch (JSON answers are read either way). Default true. */

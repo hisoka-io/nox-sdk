@@ -44,6 +44,8 @@ export const REPLY_CLAIM_DEFAULTS: Readonly<ReplyClaimSettings> = Object.freeze(
   claimTimeoutPerIdMs: 2_500,
   maxIdsPerClaim: 4,
   maxClaimsInFlight: 4,
+  jsonMaxIdsPerClaim: 1,
+  jsonMaxClaimsInFlight: 2,
   waitMs: 4_000,
   binary: true,
   retain: true,
@@ -62,6 +64,8 @@ export const CLASSIC_REPLY_CLAIM_DEFAULTS: Readonly<ReplyClaimSettings> = Object
   ...REPLY_CLAIM_DEFAULTS,
   waitMs: 0,
   maxIdsPerClaim: 128,
+  jsonMaxIdsPerClaim: 128,
+  jsonMaxClaimsInFlight: 4,
 });
 
 /** A 204 that came back after at least this share of `waitMs` means the entry held the claim. */
@@ -265,7 +269,8 @@ export class ReplyClaimScheduler {
 
   private claimFrom(entryUrl: string, targets: Target[], now: number): void {
     const state = this.entryState(entryUrl);
-    const free = this.settings.maxClaimsInFlight - state.claims;
+    const { maxIds, maxClaims } = this.limits(state);
+    const free = maxClaims - state.claims;
     if (free <= 0) return;
     targets.sort((left, right) => left.sentAt - right.sentAt);
     const start = state.cursor % targets.length;
@@ -275,7 +280,7 @@ export class ReplyClaimScheduler {
     let current: { ids: string[]; requests: Set<bigint> } = { ids: [], requests: new Set() };
     for (const target of ordered) {
       for (const id of this.wantedIds(target, state.inFlight, now)) {
-        if (current.ids.length >= this.settings.maxIdsPerClaim) {
+        if (current.ids.length >= maxIds) {
           batches.push(current);
           if (batches.length >= free) break;
           current = { ids: [], requests: new Set() };
@@ -287,6 +292,19 @@ export class ReplyClaimScheduler {
     }
     if (current.ids.length > 0 && batches.length < free) batches.push(current);
     for (const batch of batches) void this.claim(entryUrl, state, batch.ids, batch.requests);
+  }
+
+  /**
+   * Claim size and concurrency for an entry: the v2 limits once it answered
+   * claim protocol v2 (binary replies are about 32 KB), the JSON limits
+   * before that (a v1 JSON reply is about 115 KB, and a v1 entry deletes a
+   * reply as it sends it, so a long transfer that fails loses it).
+   */
+  private limits(state: EntryState): { maxIds: number; maxClaims: number } {
+    const settings = this.settings;
+    return state.v2 === true
+      ? { maxIds: settings.maxIdsPerClaim, maxClaims: settings.maxClaimsInFlight }
+      : { maxIds: settings.jsonMaxIdsPerClaim, maxClaims: settings.jsonMaxClaimsInFlight };
   }
 
   /** Ask the host once per entry how long a wait the path relays. */
@@ -342,7 +360,7 @@ export class ReplyClaimScheduler {
   private flushAcks(claimedThisTick: ReadonlyMap<string, unknown>): void {
     for (const [entryUrl, state] of this.entries) {
       if (state.acks.size === 0 || state.v2 !== true || claimedThisTick.has(entryUrl)) continue;
-      if (state.claims >= this.settings.maxClaimsInFlight) continue;
+      if (state.claims >= this.limits(state).maxClaims) continue;
       void this.claim(entryUrl, state, [], new Set());
     }
   }

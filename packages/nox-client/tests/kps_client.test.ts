@@ -479,10 +479,13 @@ describe("KPS mode background work", () => {
     expect(claimed.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("claims at most replyClaims.maxIdsPerClaim IDs per exchange and covers larger sets across claims", async () => {
+  it("claims at most replyClaims.jsonMaxIdsPerClaim IDs per exchange from a v1 entry and covers larger sets", async () => {
     const t = bed();
     const client = await connect(
-      t.config({ replyClaims: { maxIdsPerClaim: KPS_CLAIM_MAX_SURB_IDS, parityFallbackMs: 1 } }, { claimIntervalMs: 10 }),
+      t.config(
+        { replyClaims: { jsonMaxIdsPerClaim: KPS_CLAIM_MAX_SURB_IDS, parityFallbackMs: 1 } },
+        { claimIntervalMs: 10 },
+      ),
     );
     const entryAddress = client.entryUrl.slice("kps:".length);
     const claimed: string[][] = [];
