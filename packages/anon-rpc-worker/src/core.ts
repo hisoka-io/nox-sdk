@@ -42,7 +42,15 @@ import {
   type BootRetryCode,
   type FailedCode,
 } from "./errors.js";
-import { mapClientError, prepareRequest, sendPrepared, type CallBudget, type NoxHttpPort } from "./fetch-map.js";
+import {
+  mapClientError,
+  prepareRequest,
+  sendPrepared,
+  type CallBudget,
+  type NoxHttpPort,
+  type PreparedRequest,
+} from "./fetch-map.js";
+import { LocalAnswers } from "./local-answers.js";
 import { createLogger, describeError, errorCode, type LogLevel, type WorkerLogger } from "./log.js";
 import {
   LearnedCacheWriter,
@@ -150,6 +158,7 @@ class NoxWorker {
   private cacheTimer: ReturnType<typeof setInterval> | undefined;
   private learnedWriter: LearnedCacheWriter | undefined;
   private callSeq = 0;
+  private readonly answers = new LocalAnswers();
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -460,8 +469,20 @@ class NoxWorker {
     const budget = new CallControl(call.requestInit?.signal, cfg.callDeadlineMs, this.now);
     try {
       const prepared = await prepareRequest(call.url, call.requestInit, cfg, budget.signal);
+      const local = this.answers.lookup(prepared);
+      if (local !== undefined) {
+        this.log.debug("call.done", {
+          seq,
+          jsonrpcMethod: prepared.profile.method ?? null,
+          ms: this.now() - started,
+          outcome: "ok",
+          local: local.kind,
+        });
+        return local.response;
+      }
       const client = await this.waitReady(budget.signal);
       const response = await sendPrepared(prepared, client, cfg, budget);
+      if (this.answers.observe(prepared, response) === "verify") this.verifyAnswer(prepared, client, cfg);
       if (this.log.enabled("debug")) {
         this.log.debug("call.done", {
           seq,
@@ -481,6 +502,25 @@ class NoxWorker {
     } finally {
       budget.dispose();
     }
+  }
+
+  /**
+   * Send a memo call (`eth_chainId`, `net_version`) once more through the
+   * mixnet on a fresh route, in the background; the answer is kept only when
+   * both agree (see `LocalAnswers`).
+   */
+  private verifyAnswer(prepared: PreparedRequest, client: NoxClientPort, cfg: NoxWorkerConfig): void {
+    const budget = new CallControl(undefined, cfg.callDeadlineMs, this.now);
+    sendPrepared(prepared, client, cfg, budget)
+      .then(
+        (response) => {
+          this.answers.observe(prepared, response);
+        },
+        (error: unknown) => {
+          this.log.debug("local.verify.failed", { code: errorCode(mapClientError(error)) ?? "error" });
+        },
+      )
+      .finally(() => budget.dispose());
   }
 
   private waitReady(signal: AbortSignal): Promise<NoxClientPort> {
