@@ -151,9 +151,11 @@ Nodes may serve fresher topology over KPS. The worker uses it for liveness and r
 nodes agree, keeping at least two members per route layer) and for moved routing addresses two nodes agree on;
 additions and confirmed locations come from the chain check.
 
-The committed snapshot records the fleet before the nodes publish their KPS addresses; with the default anchors it
-boots anyway. A release snapshot taken after the migration lets older clients find more entries without any chain
-read, and passes the release gate against the chain through two RPC providers.
+The committed release snapshot is of block 316207920 (finalized, read and re-verified byte for byte through two RPC
+providers of different organisations). It carries the KPS addresses nox-1, nox-2 and nox-8 publish, so the worker
+finds its entries from the snapshot alone, and the default anchors and the chain check add any later moves.
+The release gate names the seven mix and exit nodes, which serve the mixnet without a KPS listener, with
+`--allow-missing-kps`.
 
 ```bash
 pnpm --filter @hisoka-io/nox-client build
@@ -178,7 +180,9 @@ a pinned `wasm-opt` on `PATH`.
 
 `scripts/verify-reproducible.sh` builds a commit twice from clean `git archive` exports in fresh containers
 of the pinned images, at two different paths, and compares the WASM, bundle and provenance digests
-(`--local` does the same with the host's tools).
+(`--local` does the same with the host's tools). `--native` adds a third build with the host's tools to the two
+container builds and requires all three to match; `--local --bwrap` runs the two host builds in bubblewrap mount
+namespaces at the container paths, for hosts without a container runtime.
 
 For a test bed, `node scripts/build.mjs --snapshot <file>` embeds another canonical snapshot (for example a
 local mesh); the provenance records which snapshot a bundle carries.
