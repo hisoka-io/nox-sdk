@@ -1836,7 +1836,14 @@ export class NoxClient {
     const address = kpsAddressOfEntry(entryUrl);
     const kps = this._kps;
     if (address === null || kps === undefined) return 0;
-    const metadata = await fetchRelayMetadata(address, kps.options.exchangeTimeoutMs, this.fetch);
+    let metadata: Record<string, unknown>;
+    try {
+      metadata = await fetchRelayMetadata(address, kps.options.exchangeTimeoutMs, this.fetch);
+    } catch (error) {
+      // A relay without the document has no claim-v2; anything else is retried by the scheduler.
+      if ((error as { cause?: { status?: unknown } }).cause?.status === 404) return 0;
+      throw error;
+    }
     const capabilities = metadata["capabilities"];
     const limits = metadata["limits"] as Record<string, unknown> | undefined;
     const waitMax = limits?.["claimWaitMaxMs"];
@@ -3667,7 +3674,9 @@ async function fetchRelayMetadata(address: string, timeoutMs: number, fetchImpl:
   try {
     const response = await fetchImpl(`kps:${address}/metadata.json`, { signal: controller.signal });
     if (!response.ok) {
-      throw new NoxClientError(`relay metadata answered HTTP ${response.status}`, NoxClientErrorCode.TopologyFetchFailed);
+      throw new NoxClientError(`relay metadata answered HTTP ${response.status}`, NoxClientErrorCode.TopologyFetchFailed, {
+        status: response.status,
+      });
     }
     text = await response.text();
   } catch (error) {

@@ -385,6 +385,13 @@ export interface ReplyClaimSettings {
   readonly parityFallbackMs: number;
   /** After a failed claim, how long a request may stay without a reply before it is reported lost. Default 1.5 s. */
   readonly lostReplyGraceMs: number;
+  /**
+   * Where the entry speaks claim v2 and holds long-polls, claim a request's
+   * first two reply blocks at once (a one-fragment reply and its parity
+   * replica), so the held claim answers with whichever reaches the entry
+   * first; the other is acked. Default true.
+   */
+  readonly firstArrival: boolean;
 }
 
 /**

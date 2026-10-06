@@ -53,6 +53,7 @@ export const REPLY_CLAIM_DEFAULTS: Readonly<ReplyClaimSettings> = Object.freeze(
   retain: true,
   parityFallbackMs: 2_000,
   lostReplyGraceMs: 1_500,
+  firstArrival: true,
 });
 
 /** Acks held per entry before the oldest are dropped (the entry's grace frees unacked replies anyway). */
@@ -69,6 +70,13 @@ export const CLASSIC_REPLY_CLAIM_DEFAULTS: Readonly<ReplyClaimSettings> = Object
   jsonMaxIdsPerClaim: 128,
   jsonMaxClaimsInFlight: 4,
 });
+
+/** First retry of a failed relay capability probe; doubles per failure up to the maximum. */
+export const PROBE_RETRY_BASE_MS = 5_000;
+export const PROBE_RETRY_MAX_MS = 60_000;
+
+/** Reply blocks claimed from the front at once under `firstArrival` (a single-fragment reply and its replica). */
+const FIRST_ARRIVAL_BLOCKS = 2;
 
 /** A 204 that came back after at least this share of `waitMs` means the entry held the claim. */
 const LONG_POLL_HELD_SHARE = 0.75;
@@ -136,6 +144,9 @@ interface EntryState {
   relayWaitMaxMs: number | undefined;
   /** A capability probe is running. */
   probing: boolean;
+  /** Failed capability probes in a row, and when the next may run. */
+  probeFailures: number;
+  probeRetryAt: number;
   /** SURB IDs to ack on the next claim (v2 entries only). */
   readonly acks: Set<string>;
 }
@@ -257,6 +268,8 @@ export class ReplyClaimScheduler {
         waitMaxMs: undefined,
         relayWaitMaxMs: undefined,
         probing: false,
+        probeFailures: 0,
+        probeRetryAt: 0,
         acks: new Set(),
       };
       this.probe(entryUrl, state);
@@ -265,15 +278,18 @@ export class ReplyClaimScheduler {
     return state;
   }
 
-  private wantedIds(target: Target, inFlight: ReadonlySet<string>, now: number): string[] {
+  private wantedIds(target: Target, state: EntryState, now: number): string[] {
+    const inFlight = state.inFlight;
     const active = this.host.activeIds(target.requestId);
     const fallback = target.suspectSince !== undefined || now - target.sentAt >= this.settings.parityFallbackMs;
-    const deferred = fallback ? new Set<string>() : new Set(target.initialIds.slice(target.dataWanted));
+    const front = Math.max(target.dataWanted, this.firstArrivalFront(state));
+    const deferred = fallback ? new Set<string>() : new Set(target.initialIds.slice(front));
     return active.filter((id) => !deferred.has(id) && !inFlight.has(id));
   }
 
   private claimFrom(entryUrl: string, targets: Target[], now: number): void {
     const state = this.entryState(entryUrl);
+    this.reprobe(entryUrl, state, now);
     const { maxIds, maxClaims } = this.limits(state);
     const free = maxClaims - state.claims;
     if (free <= 0) return;
@@ -284,7 +300,7 @@ export class ReplyClaimScheduler {
     const batches: { ids: string[]; requests: Set<bigint> }[] = [];
     let current: { ids: string[]; requests: Set<bigint> } = { ids: [], requests: new Set() };
     for (const target of ordered) {
-      for (const id of this.wantedIds(target, state.inFlight, now)) {
+      for (const id of this.wantedIds(target, state, now)) {
         if (current.ids.length >= maxIds) {
           batches.push(current);
           if (batches.length >= free) break;
@@ -312,7 +328,24 @@ export class ReplyClaimScheduler {
       : { maxIds: settings.jsonMaxIdsPerClaim, maxClaims: settings.jsonMaxClaimsInFlight };
   }
 
-  /** Ask the host once per entry how long a wait the path relays. */
+  /**
+   * Blocks claimed from the front of a request before its first fragment
+   * names the shard count. Where the entry speaks v2 and holds long-polls,
+   * the first two: a one-fragment reply travels as a data item and a parity
+   * replica over independent mix delays, and the held claim answers with
+   * whichever reaches the entry first (the other is acked once the request
+   * settles). Elsewhere one, so a polling entry never sends both.
+   */
+  private firstArrivalFront(state: EntryState): number {
+    if (!this.settings.firstArrival || state.v2 !== true || state.longPoll === false) return 1;
+    return this.waitFor(state, true) > 0 ? FIRST_ARRIVAL_BLOCKS : 1;
+  }
+
+  /**
+   * Ask the host how long a wait the path relays. A probe that fails (the
+   * capability document did not arrive) is retried later with backoff, so
+   * one lost exchange does not turn long-poll off for the session.
+   */
   private probe(entryUrl: string, state: EntryState): void {
     const probe = this.host.probeWaitMaxMs;
     if (probe === undefined || this.settings.waitMs === 0 || !this.settings.retain) return;
@@ -320,13 +353,27 @@ export class ReplyClaimScheduler {
     probe.call(this.host, entryUrl).then(
       (ms) => {
         state.relayWaitMaxMs = Number.isSafeInteger(ms) && ms > 0 ? ms : 0;
+        state.probeFailures = 0;
       },
       () => {
-        state.relayWaitMaxMs = 0;
+        state.probeFailures += 1;
+        state.probeRetryAt = this.now() +
+          Math.min(PROBE_RETRY_BASE_MS * 2 ** Math.min(state.probeFailures - 1, 16), PROBE_RETRY_MAX_MS);
+        emit(this.host.log, "info", "claim.probe.retry", {
+          entry: this.host.label(entryUrl),
+          failures: state.probeFailures,
+          retryInMs: state.probeRetryAt - this.now(),
+        });
       },
     ).finally(() => {
       state.probing = false;
     });
+  }
+
+  /** Run a failed probe again once its backoff has passed. */
+  private reprobe(entryUrl: string, state: EntryState, now: number): void {
+    if (state.relayWaitMaxMs !== undefined || state.probing || state.probeFailures === 0 || now < state.probeRetryAt) return;
+    this.probe(entryUrl, state);
   }
 
   /**
@@ -335,10 +382,10 @@ export class ReplyClaimScheduler {
    * newly tracked request is claimed at once even while other requests' held
    * claims wait out their replies.
    */
-  private waitFor(state: EntryState): number {
+  private waitFor(state: EntryState, ignoreSlots = false): number {
     const settings = this.settings;
     if (settings.waitMs === 0 || !settings.retain) return 0;
-    if (state.waiting >= Math.max(1, this.limits(state).maxClaims - 1)) return 0;
+    if (!ignoreSlots && state.waiting >= Math.max(1, this.limits(state).maxClaims - 1)) return 0;
     const relay = this.host.probeWaitMaxMs === undefined ? state.waitMaxMs : state.relayWaitMaxMs;
     if (relay === undefined || relay <= 0) return 0;
     return Math.min(settings.waitMs, relay, state.waitMaxMs ?? relay);
@@ -512,7 +559,7 @@ export function resolveReplyClaimSettings(
       throw new NoxClientError(`${key} is not a reply claim setting`, NoxClientErrorCode.InvalidConfig);
     }
     if (value === undefined) continue;
-    if (key === "binary" || key === "retain") {
+    if (key === "binary" || key === "retain" || key === "firstArrival") {
       if (typeof value !== "boolean") {
         throw new NoxClientError(`replyClaims.${key} must be a boolean`, NoxClientErrorCode.InvalidConfig);
       }

@@ -287,6 +287,102 @@ describe("request timing", () => {
   });
 });
 
+describe("first-arrival claims", () => {
+  it("long-polls the data block and its replica together on a v2 entry, so a lost data item costs no parity wait", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    t.mixnet.relayClaimV2 = true;
+    t.mixnet.claimWaitMaxMs = 2_000;
+    t.mixnet.parity = true;
+    const client = await connect(t.config({ replyClaims: { waitMs: 2_000, parityFallbackMs: 2_000 } }));
+    await get(client, "/warm", { minSurbs: 2, expectedResponseBytes: 1_000 });
+    t.mixnet.dropData = true;
+    t.mixnet.replyDelayMs = 100;
+    t.mixnet.claimLog.length = 0;
+    const started = Date.now();
+    expect(body(await get(client, "/", { minSurbs: 2, expectedResponseBytes: 1_000, retry: "none" }))).toBe(OK_BODY);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    const first = t.mixnet.claimLog.find((claim) => claim.ids.length > 0);
+    expect(first?.ids).toHaveLength(2);
+    expect(Number(first?.body["wait_ms"])).toBeGreaterThan(0);
+    // The block that was not needed is acked on a later claim.
+    await vi.waitFor(() => {
+      const acked = new Set(t.mixnet.claimLog.flatMap((claim) => claim.ack));
+      expect(first!.ids.every((id) => acked.has(id))).toBe(true);
+    });
+  });
+
+  it("keeps data-first on entries that do not hold claims (v1, or a relay without claim-v2)", async () => {
+    for (const relay of [false, true]) {
+      const t = bed();
+      t.mixnet.claimProtocol = relay ? "v2" : "v1";
+      t.mixnet.parity = true;
+      const client = await connect(t.config({ replyClaims: { waitMs: 2_000 } }));
+      await get(client, "/1", { minSurbs: 2, expectedResponseBytes: 1_000 });
+      t.mixnet.claimLog.length = 0;
+      await get(client, "/2", { minSurbs: 2, expectedResponseBytes: 1_000 });
+      expect(Math.max(...t.mixnet.claimLog.map((claim) => claim.ids.length))).toBe(1);
+    }
+  });
+
+  it("can be turned off with replyClaims.firstArrival", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    t.mixnet.relayClaimV2 = true;
+    t.mixnet.parity = true;
+    const client = await connect(t.config({ replyClaims: { waitMs: 2_000, firstArrival: false } }));
+    await get(client, "/1", { minSurbs: 2, expectedResponseBytes: 1_000 });
+    t.mixnet.claimLog.length = 0;
+    await get(client, "/2", { minSurbs: 2, expectedResponseBytes: 1_000 });
+    expect(Math.max(...t.mixnet.claimLog.map((claim) => claim.ids.length))).toBe(1);
+  });
+});
+
+describe("relay capability probe", () => {
+  it("retries a failed /metadata.json probe instead of polling for the rest of the session", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    t.mixnet.relayClaimV2 = true;
+    t.mixnet.claimWaitMaxMs = 1_500;
+    let metadataRequests = 0;
+    t.network.route(undefined, (request) => {
+      if (request.path === "/metadata.json") {
+        metadataRequests += 1;
+        if (metadataRequests === 1) return { status: 503, body: "busy" };
+      }
+      return t.mixnet.handler(request);
+    });
+    const client = await connect(t.config({ replyClaims: { waitMs: 2_000 } }));
+    await get(client, "/1");
+    expect(events(t.logs, "claim.probe.retry")).toHaveLength(1);
+    await new Promise((resolve) => setTimeout(resolve, 5_200));
+    await get(client, "/2");
+    t.mixnet.claimLog.length = 0;
+    await get(client, "/3");
+    expect(metadataRequests).toBe(2);
+    expect(t.mixnet.claimLog.some((claim) => Number(claim.body["wait_ms"] ?? 0) > 0)).toBe(true);
+  }, 15_000);
+
+  it("treats a relay without /metadata.json as one without claim-v2 (no retries)", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    let metadataRequests = 0;
+    t.network.route(undefined, (request) => {
+      if (request.path === "/metadata.json") {
+        metadataRequests += 1;
+        return { status: 404, body: "not found" };
+      }
+      return t.mixnet.handler(request);
+    });
+    const client = await connect(t.config({ replyClaims: { waitMs: 2_000 } }));
+    await get(client, "/1");
+    await get(client, "/2");
+    expect(metadataRequests).toBe(1);
+    expect(events(t.logs, "claim.probe.retry")).toHaveLength(0);
+    expect(t.mixnet.claimLog.every((claim) => claim.body["wait_ms"] === undefined)).toBe(true);
+  });
+});
+
 describe("data-first claims", () => {
   it("claims only the data block while the reply is on time; parity stays unclaimed", async () => {
     const t = bed();
