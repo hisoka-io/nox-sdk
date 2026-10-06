@@ -67,9 +67,6 @@ importers:
       ethers:
         specifier: 6.16.0
         version: 6.16.0
-      js-sha3:
-        specifier: ^0.9.3
-        version: 0.9.3
     devDependencies:
       '@types/node':
         specifier: ^20.0.0
@@ -721,9 +718,6 @@ packages:
   joycon@3.1.1:
     resolution: {integrity: sha512-34wB/Y7MW7bzjKRjUKTa46I2Z7eV62Rkhva+KkopW7Qvv/OSWBqvkSY7vusOPrNuZcUG3tApvdVgNB8POj3SPw==}
     engines: {node: '>=10'}
-
-  js-sha3@0.9.3:
-    resolution: {integrity: sha512-BcJPCQeLg6WjEx3FE591wVAevlli8lxsxm9/FzV4HXkV49TmBH38Yvrpce6fjbADGMKFrBMGTqrVz3qPIZ88Gg==}
 
   js-tokens@9.0.1:
     resolution: {integrity: sha512-mxa9E9ITFOt0ban3j6L5MpjwegGz6lBQmM1IJkWeBZGcMxto50+eWdjC/52xDbS2vy0k7vIMK0Fe2wfL9OQSpQ==}
@@ -1559,8 +1553,6 @@ snapshots:
     optional: true
 
   joycon@3.1.1: {}
-
-  js-sha3@0.9.3: {}
 
   js-tokens@9.0.1: {}
 

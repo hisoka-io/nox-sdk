@@ -27,8 +27,7 @@
   },
   "dependencies": {
     "@hisoka-io/nox-wasm": "workspace:*",
-    "ethers": "6.16.0",
-    "js-sha3": "^0.9.3"
+    "ethers": "6.16.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
