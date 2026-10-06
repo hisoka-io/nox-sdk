@@ -106,7 +106,8 @@ describe("make-snapshot.mjs", () => {
     expect(code).toBe(0);
     expect(readFileSync(out, "utf8")).toBe(committedText);
     expect(readFileSync(`${out}.keccak256`, "utf8")).toBe(readFileSync(`${SNAPSHOT_PATH}.keccak256`, "utf8"));
-    expect(stdout()).toContain("members      10 (10 eligible for routing, 0 with a KPS endpoint)");
+    const withKps = committed.members.filter((member) => member.metadataUrl.startsWith("kps:")).length;
+    expect(stdout()).toContain(`members      10 (10 eligible for routing, ${withKps} with a KPS endpoint)`);
     expect(stdout()).toContain("(all agree)");
   });
 
@@ -138,7 +139,9 @@ describe("make-snapshot.mjs", () => {
     await makeSnapshot(["--rpc", chain.url, "--block", String(committed.blockNumber), "--out", out]);
     const snapshot = JSON.parse(readFileSync(out, "utf8")) as NoxAnonRpcSnapshot;
     expect(snapshot.members[0]?.metadataUrl).toBe(first.metadataUrl);
-    expect(stdout()).toContain("1 with a KPS endpoint");
+    // Members 0 and 1 are overridden above; every other committed member keeps its published address.
+    const othersWithKps = committed.members.slice(2).filter((member) => member.metadataUrl.startsWith("kps:")).length;
+    expect(stdout()).toContain(`${othersWithKps + 1} with a KPS endpoint`);
     expect(stdout()).toContain(`no KPS endpoint: ${second.address} (metadataUrl starts with "kps:" but certhash must be`);
     expect(stdout()).not.toContain(`no KPS endpoint: ${first.address}`);
   });
