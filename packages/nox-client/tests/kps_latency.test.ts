@@ -232,6 +232,33 @@ describe("claims over KPS against v1 and v2 entries", () => {
     expect(events(t.logs, "claim.relay")[0]?.fields).toMatchObject({ claimV2: true, waitMaxMs: 1_500 });
   });
 
+  it("keeps one claim slot free of long-polls: held claims for lost replies never delay a new call", async () => {
+    const t = bed();
+    t.mixnet.claimProtocol = "v2";
+    t.mixnet.relayClaimV2 = true;
+    t.mixnet.claimWaitMaxMs = 3_000;
+    let calls = 0;
+    // Calls 2 and 3 lose their reply in the mixnet; the others answer.
+    t.mixnet.exit = () => {
+      calls += 1;
+      return calls === 2 || calls === 3 ? null : encodeExitHttpResponse(200, [], OK_BODY);
+    };
+    const client = await connect(t.config(
+      { timeoutMs: 4_000, replyClaims: { waitMs: 3_000, maxClaimsInFlight: 2, maxIdsPerClaim: 1 } },
+    ));
+    await get(client, "/warm");
+    const lost = [get(client, "/lost-1", { retry: "none" }), get(client, "/lost-2", { retry: "none" })];
+    for (const call of lost) call.catch(() => undefined);
+    await vi.waitFor(() => expect(calls).toBe(3));
+    await vi.waitFor(() => {
+      expect(t.mixnet.claimLog.some((claim) => Number(claim.body["wait_ms"] ?? 0) > 0)).toBe(true);
+    });
+    const started = Date.now();
+    expect(body(await get(client, "/fresh", { retry: "none" }))).toBe(OK_BODY);
+    expect(Date.now() - started).toBeLessThan(1_500);
+    await Promise.allSettled(lost);
+  });
+
   it("never asks a relay without claim-v2 (rc.6 nox-kps) to hold a claim", async () => {
     const t = bed();
     t.mixnet.claimProtocol = "v2";

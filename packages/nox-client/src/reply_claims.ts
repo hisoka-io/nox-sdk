@@ -19,7 +19,9 @@
  *   `/metadata.json` lists `claim-v2` with `limits.claimWaitMaxMs` above 0
  *   (an older relay would hold a general upstream slot and time out at 10 s),
  *   directly once the entry answered with `x-nox-claim-wait-max-ms`. The
- *   wait is capped by both. Elsewhere the tick keeps polling.
+ *   wait is capped by both. Elsewhere the tick keeps polling. At most
+ *   `maxClaims - 1` claims per entry long-poll at once, so a held claim for
+ *   a slow or lost reply never keeps a new request's claim waiting.
  * - Lost replies: a claim that fails after it was sent may have taken replies
  *   with it (v1 entries delete on claim). Its IDs, parity included, are
  *   claimed again at once (v2 entries return the same replies); a request
@@ -120,6 +122,8 @@ interface Target {
 interface EntryState {
   readonly inFlight: Set<string>;
   claims: number;
+  /** Claims in flight that asked the entry to hold them (long-poll). */
+  waiting: number;
   /** Rotation start over targets, so a large request cannot starve the others. */
   cursor: number;
   /** Whether the entry held a claim open (long-poll), once observed. */
@@ -246,6 +250,7 @@ export class ReplyClaimScheduler {
       state = {
         inFlight: new Set(),
         claims: 0,
+        waiting: 0,
         cursor: 0,
         longPoll: undefined,
         v2: undefined,
@@ -324,10 +329,16 @@ export class ReplyClaimScheduler {
     });
   }
 
-  /** Long-poll hold for the next claim to this entry (0 until the path is known to relay it). */
+  /**
+   * Long-poll hold for the next claim to this entry (0 until the path is
+   * known to relay it). One claim slot always stays free of long-polls, so a
+   * newly tracked request is claimed at once even while other requests' held
+   * claims wait out their replies.
+   */
   private waitFor(state: EntryState): number {
     const settings = this.settings;
     if (settings.waitMs === 0 || !settings.retain) return 0;
+    if (state.waiting >= Math.max(1, this.limits(state).maxClaims - 1)) return 0;
     const relay = this.host.probeWaitMaxMs === undefined ? state.waitMaxMs : state.relayWaitMaxMs;
     if (relay === undefined || relay <= 0) return 0;
     return Math.min(settings.waitMs, relay, state.waitMaxMs ?? relay);
@@ -372,6 +383,7 @@ export class ReplyClaimScheduler {
     const acks = this.takeAcks(state);
     const started = this.now();
     const waitMs = ids.length === 0 ? 0 : this.waitFor(state);
+    if (waitMs > 0) state.waiting += 1;
     const timeoutMs = settings.claimTimeoutMs + waitMs + settings.claimTimeoutPerIdMs * Math.max(0, ids.length - 1);
     let items: ClaimedItem[] = [];
     let delivered: DeliveredClaim | undefined;
@@ -396,6 +408,7 @@ export class ReplyClaimScheduler {
     } finally {
       for (const id of ids) state.inFlight.delete(id);
       state.claims -= 1;
+      if (waitMs > 0) state.waiting -= 1;
     }
     if (this.closed || delivered === undefined) return;
     const received: string[] = [];

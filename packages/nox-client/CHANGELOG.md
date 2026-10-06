@@ -31,6 +31,7 @@ nox 0.4.0-rc.6 (claim protocol v1) and on nodes with claim protocol v2 alike.
 ### Changed
 
 - Claims are no longer single-flight per entry, and a request claims its data blocks before its parity blocks.
+- At most `maxClaimsInFlight - 1` claims per entry long-poll at once, so one claim slot stays free for new requests.
 - Registry reads of chain checks carry two reply blocks and are resent once on another route (same exit).
 - The KPS transport forwards `Accept` next to `Content-Type`.
 - `computeTopologyFingerprint` hashes with ethers' `keccak256` (same digest); `js-sha3` is no longer a dependency.
