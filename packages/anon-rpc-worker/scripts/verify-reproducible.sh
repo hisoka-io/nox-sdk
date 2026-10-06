@@ -21,9 +21,10 @@
 #                  --allow-unpinned is given, in which case only the two local
 #                  builds are compared.
 # --native         container mode: also build a third clean export with the
-#                  host's pinned tools (as --local does) and require all three
-#                  builds to match, so the canonical bytes do not depend on the
-#                  container images either.
+#                  host's pinned tools (as --local does) and require its WASM
+#                  and bundle to match the container builds, so the canonical
+#                  bytes do not depend on the container images either (its
+#                  provenance records the host toolchain and may differ).
 # --bwrap          local mode: run the two host builds inside bubblewrap mount
 #                  namespaces at the container paths (/src and
 #                  /work/second-build/nox-sdk), for hosts without docker.
@@ -237,10 +238,22 @@ for field in 0 1 2 3; do
   printf '\n'
 done
 
+# Every build must give the same WASM and bundle. The provenance records the
+# toolchain it ran with, so it is compared between the canonical (pinned) builds
+# only: the host build of --native may record another Node version.
 same=1
-for result in "${results[@]}"; do
-  [[ "$result" == "${results[0]}" ]] || same=0
+read -r -a first_fields <<<"${results[0]}"
+for index in "${!results[@]}"; do
+  read -r -a fields <<<"${results[$index]}"
+  for field in 0 1 2; do
+    [[ "${fields[$field]}" == "${first_fields[$field]}" ]] || same=0
+  done
+  if [[ "$index" -lt 2 && "${fields[3]}" != "${first_fields[3]}" ]]; then same=0; fi
 done
+if [[ "$native" -eq 1 && "$same" -eq 1 ]]; then
+  read -r -a host_fields <<<"${results[2]}"
+  [[ "${host_fields[3]}" == "${first_fields[3]}" ]] || echo "note: the host build's provenance differs from the container builds' (it records the host toolchain); WASM and bundle bytes match"
+fi
 if [[ "$same" -eq 1 ]]; then
   read -r -a first <<<"${results[0]}"
   echo "REPRODUCIBLE: all ${#results[@]} builds of $commit give worker keccak256 ${first[1]}"
