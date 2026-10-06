@@ -663,6 +663,46 @@ describe("connections", () => {
   });
 });
 
+describe("spreading calls over warm entries", () => {
+  async function slowUploads(spreadCalls: boolean | undefined) {
+    const t = bed();
+    const kps: Record<string, unknown> = { standby: true, entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 };
+    if (spreadCalls !== undefined) kps["spreadCalls"] = spreadCalls;
+    const client = await connect(t.config({}, kps));
+    const first = client.entryUrl.slice("kps:".length);
+    const other = first === kpsAddressFor(1) ? kpsAddressFor(2) : kpsAddressFor(1);
+    await vi.waitFor(() => expect(t.network.connections.some((conn) => conn.address === other && conn.open)).toBe(true));
+    t.network.route(undefined, async (request) => {
+      if (request.path === "/api/v1/packets") await new Promise((resolve) => setTimeout(resolve, 60));
+      return t.mixnet.handler(request);
+    });
+    await Promise.all([1, 2, 3, 4].map((i) => get(client, `/${i}`, { retry: "none" })));
+    return { t, first, other };
+  }
+
+  it("sends concurrent calls through the standby while the pinned entry is uploading", async () => {
+    const { t, first, other } = await slowUploads(undefined);
+    expect(t.mixnet.packetsByAddress.get(first)).toBe(2);
+    expect(t.mixnet.packetsByAddress.get(other)).toBe(2);
+  });
+
+  it("keeps every call on the pinned entry with spreadCalls false", async () => {
+    const { t, first, other } = await slowUploads(false);
+    expect(t.mixnet.packetsByAddress.get(first)).toBe(4);
+    expect(t.mixnet.packetsByAddress.get(other) ?? 0).toBe(0);
+  });
+
+  it("keeps a lone call on the pinned entry", async () => {
+    const t = bed();
+    const client = await connect(
+      t.config({}, { standby: true, entries: [kpsAddressFor(1), kpsAddressFor(2)], topologySources: 2 }),
+    );
+    const first = client.entryUrl.slice("kps:".length);
+    for (const path of ["/1", "/2", "/3"]) await get(client, path);
+    expect(t.mixnet.packetsByAddress.get(first)).toBe(3);
+  });
+});
+
 /** The transport's send-window warm-up pads claims that name no reply; they are not scheduler claims. */
 function isWarmupClaim(body: Uint8Array): boolean {
   const text = new TextDecoder().decode(body);

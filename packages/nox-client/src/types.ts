@@ -350,6 +350,13 @@ export interface KpsModeOptions {
    * connection closes, so a redial is not on a call's path. Default false.
    */
   standby?: boolean;
+  /**
+   * With `standby`: send a call through the standby entry when the pinned
+   * entry is uploading more packets than the standby, so a burst of calls
+   * uses two send windows. Each call (and each host batch) is still one
+   * packet through one entry. Default true.
+   */
+  spreadCalls?: boolean;
 }
 
 /** Reply claim tuning (`NoxClientConfig.replyClaims`). */
