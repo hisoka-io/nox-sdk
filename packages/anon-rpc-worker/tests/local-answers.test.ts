@@ -49,7 +49,7 @@ describe("LocalAnswers", () => {
   });
 
   it("never keeps an empty list for a block-hash read (the upstream may not have the block yet)", async () => {
-    const answers = new LocalAnswers();
+    const answers = new LocalAnswers({ blockHashReads: true });
     for (const body of [call("eth_getLogs", [{ blockHash: HASH }]), call("eth_getBlockReceipts", [HASH])]) {
       const request = await prepare(body);
       answers.observe(request, reply([]));
@@ -68,8 +68,16 @@ describe("LocalAnswers", () => {
     expect(answers.size).toBe(0);
   });
 
-  it("serves block-hash reads after two matching answers and never block-number reads", async () => {
+  it("keeps no block-hash reads unless blockHashReads is on", async () => {
     const answers = new LocalAnswers();
+    const request = await prepare(call("eth_getBlockByHash", [HASH, false]));
+    answers.observe(request, reply({ ok: 1 }));
+    answers.observe(request, reply({ ok: 1 }));
+    expect(answers.lookup(request)).toBeUndefined();
+  });
+
+  it("serves block-hash reads after two matching answers and never block-number reads", async () => {
+    const answers = new LocalAnswers({ blockHashReads: true });
     const cases = [
       call("eth_getBlockByHash", [HASH, false]),
       call("eth_getLogs", [{ blockHash: HASH, address: "0x" + "11".repeat(20) }]),
@@ -117,7 +125,7 @@ describe("LocalAnswers", () => {
   });
 
   it("bounds the number of answers held", async () => {
-    const answers = new LocalAnswers();
+    const answers = new LocalAnswers({ blockHashReads: true });
     for (let i = 0; i < LOCAL_ANSWER_MAX_ENTRIES + 10; i++) {
       const hash = "0x" + i.toString(16).padStart(64, "0");
       answers.observe(await prepare(call("eth_getBlockByHash", [hash, false])), reply({ i }));

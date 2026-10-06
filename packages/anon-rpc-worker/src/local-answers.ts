@@ -8,7 +8,9 @@
  * - `eth_chainId` and `net_version`: memoised once a second, independently
  *   routed request through the mixnet returned the same result (the worker
  *   sends that check in the background after the first answer).
- * - Reads addressed by block hash, whose result is fixed by the hash:
+ * - Only with `blockHashReads` (off by default, because an answer is not yet
+ *   checked against the block hash): reads addressed by block hash, whose
+ *   result is fixed by the hash:
  *   `eth_getBlockByHash`, `eth_getBlockReceipts`, `eth_getLogs` with a
  *   `blockHash` filter, the `…ByBlockHash…` lookups, and EIP-1898 state reads
  *   (`eth_call`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`,
@@ -81,13 +83,31 @@ interface Call {
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const encoder = new TextEncoder();
 
+/** Options for {@link LocalAnswers}. */
+export interface LocalAnswersOptions {
+  /** Also keep reads addressed by block hash (see above). Default false. */
+  readonly blockHashReads?: boolean;
+}
+
 export class LocalAnswers {
   private readonly entries = new Map<string, Entry>();
   private bytes = 0;
+  private readonly blockHashReads: boolean;
+
+  constructor(options: LocalAnswersOptions = {}) {
+    this.blockHashReads = options.blockHashReads ?? false;
+  }
+
+  /** The cacheable call in `request`, honouring the enabled kinds. */
+  private call(request: PreparedRequest): Call | undefined {
+    const call = cacheableCall(request);
+    if (call === undefined) return undefined;
+    return call.kind === "block-hash" && !this.blockHashReads ? undefined : call;
+  }
 
   /** The local answer for `request`, if one is confirmed. */
   lookup(request: PreparedRequest): { response: AnonFetchResponse; kind: LocalKind } | undefined {
-    const call = cacheableCall(request);
+    const call = this.call(request);
     if (call === undefined) return undefined;
     const entry = this.entries.get(call.key);
     if (entry === undefined || !this.served(entry)) return undefined;
@@ -106,7 +126,7 @@ export class LocalAnswers {
    * mixnet and passes that answer here too.
    */
   observe(request: PreparedRequest, response: AnonFetchResponse): "verify" | undefined {
-    const call = cacheableCall(request);
+    const call = this.call(request);
     if (call === undefined || response.status !== 200 || !(response.body instanceof Uint8Array)) return undefined;
     const result = resultOf(response.body);
     if (result === undefined || result.length > LOCAL_ANSWER_MAX_ENTRY_BYTES) return undefined;
