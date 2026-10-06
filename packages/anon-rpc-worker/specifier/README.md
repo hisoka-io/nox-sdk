@@ -83,8 +83,25 @@ pnpm --filter @hisoka-io/anon-rpc-specifier plan -- \
   --resolver "https://cdn.jsdelivr.net/npm/@hisoka-io/anon-rpc-worker@<version>/dist/<file>.js" \
   --resolver "kps:<ip>:<udp-port>:<certhash>/keccak/<hh>/<rest>" \
   [--variant immutable|reference|both] [--deployer 0x…] [--new-owner 0x…] [--rpc-url <read-only RPC>] \
-  [--check-resolvers]
+  [--resolver-order https-first|as-given] [--check-resolvers]
 ```
+
+### Resolver order for the next specifier
+
+Harnesses try resolvers in list order, so the first entry that answers sets boot time. The planner publishes
+`https:` resolvers first by default (`--resolver-order https-first`, a stable reorder: entries of one kind keep the
+order you gave), then `kps:` resolvers, which stay as the censorship-resistant fallback when every `https:` host is
+blocked. The resolver check warns when a `kps:` entry comes before an `https:` one, and the reference variant's
+planned `setWorker` uses the same order. `--resolver-order as-given` publishes the list exactly as passed.
+
+Measured from India on 2026-10-06 against the 0.2.0 specifier (`kps:` first): ready after 26.5-45.1 s, of which
+14-37 s was the ~0.9 MB bundle over one WebRTC data channel; with an `https:` resolver first, ready after
+7.8-8.5 s. The next specifier's resolvers, in the order the planner writes them:
+
+1. `https://raw.githubusercontent.com/hisoka-io/anon-rpc/keccak/<hh>/<rest>`
+2. `https://cdn.jsdelivr.net/npm/@hisoka-io/anon-rpc-worker@<version>/dist/anon-rpc-worker.js`
+3. `https://unpkg.com/@hisoka-io/anon-rpc-worker@<version>/dist/anon-rpc-worker.js`
+4. `kps:<nox-1 address>/keccak/<hh>/<rest>`, then nox-2 and nox-8 the same way
 
 The planner checks every resolver entry, reads fees and the latest block from the RPC (default
 `https://ethereum-rpc.publicnode.com`, or `MAINNET_RPC_URL`; the endpoint operator sees which specifier and deployer

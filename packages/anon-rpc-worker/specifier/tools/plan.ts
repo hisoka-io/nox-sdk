@@ -16,7 +16,7 @@ import {
   transferOwnershipCalldata,
 } from "./deployment.ts";
 import { MAX_BUNDLE_BYTES } from "./harness.ts";
-import { checkResolvers, type ResolverPolicy, type ResolverReport } from "./resolvers.ts";
+import { checkResolvers, orderResolvers, type ResolverPolicy, type ResolverReport } from "./resolvers.ts";
 import { expectHex, hexToBigInt, readOnlyRpc, redactUrl, toQuantity, waitForReceipt, type RpcClient } from "./rpc.ts";
 import { inspectSpecifier, type KnownArtifacts, type SpecifierInspection } from "./specifier.ts";
 
@@ -325,7 +325,7 @@ async function planVariant(
       {
         kind: "setWorker",
         label: "setWorker (next version: new hash, same resolver hosts)",
-        data: setWorkerCalldata(nextHash, retargetResolvers(request.resolvers, workerHash, nextHash)),
+        data: setWorkerCalldata(nextHash, orderResolvers(retargetResolvers(request.resolvers, workerHash, nextHash))),
       },
       {
         kind: "renounceOwnership",

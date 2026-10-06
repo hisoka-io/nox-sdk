@@ -18,13 +18,15 @@ import { DEFAULT_MAINNET_RPC_URL } from "../tools/constants.ts";
 import { creationCode } from "../tools/deployment.ts";
 import { DEFAULT_PLAN_SETTINGS, planDeployment } from "../tools/plan.ts";
 import { castCreateArgs, renderPlan, toJson } from "../tools/report.ts";
-import { DEFAULT_RESOLVER_POLICY } from "../tools/resolvers.ts";
+import { DEFAULT_RESOLVER_ORDER, DEFAULT_RESOLVER_POLICY, orderResolvers, type ResolverOrder } from "../tools/resolvers.ts";
 
 const USAGE = `usage: pnpm plan -- (--hash 0x… | --bundle <file>) --resolver <entry> [--resolver <entry> …]
-                    [--resolvers-file <json array>] [--variant immutable|reference|both]
+                    [--resolvers-file <json array>] [--resolver-order https-first|as-given]
+                    [--variant immutable|reference|both]
                     [--deployer 0x…] [--new-owner 0x…] [--rpc-url <read-only RPC>] [--out <dir>]
                     [--check-resolvers] [--allow-unknown-kinds] [--json] [--dry-run]
-Dry run only: nothing is signed or sent to the target chain.`;
+Dry run only: nothing is signed or sent to the target chain.
+--resolver-order https-first (default) publishes https: resolvers before kps: ones, each group in the given order.`;
 
 class UsageError extends Error {}
 
@@ -37,6 +39,7 @@ async function main(): Promise<void> {
       bundle: { type: "string" },
       resolver: { type: "string", multiple: true },
       "resolvers-file": { type: "string" },
+      "resolver-order": { type: "string", default: DEFAULT_RESOLVER_ORDER },
       variant: { type: "string", default: "both" },
       deployer: { type: "string" },
       "new-owner": { type: "string" },
@@ -80,6 +83,11 @@ async function main(): Promise<void> {
     }
     resolvers.push(...parsed);
   }
+  const order = values["resolver-order"];
+  if (order !== "https-first" && order !== "as-given") {
+    throw new UsageError(`--resolver-order must be https-first or as-given (got ${order})`);
+  }
+  const ordered = orderResolvers(resolvers, order as ResolverOrder);
 
   const variants: Variant[] =
     values.variant === "both"
@@ -96,7 +104,7 @@ async function main(): Promise<void> {
   const plan = await planDeployment({
     variants,
     workerHash,
-    resolvers,
+    resolvers: ordered,
     upstreamUrl,
     ...(values.deployer === undefined ? {} : { deployer: values.deployer }),
     ...(values["new-owner"] === undefined ? {} : { newOwner: values["new-owner"] }),

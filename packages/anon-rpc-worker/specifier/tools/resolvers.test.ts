@@ -1,17 +1,26 @@
 import { describe, expect, it } from "vitest";
 import { SAMPLE_CERTHASH, SAMPLE_HASH, SAMPLE_KPS_IPV4, SAMPLE_RESOLVERS, TORJS_MAINNET } from "../itest/sample.ts";
-import { checkResolver, checkResolvers, DEFAULT_RESOLVER_POLICY } from "./resolvers.ts";
+import { checkResolver, checkResolvers, DEFAULT_RESOLVER_POLICY, orderResolvers } from "./resolvers.ts";
 
 const path = `/keccak/${SAMPLE_HASH.slice(2, 4)}/${SAMPLE_HASH.slice(4)}`;
 const errorsOf = (entry: string, hash: string | undefined = SAMPLE_HASH) => checkResolver(entry, hash).errors;
 
 describe("checkResolvers", () => {
-  it("accepts the sample Nox resolver list", () => {
+  it("accepts the sample Nox resolver list, and warns that its kps: entries come before https: ones", () => {
     const report = checkResolvers(SAMPLE_RESOLVERS, SAMPLE_HASH);
     expect(report.errors).toEqual([]);
-    expect(report.warnings).toEqual([]);
+    expect(report.warnings).toEqual([expect.stringMatching(/^resolver 0 \(kps:\) comes before resolver 2 \(https:\)/)]);
     expect(report.checks.map((c) => c.kind)).toEqual(["kps", "kps", "https", "https", "https"]);
     expect(report.totalBytes).toBe(SAMPLE_RESOLVERS.reduce((s, r) => s + r.length, 0));
+  });
+
+  it("publishes https: resolvers first by default, keeping each kind's order (stable)", () => {
+    const ordered = orderResolvers(SAMPLE_RESOLVERS);
+    expect(ordered.map((entry) => entry.slice(0, entry.indexOf(":")))).toEqual(["https", "https", "https", "kps", "kps"]);
+    expect(ordered.filter((entry) => entry.startsWith("https:"))).toEqual(SAMPLE_RESOLVERS.filter((entry) => entry.startsWith("https:")));
+    expect(ordered.filter((entry) => entry.startsWith("kps:"))).toEqual(SAMPLE_RESOLVERS.filter((entry) => entry.startsWith("kps:")));
+    expect(checkResolvers(ordered, SAMPLE_HASH).warnings).toEqual([]);
+    expect(orderResolvers(SAMPLE_RESOLVERS, "as-given")).toEqual(SAMPLE_RESOLVERS);
   });
 
   it("accepts the five resolvers of the tor-js mainnet specifier", () => {
