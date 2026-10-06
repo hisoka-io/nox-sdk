@@ -20,7 +20,8 @@ Every 0.2.0 config stays valid. Works against entries on nox 0.4.0-rc.6 and on n
 - Worker-local answers: `eth_chainId` and `net_version` per upstream URL once a second, independently routed
   request agrees, and reads addressed by block hash (`eth_getBlockByHash`, `eth_getBlockReceipts`, `eth_getLogs`
   with `blockHash`, EIP-1898 `{blockHash}` state reads) once two calls returned the same result. A hit answers at
-  once with the caller's JSON-RPC `id` and sends nothing. `Cache-Control: no-cache` or `no-store` skips it.
+  once with the caller's JSON-RPC `id` and sends nothing. `Cache-Control: no-cache` or `no-store` skips it. An
+  empty log or receipt list is always fetched again, since an upstream behind the chain head answers `[]`.
 - The client's send-path settings: chunked packet writes, a send-window warm-up after each entry connection
   opens, and concurrent calls spread over the pinned and standby entries.
 

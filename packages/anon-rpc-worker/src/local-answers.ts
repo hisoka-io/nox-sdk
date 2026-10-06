@@ -14,11 +14,14 @@
  *   (`eth_call`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`,
  *   `eth_getTransactionCount`, `eth_getProof`) whose block is
  *   `{"blockHash": …}` without `requireCanonical`. They are kept once two
- *   separate calls returned the same result, so one exit alone cannot plant
- *   an answer.
+ *   separate calls returned the same result. Each call takes its own route,
+ *   so a wrong answer is kept only when both calls went through exits that
+ *   returned the same wrong result.
  *
  * Only single calls (not batches) with a `result` that is not null are kept;
- * errors never are. A request with `Cache-Control: no-cache` or `no-store`
+ * errors never are, and neither is an empty list for a block-hash read: an
+ * upstream that has not seen the block yet may answer `[]` for its logs or
+ * receipts, and a later call returns the full list. A request with `Cache-Control: no-cache` or `no-store`
  * always goes through the mixnet. The reply carries the caller's own
  * JSON-RPC `id`. Memory is bounded by entry count and bytes (oldest out).
  */
@@ -107,6 +110,7 @@ export class LocalAnswers {
     if (call === undefined || response.status !== 200 || !(response.body instanceof Uint8Array)) return undefined;
     const result = resultOf(response.body);
     if (result === undefined || result.length > LOCAL_ANSWER_MAX_ENTRY_BYTES) return undefined;
+    if (call.kind === "block-hash" && result === "[]") return undefined;
     const existing = this.entries.get(call.key);
     if (existing !== undefined) {
       if (existing.result === result) {

@@ -48,6 +48,17 @@ describe("LocalAnswers", () => {
     expect(answers.lookup(await prepare(call("eth_chainId", []), "https://other.test/"))).toBeUndefined();
   });
 
+  it("never keeps an empty list for a block-hash read (the upstream may not have the block yet)", async () => {
+    const answers = new LocalAnswers();
+    for (const body of [call("eth_getLogs", [{ blockHash: HASH }]), call("eth_getBlockReceipts", [HASH])]) {
+      const request = await prepare(body);
+      answers.observe(request, reply([]));
+      answers.observe(request, reply([]));
+      expect(answers.lookup(request)).toBeUndefined();
+    }
+    expect(answers.size).toBe(0);
+  });
+
   it("drops a memo whose check disagrees", async () => {
     const answers = new LocalAnswers();
     const request = await prepare(call("net_version", []));
