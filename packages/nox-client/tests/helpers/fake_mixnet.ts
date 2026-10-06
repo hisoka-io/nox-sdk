@@ -16,7 +16,8 @@ import {
   encodeRelayerPayload,
   type ServiceRequest,
 } from "../../src/bincode.js";
-import type { BatchResponseItem, TopologySnapshot } from "../../src/types.js";
+import type { TopologySnapshot } from "../../src/types.js";
+import { CLAIM_BINARY_MEDIA_TYPE, encodeBinaryClaim, type ClaimedItem } from "../../src/transport.js";
 import { json, type FakeHandler, type FakeReply, type FakeRequest } from "./fake_kps.js";
 
 export const SPHINX_PACKET_BYTES = 32_768;
@@ -39,9 +40,25 @@ class FakeSurbRecovery {
   }
 }
 
-/** WASM bindings with the exports `NoxClient` calls; see the module comment. */
-export function fakeWasmBindings(): Record<string, unknown> {
+/**
+ * WASM bindings with the exports `NoxClient` calls; see the module comment.
+ * With `v2`, `create_surb_v2` returns a random delivery ID as both the SURB
+ * bytes and the recovery ID, so format 2 reply blocks route like format 1.
+ */
+export function fakeWasmBindings(options: { v2?: boolean } = {}): Record<string, unknown> {
+  const v2 = options.v2 === true
+    ? {
+      create_surb_v2(_path: unknown[], _pow: number) {
+        const idHex = Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, "0")).join("");
+        return {
+          surb_bytes: encoder.encode(idHex),
+          recovery: { id_hex: idHex, to_json: () => JSON.stringify({ id: idHex }) },
+        };
+      },
+    }
+    : {};
   return {
+    ...v2,
     JsPathHop: FakePathHop,
     JsSurbRecovery: FakeSurbRecovery,
     build_sphinx_packet(_hops: unknown[], payload: Uint8Array, _pow: number): Uint8Array {
@@ -65,6 +82,22 @@ export function fakeWasmBindings(): Record<string, unknown> {
 /** The exit's behaviour: answer a decoded request with reply bytes, or drop it (`null`). */
 export type FakeExit = (request: ServiceRequest) => Uint8Array | null | Promise<Uint8Array | null>;
 
+/** One claim the fake entry saw. */
+export interface FakeClaim {
+  readonly ids: string[];
+  readonly ack: string[];
+  readonly body: Record<string, unknown>;
+  readonly accept: string | undefined;
+  readonly at: number;
+}
+
+/**
+ * Claim protocol of the fake entry: `v1` answers JSON number arrays and
+ * deletes on claim (nox 0.4.0-rc.6); `v2` follows nox `docs/claim-api.md`
+ * (binary batch, retain until ack or grace, ack, long-poll with retain).
+ */
+export type FakeClaimProtocol = "v1" | "v2";
+
 export class FakeMixnet {
   /** Requests the exit saw, in order. */
   readonly served: ServiceRequest[] = [];
@@ -77,7 +110,22 @@ export class FakeMixnet {
   packetStatus = 202;
   /** Delay before replies become claimable. */
   replyDelayMs = 0;
-  private readonly buffered = new Map<string, BatchResponseItem>();
+  /** Claim protocol the entry speaks. */
+  claimProtocol: FakeClaimProtocol = "v1";
+  /** Also buffer each reply under the next SURB, standing in for the exit's RS parity block. */
+  parity = false;
+  /** Leave the data block's reply out (lost in the mixnet); only the parity copy arrives. */
+  dropData = false;
+  /** v2: how long a retained reply stays re-claimable. */
+  claimGraceMs = 20_000;
+  /** v2: longest wait honoured (sent as `x-nox-claim-wait-max-ms`). */
+  claimWaitMaxMs = 20_000;
+  /** The relay's `/metadata.json` lists `claim-v2` with `limits.claimWaitMaxMs` (relays long-polls). */
+  relayClaimV2 = false;
+  /** Claims seen, in order. */
+  readonly claimLog: FakeClaim[] = [];
+  private readonly buffered = new Map<string, { item: ClaimedItem; claimedAt: number | undefined }>();
+  private readonly arrivals = new Set<() => void>();
   private nextResponse = 1;
 
   constructor(
@@ -90,6 +138,14 @@ export class FakeMixnet {
   private async answer(request: FakeRequest): Promise<FakeReply> {
     if (request.method === "GET" && request.path === "/topology") return json(200, this.topology());
     if (request.method === "GET" && request.path === "/health") return json(200, { status: "ok" });
+    if (request.method === "GET" && request.path === "/metadata.json") {
+      return json(200, {
+        protocol: "nox-kps-http/1",
+        software: "nox-kps",
+        capabilities: ["metadata", "health", "packets", "claim", "topology", ...(this.relayClaimV2 ? ["claim-v2"] : [])],
+        limits: { claimMaxSurbIds: 128, ...(this.relayClaimV2 ? { claimWaitMaxMs: this.claimWaitMaxMs } : {}) },
+      });
+    }
     if (request.method === "POST" && request.path === "/api/v1/packets") return this.packet(request);
     if (request.method === "POST" && request.path === "/api/v1/responses/claim") return this.claim(request);
     return { status: 404, body: "not found" };
@@ -125,23 +181,84 @@ export class FakeMixnet {
         fec: null,
       },
     });
-    const id = surbIds[0]!;
-    this.buffered.set(id, { id: `resp-${this.nextResponse}-${id}`, data: Array.from(plaintext) });
+    const store = (id: string): void => {
+      this.buffered.set(id, { item: { id: `resp-${this.nextResponse}-${id}`, data: plaintext }, claimedAt: undefined });
+    };
+    if (!this.dropData) store(surbIds[0]!);
+    if (this.parity && surbIds.length > 1) store(surbIds[1]!);
     this.nextResponse += 1;
+    for (const wake of [...this.arrivals]) wake();
   }
 
-  private claim(request: FakeRequest): FakeReply {
+  /** Whether a reply is buffered (and claimable) under `id`. */
+  holds(id: string): boolean {
+    return this.buffered.has(id);
+  }
+
+  private async claim(request: FakeRequest): Promise<FakeReply> {
     this.claims += 1;
-    const { surb_ids: ids } = JSON.parse(decoder.decode(request.body)) as { surb_ids: string[] };
-    const items: BatchResponseItem[] = [];
-    for (const id of ids) {
-      const item = this.buffered.get(id);
-      if (item !== undefined) {
-        items.push(item);
-        this.buffered.delete(id);
+    const body = JSON.parse(decoder.decode(request.body)) as Record<string, unknown>;
+    const ids = (body["surb_ids"] as string[] | undefined) ?? [];
+    const ack = (body["ack"] as string[] | undefined) ?? [];
+    const accept = request.headers.find(([name]) => name === "accept")?.[1];
+    this.claimLog.push({ ids, ack, body, accept, at: Date.now() });
+    if (this.claimProtocol === "v1") {
+      const items: { id: string; data: number[] }[] = [];
+      for (const id of ids) {
+        const held = this.buffered.get(id);
+        if (held !== undefined) {
+          items.push({ id: held.item.id, data: Array.from(held.item.data) });
+          this.buffered.delete(id);
+        }
       }
+      return json(200, items);
     }
-    return json(200, items);
+    for (const id of ack) this.buffered.delete(id);
+    const retain = body["retain"] === true;
+    const waitMs = retain ? Math.min(Number(body["wait_ms"] ?? 0), this.claimWaitMaxMs) : 0;
+    const headers: [string, string][] = [
+      ["x-nox-claim-version", "2"],
+      ["x-nox-claim-wait-max-ms", String(this.claimWaitMaxMs)],
+    ];
+    const take = (): ClaimedItem[] => {
+      const now = Date.now();
+      const items: ClaimedItem[] = [];
+      for (const id of ids) {
+        const held = this.buffered.get(id);
+        if (held === undefined) continue;
+        if (held.claimedAt !== undefined && now - held.claimedAt >= this.claimGraceMs) {
+          this.buffered.delete(id);
+          continue;
+        }
+        items.push({ ...held.item, reclaimed: held.claimedAt !== undefined });
+        if (retain) held.claimedAt ??= now;
+        else this.buffered.delete(id);
+      }
+      return items;
+    };
+    let items = take();
+    if (items.length === 0 && waitMs > 0 && ids.length > 0) {
+      await new Promise<void>((resolve) => {
+        const wake = (): void => {
+          if (ids.some((id) => this.buffered.has(id))) done();
+        };
+        const timer = setTimeout(() => done(), waitMs);
+        const done = (): void => {
+          clearTimeout(timer);
+          this.arrivals.delete(wake);
+          resolve();
+        };
+        this.arrivals.add(wake);
+      });
+      items = take();
+    }
+    if (items.length === 0) return { status: 204, reason: "No Content", headers, contentLength: false };
+    const binary = body["encoding"] === "binary" || (accept ?? "").includes(CLAIM_BINARY_MEDIA_TYPE);
+    if (binary) {
+      return { status: 200, headers: [["content-type", CLAIM_BINARY_MEDIA_TYPE], ...headers], body: encodeBinaryClaim(items) };
+    }
+    const reply = json(200, items.map((item) => ({ id: item.id, data: Array.from(item.data) })));
+    return { ...reply, headers: [...(("headers" in reply && reply.headers) || []), ...headers] } as FakeReply;
   }
 }
 

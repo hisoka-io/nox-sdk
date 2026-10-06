@@ -2,6 +2,39 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
+## Unreleased
+
+Additive; every 0.6.0 configuration behaves as before except where noted under Changed. Works against entries on
+nox 0.4.0-rc.6 (claim protocol v1) and on nodes with claim protocol v2 alike.
+
+### Added
+
+- Claim protocol v2 (nox `docs/claim-api.md`), negotiated per response: claims ask for the binary claim batch
+  (`encoding: "binary"`, `Accept: application/vnd.nox.claim-batch`), `retain` (a cut-off transfer can be claimed
+  again within the entry's grace), `ack` (delivered replies and the unused blocks of settled requests) and `wait_ms`
+  (long-poll; over KPS only when the relay's `/metadata.json` lists `claim-v2`, capped by its
+  `limits.claimWaitMaxMs`). A v1 entry ignores every v2 field and its JSON answer is read as before. `claimReplies`,
+  `decodeBinaryClaim`, `encodeBinaryClaim`, `decodeBase64`.
+- `ReplyClaimScheduler` and `NoxClientConfig.replyClaims`: concurrent claims per entry (an ID is never in two claims
+  at once), data blocks first and parity only after `parityFallbackMs` or a failed claim, bounded IDs per claim,
+  re-claim right after a failed claim, `reply.lost` after `lostReplyGraceMs`.
+- `NoxClientConfig.resend` (`ResendPolicy`, `RESEND_LEGACY`, `RESEND_FAST`): hedged copies at about the p95 reply
+  time, an immediate resend on a lost reply, transport-failure resends counted apart, same-entry resends when only
+  one entry can carry them (single bridge).
+- `kps.claimLane` (claims on a second connection to the entry) and `kps.standby` (a second entry kept connected,
+  with failover when the pinned connection closes); `KpsHttpTransport.fetchOn`, `retain`, `prewarm`, `rttMs`,
+  `dialMs`, `onConnectionClosed`.
+- `kps.discovery.firstCheckDeferMs`: the first chain check waits for the first wallet call (bounded).
+- Logs: `claim.failed`, `claim.recovered`, `claim.mode`, `reply.lost`, `call.resend`, `entry.failover`, and
+  `request.timing` (debug: upload, wait, claim, download and decode durations of each request).
+
+### Changed
+
+- Claims are no longer single-flight per entry, and a request claims its data blocks before its parity blocks.
+- Registry reads of chain checks carry two reply blocks and are resent once on another route (same exit).
+- The KPS transport forwards `Accept` next to `Content-Type`.
+- `computeTopologyFingerprint` hashes with ethers' `keccak256` (same digest); `js-sha3` is no longer a dependency.
+
 ## 0.6.0 (2026-10-06)
 
 Additive; every 0.5.0 configuration behaves as before.

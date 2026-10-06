@@ -447,26 +447,43 @@ describe("KPS mode requests", () => {
 });
 
 describe("KPS mode background work", () => {
-  it("claims replies with at most one claim in flight per entry", async () => {
+  it("never puts one SURB ID in two claims at once, and a stuck claim holds only its own IDs", async () => {
     const t = bed();
     const client = await connect(t.config({}, { claimIntervalMs: 10 }));
     const entryAddress = client.entryUrl.slice("kps:".length);
-    let claims = 0;
-    t.network.route(entryAddress, (request) => {
+    const inFlight = new Set<string>();
+    const claimed: string[][] = [];
+    let overlap = false;
+    let hung = false;
+    t.network.route(entryAddress, async (request) => {
       if (request.path === "/api/v1/responses/claim") {
-        claims += 1;
-        return { hang: true };
+        const { surb_ids: ids } = JSON.parse(new TextDecoder().decode(request.body)) as { surb_ids: string[] };
+        claimed.push(ids);
+        if (ids.some((id) => inFlight.has(id))) overlap = true;
+        if (!hung) {
+          // The first claim never answers: its IDs stay in flight.
+          hung = true;
+          for (const id of ids) inFlight.add(id);
+          return { hang: true };
+        }
       }
       return t.mixnet.handler(request);
     });
-    const pending = client.httpRequest("GET", "https://example.test/", [], new Uint8Array(0), { timeoutMs: 300 });
-    await expect(pending).rejects.toMatchObject({ code: NoxClientErrorCode.ResponseTimeout });
-    expect(claims).toBe(1);
+    const stuck = client.httpRequest("GET", "https://example.test/a", [], new Uint8Array(0), { timeoutMs: 400, retry: "none" });
+    await vi.waitFor(() => expect(hung).toBe(true));
+    // A second request is claimed on its own and answers while the first claim hangs.
+    const reply = await client.httpRequest("GET", "https://example.test/b", [], new Uint8Array(0), { retry: "none" });
+    expect(decodeHttpResponse(reply).status).toBe(200);
+    await expect(stuck).rejects.toMatchObject({ code: NoxClientErrorCode.ResponseTimeout });
+    expect(overlap).toBe(false);
+    expect(claimed.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("claims at most KPS_CLAIM_MAX_SURB_IDS IDs per exchange and rotates through larger sets", async () => {
+  it("claims at most replyClaims.maxIdsPerClaim IDs per exchange and covers larger sets across claims", async () => {
     const t = bed();
-    const client = await connect(t.config({}, { claimIntervalMs: 10 }));
+    const client = await connect(
+      t.config({ replyClaims: { maxIdsPerClaim: KPS_CLAIM_MAX_SURB_IDS, parityFallbackMs: 1 } }, { claimIntervalMs: 10 }),
+    );
     const entryAddress = client.entryUrl.slice("kps:".length);
     const claimed: string[][] = [];
     t.network.route(entryAddress, (request) => {
@@ -480,12 +497,13 @@ describe("KPS mode background work", () => {
     const pending = client.httpRequest("GET", "https://example.test/", [], new Uint8Array(0), {
       timeoutMs: 600,
       minSurbs: KPS_CLAIM_MAX_SURB_IDS + 40,
+      retry: "none",
     });
     await expect(pending).rejects.toMatchObject({ code: NoxClientErrorCode.ResponseTimeout });
     expect(claimed.length).toBeGreaterThanOrEqual(2);
     expect(Math.max(...claimed.map((ids) => ids.length))).toBe(KPS_CLAIM_MAX_SURB_IDS);
     const seen = new Set(claimed.flat());
-    expect(seen.size).toBeGreaterThan(KPS_CLAIM_MAX_SURB_IDS);
+    expect(seen.size).toBe(KPS_CLAIM_MAX_SURB_IDS + 40);
   });
 
   it("refreshes over KPS with the removals-only rule and brings recovered members back", async () => {

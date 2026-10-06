@@ -464,6 +464,38 @@ describe("KPS discovery: chain checks", () => {
     expect(exits).toEqual(expect.arrayContaining([memberAddress(10), memberAddress(11)]));
   });
 
+  it("wallet calls first: with firstCheckDeferMs the ready check waits for the first call", async () => {
+    const t = bed();
+    const client = await connect(t.config({ firstCheckDeferMs: 5_000 }));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(t.providerRequests).toBe(0);
+    const reply = await client.httpRequest("GET", "https://example.test/", [], new Uint8Array(0));
+    expect(reply.length).toBeGreaterThan(0);
+    await vi.waitFor(() => expect(t.logs.some((entry) => entry.event === "discovery.verified")).toBe(true), {
+      timeout: 4_000,
+      interval: 20,
+    });
+  });
+
+  it("wallet calls first: the ready check starts after firstCheckDeferMs with no call", async () => {
+    const t = bed();
+    await connect(t.config({ firstCheckDeferMs: 150 }));
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(t.providerRequests).toBe(0);
+    await vi.waitFor(() => expect(t.providerRequests).toBeGreaterThan(0), { timeout: 2_000, interval: 20 });
+  });
+
+  it("registry reads carry a parity block (two reply blocks each)", async () => {
+    const t = bed();
+    const client = await connect(t.config());
+    await (Reflect.get(client, "_runChainCheck") as (reason: string, force: boolean) => Promise<boolean>).call(client, "test", true);
+    const discoveryReads = t.mixnet.served
+      .map((request, index) => ({ request, surbs: t.mixnet.surbCounts[index]! }))
+      .filter(({ request }) => request.tag === "HttpRequest" && t.chains.has(request.url));
+    expect(discoveryReads.length).toBeGreaterThan(0);
+    expect(discoveryReads.every(({ surbs }) => surbs >= 2)).toBe(true);
+  });
+
   it("never reads the chain with discovery.chain false", async () => {
     const t = bed();
     await connect(t.config({ chain: false }));

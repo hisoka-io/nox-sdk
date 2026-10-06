@@ -33,6 +33,8 @@ export type {
   NoxLogLevel,
   NoxLogSink,
   HttpRequestOptions,
+  ReplyClaimSettings,
+  ResendPolicy,
 } from "./types.js";
 
 export {
@@ -66,7 +68,31 @@ export { resolveSeedUrl, DEFAULT_SEED } from "./seeder.js";
 export {
   postPacket,
   pollResponses,
+  claimReplies,
+  decodeBinaryClaim,
+  encodeBinaryClaim,
+  CLAIM_BINARY_MEDIA_TYPE,
+  CLAIM_ACCEPT_BINARY,
+  CLAIM_BATCH_VERSION,
+  CLAIM_ITEM_FLAG_RECLAIMED,
+  CLAIM_VERSION_HEADER,
+  CLAIM_WAIT_MAX_HEADER,
+  decodeBase64,
 } from "./transport.js";
+export type { ClaimedItem, ClaimFormat, ClaimOutcome, ClaimRequestOptions } from "./transport.js";
+export {
+  ReplyClaimScheduler,
+  REPLY_CLAIM_DEFAULTS,
+  CLASSIC_REPLY_CLAIM_DEFAULTS,
+  resolveReplyClaimSettings,
+} from "./reply_claims.js";
+export type { ReplyClaimHost } from "./reply_claims.js";
+export {
+  RESEND_LEGACY,
+  RESEND_FAST,
+  LatencyTracker,
+  resolveResendPolicy,
+} from "./resend.js";
 
 export {
   encodeServiceRequest,
@@ -114,6 +140,8 @@ export { createKpsFetch } from "./kps/fetch.js";
 export type { KpsFetch } from "./kps/fetch.js";
 export { KPS_TRANSPORT_DEFAULTS, kpsFailurePhase } from "./kps/transport.js";
 export type {
+  KpsLane,
+  KpsConnectionListener,
   KpsFailureCause,
   KpsFailurePhase,
   KpsFetchStats,
@@ -128,6 +156,8 @@ export {
   DISCOVERY_POLICY_RANGES,
   DISCOVERY_LIMITS,
   DISCOVERY_MAX_BATCH_CALLS,
+  DISCOVERY_FIRST_CHECK_MAX_DEFER_MS,
+  DISCOVERY_MIN_SURBS,
 } from "./kps/constants.js";
 export { verifyBootstrap, checkAnchorList, checkRpcUrls, isAllowedRpcUrl, rpcProviderKey } from "./kps/bootstrap.js";
 export {

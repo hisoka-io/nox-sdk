@@ -69,7 +69,19 @@ export interface KpsTransportSettings {
   maxStreamsPerConnection: number;
   /** Period of the idle and keepalive sweep. */
   maintenanceIntervalMs: number;
+  /** Claim-lane connections kept open (with keepalives) while idle; others close after `idleCloseMs`. */
+  claimLaneConnectionsKept: number;
 }
+
+/**
+ * A connection class per KPS address. `primary` carries packets, topology and
+ * keepalives; `claims` is an optional second connection to the same address
+ * for reply claims, so reply downloads never sit in front of a packet's
+ * answer in one association's send queue, and each direction gets its own
+ * congestion window. A `claims` exchange uses the primary connection until
+ * its own connection is up (it is dialled in the background).
+ */
+export type KpsLane = "primary" | "claims";
 
 /** Defaults (ARCHITECTURE §3.2, §3.5). */
 export const KPS_TRANSPORT_DEFAULTS: Readonly<KpsTransportSettings> = Object.freeze({
@@ -85,7 +97,32 @@ export const KPS_TRANSPORT_DEFAULTS: Readonly<KpsTransportSettings> = Object.fre
   idleCloseMs: 30_000,
   maxStreamsPerConnection: 32,
   maintenanceIntervalMs: 5_000,
+  claimLaneConnectionsKept: 1,
 });
+
+/** Smoothing of the per-address round-trip estimate (exponential moving average weight of a new sample). */
+export const KPS_RTT_EMA_ALPHA = 0.3;
+
+/** Exchanges whose request and response are both at most this many bytes count as round-trip samples. */
+export const KPS_RTT_SAMPLE_MAX_BYTES = 2_048;
+
+/** When one KPS exchange's response head and body arrived (`Date.now()` values). */
+export interface KpsExchangeTiming {
+  readonly startedAt: number;
+  readonly headAt: number;
+  readonly bodyAt: number;
+}
+
+/**
+ * Timing of the exchange behind a `Response` this transport returned (the
+ * transport reads the whole body before it returns, so `fetch` resolving says
+ * nothing about when the head arrived). Undefined for other responses.
+ */
+const EXCHANGE_TIMINGS = new WeakMap<Response, KpsExchangeTiming>();
+
+export function kpsExchangeTiming(response: Response): KpsExchangeTiming | undefined {
+  return EXCHANGE_TIMINGS.get(response);
+}
 
 /** Route `nox-kps` answers itself; used for keepalives (ARCHITECTURE §2.9). */
 export const KPS_HEALTH_TARGET = "/health";
@@ -118,6 +155,7 @@ interface StreamWaiter {
 
 interface PoolEntry {
   readonly address: string;
+  readonly lane: KpsLane;
   readonly label: string;
   readonly certhash: string;
   dial: Promise<KpsConnLike> | null;
@@ -129,7 +167,14 @@ interface PoolEntry {
   coolUntil: number;
   lastActivity: number;
   keepaliveInFlight: boolean;
+  /** Dial time of the current connection. */
+  dialMs: number | undefined;
+  /** Smoothed round trip of small exchanges on this address. */
+  rttMs: number | undefined;
 }
+
+/** Notified when a connection closes (`clean` as `kps.conn.closed` logs it). */
+export type KpsConnectionListener = (address: string, lane: KpsLane, clean: boolean) => void;
 
 const NULL_BODY_STATUSES: ReadonlySet<number> = new Set([204, 205, 304]);
 const STANDARD_METHODS = ["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH"];
@@ -149,6 +194,10 @@ export class KpsHttpTransport {
   };
   private maintenance: ReturnType<typeof setInterval> | null = null;
   private closed = false;
+  /** Primary connections kept open with keepalives whatever their recency (pinned entry and standby). */
+  private retained: ReadonlySet<string> = new Set();
+  private readonly listeners = new Set<KpsConnectionListener>();
+  private readonly laneFetches = new Map<KpsLane, NoxFetch>();
 
   constructor(
     private readonly dial: KpsDial,
@@ -163,12 +212,58 @@ export class KpsHttpTransport {
       );
     }
     this.limits = { maxHeadBytes: settings.maxHeadBytes, maxBodyBytes: settings.maxBodyBytes };
-    this.fetch = (input, init) => this.request(input, init);
+    this.fetch = (input, init) => this.request(input, init, "primary");
+    this.laneFetches.set("primary", this.fetch);
+  }
+
+  /** `fetch` on one lane (see `KpsLane`). */
+  fetchOn(lane: KpsLane): NoxFetch {
+    let laneFetch = this.laneFetches.get(lane);
+    if (laneFetch === undefined) {
+      laneFetch = (input, init) => this.request(input, init, lane);
+      this.laneFetches.set(lane, laneFetch);
+    }
+    return laneFetch;
+  }
+
+  /**
+   * Keep these primary connections open with keepalives, whatever their
+   * recency (the pinned entry and its standby). Others follow the idle rules.
+   */
+  retain(addresses: Iterable<string>): void {
+    this.retained = new Set(addresses);
+  }
+
+  /** Listen for connection closes; returns the unsubscribe function. */
+  onConnectionClosed(listener: KpsConnectionListener): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  /** Smoothed round trip of small exchanges to `address`, if measured. */
+  rttMs(address: string): number | undefined {
+    return this.pool.get(poolKey(address, "primary"))?.rttMs ?? this.pool.get(poolKey(address, "claims"))?.rttMs;
+  }
+
+  /** How long the current primary connection to `address` took to dial, if connected. */
+  dialMs(address: string): number | undefined {
+    const entry = this.pool.get(poolKey(address, "primary"));
+    return entry?.conn != null ? entry.dialMs : undefined;
+  }
+
+  /** Start dialling `address` in the background (no-op when connected, dialling or cooling down). */
+  prewarm(address: string, lane: KpsLane = "primary"): void {
+    if (this.closed) return;
+    const entry = this.entry(parseKpsAddress(address).address, lane);
+    if (entry.conn !== null || entry.dial !== null || entry.coolUntil > Date.now()) return;
+    this.connection(entry).catch(noop);
   }
 
   /** Make sure a connection to `address` is up, dialling it if needed. */
   async warm(address: string, signal?: AbortSignal): Promise<void> {
-    const entry = this.entry(parseKpsAddress(address).address);
+    const entry = this.entry(parseKpsAddress(address).address, "primary");
     try {
       await this.connection(entry, signal);
     } catch (error) {
@@ -178,13 +273,13 @@ export class KpsHttpTransport {
 
   /** True while `address` is in its dial cooldown after a failure. */
   isCoolingDown(address: string): boolean {
-    const entry = this.pool.get(address);
+    const entry = this.pool.get(poolKey(address, "primary"));
     return entry !== undefined && entry.conn === null && entry.coolUntil > Date.now();
   }
 
   /** True when a connection to `address` is established. */
   isConnected(address: string): boolean {
-    return this.pool.get(address)?.conn != null;
+    return this.pool.get(poolKey(address, "primary"))?.conn != null;
   }
 
   stats(): KpsFetchStats {
@@ -213,11 +308,13 @@ export class KpsHttpTransport {
     await Promise.all(closing);
   }
 
-  private entry(address: string): PoolEntry {
-    let entry = this.pool.get(address);
+  private entry(address: string, lane: KpsLane): PoolEntry {
+    const key = poolKey(address, lane);
+    let entry = this.pool.get(key);
     if (entry === undefined) {
       entry = {
         address,
+        lane,
         label: kpsAddressLabel(address),
         certhash: address.slice(address.lastIndexOf(":") + 1),
         dial: null,
@@ -229,13 +326,29 @@ export class KpsHttpTransport {
         coolUntil: 0,
         lastActivity: Date.now(),
         keepaliveInFlight: false,
+        dialMs: undefined,
+        rttMs: undefined,
       };
-      this.pool.set(address, entry);
+      this.pool.set(key, entry);
     }
     return entry;
   }
 
-  private async request(input: string, init?: RequestInit): Promise<Response> {
+  /**
+   * The pool entry an exchange on `lane` uses: the lane's own connection when
+   * it is up, else the primary one (and the lane's connection is dialled in
+   * the background).
+   */
+  private laneEntry(address: string, lane: KpsLane): PoolEntry {
+    const primary = this.entry(address, "primary");
+    if (lane === "primary") return primary;
+    const own = this.entry(address, lane);
+    if (own.conn !== null) return own;
+    if (own.dial === null && own.coolUntil <= Date.now() && primary.conn !== null) this.connection(own).catch(noop);
+    return primary;
+  }
+
+  private async request(input: string, init: RequestInit | undefined, lane: KpsLane): Promise<Response> {
     const endpoint = parseKpsEndpoint(String(input));
     if (endpoint === null) {
       const text = String(input);
@@ -253,12 +366,12 @@ export class KpsHttpTransport {
       } satisfies KpsFailureCause);
     }
     const method = normalizeMethod(init?.method);
-    const entry = this.entry(endpoint.addr);
+    const entry = this.laneEntry(endpoint.addr, lane);
     const requestBytes = encodeKpsHttpRequest({
       method,
       path: endpoint.target,
       certhash: entry.certhash,
-      headers: contentTypeOnly(init?.headers),
+      headers: forwardedHeaders(init?.headers),
       body: requestBody(init?.body),
     });
     const callerSignal = init?.signal ?? undefined;
@@ -321,15 +434,22 @@ export class KpsHttpTransport {
       await raceSignal(writer.close(), exchange.signal);
       phase = "read";
       const { head, rest } = await raceSignal(readKpsHttpResponseHead(reader, this.limits), exchange.signal);
+      const headAt = Date.now();
       const body = await raceSignal(
         readKpsHttpResponseBody(reader, head, rest, method, this.limits),
         exchange.signal,
       );
       this.counters.bytesIn += body.length;
       this.counters.lastExchangeMs = Date.now() - started;
+      if (requestBytes.length <= KPS_RTT_SAMPLE_MAX_BYTES && body.length <= KPS_RTT_SAMPLE_MAX_BYTES) {
+        const sample = Date.now() - started;
+        entry.rttMs = entry.rttMs === undefined ? sample : entry.rttMs + KPS_RTT_EMA_ALPHA * (sample - entry.rttMs);
+      }
       entry.lastActivity = Date.now();
       finishStream(false);
-      return toResponse(head, body);
+      const response = toResponse(head, body);
+      EXCHANGE_TIMINGS.set(response, { startedAt: started, headAt, bodyAt: Date.now() });
+      return response;
     } catch (error) {
       finishStream(true);
       if (isAborted(callerSignal)) throw abortReason(callerSignal);
@@ -426,17 +546,28 @@ export class KpsHttpTransport {
         entry.failures = 0;
         entry.coolUntil = 0;
         entry.lastActivity = Date.now();
+        entry.dialMs = Date.now() - started;
         this.counters.dialsOk += 1;
         const onClosed = (info: unknown): void => {
-          if (entry.conn === conn) entry.conn = null;
+          const current = entry.conn === conn;
+          if (current) entry.conn = null;
           const clean = typeof info === "object" && info !== null && (info as { ok?: unknown }).ok === true;
-          this.emit("info", "kps.conn.closed", { entry: entry.label, clean });
+          this.emit("info", "kps.conn.closed", { entry: entry.label, lane: entry.lane, clean });
           const error = new NoxKpsError(`KPS connection to ${entry.label} closed`, "closed");
           for (const teardown of [...entry.teardowns]) teardown(error);
           entry.teardowns.clear();
+          if (current && !this.closed) {
+            for (const listener of [...this.listeners]) {
+              try {
+                listener(entry.address, entry.lane, clean);
+              } catch {
+                // A listener never breaks the transport.
+              }
+            }
+          }
         };
         conn.closed.then(onClosed, onClosed);
-        this.emit("info", "kps.dial.ok", { entry: entry.label, ms: Date.now() - started });
+        this.emit("info", "kps.dial.ok", { entry: entry.label, lane: entry.lane, ms: entry.dialMs });
         this.startMaintenance();
         return conn;
       },
@@ -454,6 +585,7 @@ export class KpsHttpTransport {
         const code = kpsErrorCodeOf(error, "network-error");
         this.emit("warn", "kps.dial.failed", {
           entry: entry.label,
+          lane: entry.lane,
           code,
           failures: entry.failures,
           retryInMs: backoff,
@@ -560,43 +692,52 @@ export class KpsHttpTransport {
   }
 
   /**
-   * Keep at most `idleConnectionsKept` idle connections, most recently used
-   * first, closing the others once idle for `idleCloseMs`; send `GET /health`
-   * on kept connections idle for `keepaliveMs` (keeps NAT bindings and the
-   * `nox-kps` idle timer alive, ARCHITECTURE §3.5).
+   * Per lane, keep the retained primary connections and then the most
+   * recently used ones up to `idleConnectionsKept` (primary) or
+   * `claimLaneConnectionsKept` (claims), closing the others once idle for
+   * `idleCloseMs`; send `GET /health` on kept connections idle for
+   * `keepaliveMs` (keeps NAT bindings and the `nox-kps` idle timer, 120 s,
+   * alive, ARCHITECTURE §3.5).
    */
   private maintain(): void {
     if (this.closed) return;
     const now = Date.now();
-    const idle = [...this.pool.values()]
-      .filter((entry) => entry.conn !== null && entry.active === 0 && entry.waiters.length === 0)
-      .sort((left, right) => right.lastActivity - left.lastActivity);
-    for (const [index, entry] of idle.entries()) {
-      const idleFor = now - entry.lastActivity;
-      const conn = entry.conn;
-      if (conn === null) continue;
-      if (index >= this.settings.idleConnectionsKept) {
-        if (idleFor >= this.settings.idleCloseMs) {
-          entry.conn = null;
-          this.emit("debug", "kps.conn.idle-close", { entry: entry.label, idleMs: idleFor });
-          void safeClose(conn, { code: "closed" });
+    for (const lane of ["primary", "claims"] as const) {
+      const kept = lane === "primary" ? this.settings.idleConnectionsKept : this.settings.claimLaneConnectionsKept;
+      const idle = [...this.pool.values()]
+        .filter((entry) => entry.lane === lane && entry.conn !== null && entry.active === 0 && entry.waiters.length === 0)
+        .sort((left, right) => {
+          const retainedFirst = Number(this.retained.has(right.address)) - Number(this.retained.has(left.address));
+          return retainedFirst !== 0 ? retainedFirst : right.lastActivity - left.lastActivity;
+        });
+      for (const [index, entry] of idle.entries()) {
+        const idleFor = now - entry.lastActivity;
+        const conn = entry.conn;
+        if (conn === null) continue;
+        const keep = (lane === "primary" && this.retained.has(entry.address)) || index < kept;
+        if (!keep) {
+          if (idleFor >= this.settings.idleCloseMs) {
+            entry.conn = null;
+            this.emit("debug", "kps.conn.idle-close", { entry: entry.label, lane, idleMs: idleFor });
+            void safeClose(conn, { code: "closed" });
+          }
+          continue;
         }
-        continue;
-      }
-      if (idleFor >= this.settings.keepaliveMs && !entry.keepaliveInFlight) {
-        entry.keepaliveInFlight = true;
-        this.request(`kps:${entry.address}${KPS_HEALTH_TARGET}`, { method: "GET" })
-          .then(
-            (response) => {
-              void response.arrayBuffer().catch(noop);
-            },
-            () => {
-              this.emit("warn", "kps.keepalive.failed", { entry: entry.label });
-            },
-          )
-          .finally(() => {
-            entry.keepaliveInFlight = false;
-          });
+        if (idleFor >= this.settings.keepaliveMs && !entry.keepaliveInFlight) {
+          entry.keepaliveInFlight = true;
+          this.request(`kps:${entry.address}${KPS_HEALTH_TARGET}`, { method: "GET" }, lane)
+            .then(
+              (response) => {
+                void response.arrayBuffer().catch(noop);
+              },
+              () => {
+                this.emit("warn", "kps.keepalive.failed", { entry: entry.label, lane });
+              },
+            )
+            .finally(() => {
+              entry.keepaliveInFlight = false;
+            });
+        }
       }
     }
     if (![...this.pool.values()].some((entry) => entry.conn !== null) && this.maintenance !== null) {
@@ -687,22 +828,38 @@ function requestBody(body: RequestInit["body"]): Uint8Array | null {
   );
 }
 
-/** Only `Content-Type` is taken from the caller; `Host` and `Content-Length` are computed. */
-function contentTypeOnly(headers: RequestInit["headers"]): [string, string][] {
+/** Request headers taken from the caller; `Host` and `Content-Length` are computed. */
+const FORWARDED_REQUEST_HEADERS: readonly (readonly [string, string])[] = [
+  ["content-type", "Content-Type"],
+  ["accept", "Accept"],
+];
+
+/**
+ * Only `Content-Type` and `Accept` are taken from the caller (`Accept` lets a
+ * claim ask for binary replies); every other header stays on this side.
+ */
+function forwardedHeaders(headers: RequestInit["headers"]): [string, string][] {
   if (headers === undefined) return [];
-  let value: string | null = null;
+  const found = new Map<string, string>();
+  const take = (name: string, value: string): void => {
+    const lower = name.toLowerCase();
+    if (FORWARDED_REQUEST_HEADERS.some(([key]) => key === lower)) found.set(lower, value);
+  };
   if (typeof Headers !== "undefined" && headers instanceof Headers) {
-    value = headers.get("content-type");
+    headers.forEach((value, name) => take(name, value));
   } else if (Array.isArray(headers)) {
     for (const pair of headers) {
-      if (Array.isArray(pair) && String(pair[0]).toLowerCase() === "content-type") value = String(pair[1]);
+      if (Array.isArray(pair)) take(String(pair[0]), String(pair[1]));
     }
   } else {
-    for (const [name, entry] of Object.entries(headers as Record<string, string>)) {
-      if (name.toLowerCase() === "content-type") value = String(entry);
-    }
+    for (const [name, entry] of Object.entries(headers as Record<string, string>)) take(name, String(entry));
   }
-  return value === null ? [] : [["Content-Type", value]];
+  const out: [string, string][] = [];
+  for (const [key, canonical] of FORWARDED_REQUEST_HEADERS) {
+    const value = found.get(key);
+    if (value !== undefined) out.push([canonical, value]);
+  }
+  return out;
 }
 
 function toResponse(head: KpsHttpResponseHead, body: Uint8Array<ArrayBuffer>): Response {
@@ -760,6 +917,11 @@ async function safeClose(conn: unknown, reason: KpsReason): Promise<void> {
   } catch {
     // Closing a connection nobody uses is best effort.
   }
+}
+
+/** Pool key of one lane's connection to an address. */
+function poolKey(address: string, lane: KpsLane): string {
+  return lane === "primary" ? address : `${address}#${lane}`;
 }
 
 function noop(): void {

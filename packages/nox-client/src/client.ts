@@ -18,6 +18,8 @@ import {
   type PathHop,
   type PinnedSnapshot,
   type RelayerNode,
+  type ReplyClaimSettings,
+  type ResendPolicy,
   type Route,
   type SurbFormat,
   type TopologyNode,
@@ -73,7 +75,15 @@ import {
   supportsSurbV2,
   MAX_SURB_V2_ADDRESS_BYTES,
 } from "./topology.js";
-import { postPacket, claimResponses, ResponseWebSocket } from "./transport.js";
+import { postPacket, ResponseWebSocket, type ClaimedItem } from "./transport.js";
+import {
+  CLASSIC_REPLY_CLAIM_DEFAULTS,
+  REPLY_CLAIM_DEFAULTS,
+  ReplyClaimScheduler,
+  resolveReplyClaimSettings,
+  type DeliveredClaim,
+} from "./reply_claims.js";
+import { LatencyTracker, RESEND_LEGACY, resolveResendPolicy } from "./resend.js";
 import { defaultFetch } from "./rpc.js";
 import {
   encodeRelayerPayload,
@@ -104,11 +114,11 @@ import {
   KPS_ANCHOR_STAGGER_MS,
   KPS_SECOND_SOURCE_WAIT_MS,
   KPS_ENTRY_SWITCH_AFTER_FAILURES,
-  KPS_CLAIM_MAX_SURB_IDS,
+  DISCOVERY_FIRST_CHECK_MAX_DEFER_MS,
+  DISCOVERY_MIN_SURBS,
   DISCOVERY_LIMITS,
   DISCOVERY_POLICY_RANGES,
   DISCOVERY_TRIGGER_MIN_GAP_MS,
-  claimWindow,
 } from "./kps/constants.js";
 import {
   validateIssuedPaidQuote,
@@ -144,8 +154,8 @@ interface PlannedRoute {
   version: SurbVersion;
 }
 
-/** Interval for claiming replies from an entry other than the pinned one. */
-const AUX_ENTRY_POLL_MS = 200;
+/** Interval of the burst stall check (fragment replenishment). */
+const STALL_CHECK_INTERVAL_MS = 1_000;
 
 interface EmaState {
   ema: number;
@@ -188,6 +198,21 @@ interface PendingRequest {
   createdAt: number;
   /** Reply size cap from `HttpRequestOptions.maxResponseBytes`. */
   maxResponseBytes?: number;
+  /** Called when the claim scheduler presumes this request's reply lost. */
+  onLost?: () => void;
+  /** Phase timing (`Date.now()` values) for the `request.timing` log event. */
+  timing: RequestTiming;
+}
+
+/** When one request passed each phase (`Date.now()` values). */
+interface RequestTiming {
+  readonly startedAt: number;
+  /** The entry accepted the packet(s) (HTTP 202). */
+  uploadedAt?: number;
+  /** The claim that carried the first fragment. */
+  claim?: DeliveredClaim;
+  /** Claims that carried fragments of this request. */
+  claims: number;
 }
 
 /** Per-request options threaded below the public methods. */
@@ -197,6 +222,10 @@ interface SendExtras {
   maxResponseBytes?: number;
   /** Entry for the first route instead of the pinned one (a chain-check read whose exit is the pinned entry). */
   entry?: TopologyNode;
+  /** Set by the resend logic on each attempt: the attempt's lost-reply hook. */
+  onLost?: () => void;
+  /** Background work (chain checks): not counted as the first wallet call. */
+  background?: boolean;
 }
 
 /** Resolved run-time discovery inputs (PROPOSAL §2.2, §2.5). */
@@ -213,6 +242,10 @@ interface ResolvedDiscovery {
   readonly chain: boolean;
   readonly firstSeen: ReadonlyMap<string, MemberFirstSeen>;
   readonly onVerified: ((state: VerifiedDiscovery) => void) | undefined;
+  /** Longest wait of the first chain check for the first wallet call to settle. */
+  readonly firstCheckDeferMs: number;
+  /** The wallet's gateways or bridges, when set: a standby is only dialled among them. */
+  readonly userAnchors: ReadonlySet<string> | undefined;
 }
 
 /** Last chain check the client applied. */
@@ -236,6 +269,8 @@ interface ResolvedKpsOptions {
   readonly exchangeTimeoutMs: number;
   readonly claimIntervalMs: number;
   readonly clockSkewToleranceSeconds: number;
+  readonly claimLane: boolean;
+  readonly standby: boolean;
 }
 
 /** Live KPS mode state. */
@@ -244,10 +279,8 @@ interface KpsState {
   readonly transport: KpsHttpTransport;
   /** Working set: pinned eligible members not removed by served topologies. */
   members: RelayerNode[];
-  /** Entry endpoints with a reply claim in flight (single-flight, ARCHITECTURE §3.6). */
-  readonly claimsInFlight: Set<string>;
-  /** Per entry, where the next claim window starts when more than `KPS_CLAIM_MAX_SURB_IDS` IDs are active. */
-  readonly claimCursors: Map<string, number>;
+  /** Unsubscribes the connection-close listener (standby failover). */
+  unlisten: (() => void) | undefined;
   /** Consecutive transport failures on the pinned entry. */
   pinnedEntryFailures: number;
   /** Base membership: eligible floor members, or the last chain-verified set. */
@@ -336,19 +369,19 @@ export class NoxClient {
   }
 
   private topologyTimer: ReturnType<typeof setInterval> | null = null;
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
   private stallTimer: ReturnType<typeof setInterval> | null = null;
   private responseWs: ResponseWebSocket | null = null;
+  /** Entry the response WebSocket is connected to; its replies are not claimed. */
+  private _wsEntryUrl: string | null = null;
   private subscribedSurbIds = new Set<string>();
-  /**
-   * Requests whose route uses an entry other than `_entryUrl`, by entry URL.
-   * Their replies are claimed from that entry, and their SURB IDs are never
-   * sent to the pinned entry.
-   */
-  private readonly _auxEntries = new Map<
-    string,
-    { requests: Set<bigint>; timer: ReturnType<typeof setInterval> }
-  >();
+  /** Reply claims for every request not served by the WebSocket. */
+  private _claims: ReplyClaimScheduler | null = null;
+  private _claimSettings: ReplyClaimSettings | undefined;
+  private _resendPolicy: ResendPolicy | undefined;
+  private _latency: LatencyTracker | undefined;
+  private _hedgesInFlight = 0;
+  /** Resolves once the first wallet (non-background) call settles. */
+  private _firstCall: { done: boolean; waiters: (() => void)[] } = { done: false, waiters: [] };
 
   public _debugPoll = false;
 
@@ -399,6 +432,8 @@ export class NoxClient {
     const full = resolveSettings(config);
     validateTopologyVerificationConfig(full);
     const transport = resolveTransport(config);
+    const claimSettings = resolveReplyClaimSettings(config.replyClaims, CLASSIC_REPLY_CLAIM_DEFAULTS);
+    const resendPolicy = resolveResendPolicy(config.resend);
     if (config.wasm !== undefined) validateWasmProvider(config.wasm);
 
     const candidates = seedCandidates(full.seeds, !full.dangerouslySkipFingerprintCheck);
@@ -436,6 +471,8 @@ export class NoxClient {
     client._powDifficultyPinned = powDifficultyPinned;
     client._fetchImpl = transport.fetch;
     client._webSocketImpl = transport.WebSocket;
+    client._claimSettings = claimSettings;
+    client._resendPolicy = resendPolicy;
     client._wasmProvider = config.wasm;
     client._log = config.log;
 
@@ -461,6 +498,11 @@ export class NoxClient {
   private static async _connectKps(config: NoxClientConfig): Promise<NoxClient> {
     const options = resolveKpsOptions(config);
     const settings = resolveKpsSettings(config, options.pinned);
+    const claimSettings = resolveReplyClaimSettings(
+      { intervalMs: options.claimIntervalMs, ...config.replyClaims },
+      REPLY_CLAIM_DEFAULTS,
+    );
+    const resendPolicy = resolveResendPolicy(config.resend);
     const kpsConfig = config.kps as KpsModeOptions;
     const log = config.log;
     const bindings = await loadWasmBindings(config.wasm as NoxWasmProvider);
@@ -508,8 +550,7 @@ export class NoxClient {
         options,
         transport,
         members: working.members,
-        claimsInFlight: new Set(),
-        claimCursors: new Map(),
+        unlisten: undefined,
         pinnedEntryFailures: 0,
         membership,
         anchorMembers,
@@ -542,8 +583,11 @@ export class NoxClient {
       client._log = log;
       client._wasmProvider = config.wasm;
       client._wasm = bindings;
+      client._claimSettings = claimSettings;
+      client._resendPolicy = resendPolicy;
       client._startTopologyRefresh();
       client._startResponseStream();
+      client._startStandby();
       client._startChainChecks();
       emitLog(log, "info", "kps.connected", {
         entry: kpsAddressLabel(kpsAddressOfEntry(entryUrl) ?? ""),
@@ -918,9 +962,9 @@ export class NoxClient {
       clearInterval(this.topologyTimer);
       this.topologyTimer = null;
     }
-    if (this.pollTimer !== null) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
+    if (this._claims !== null) {
+      this._claims.close();
+      this._claims = null;
     }
     if (this.stallTimer !== null) {
       clearInterval(this.stallTimer);
@@ -931,8 +975,6 @@ export class NoxClient {
       this.responseWs = null;
     }
     this.subscribedSurbIds.clear();
-    for (const { timer } of this._auxEntries.values()) clearInterval(timer);
-    this._auxEntries.clear();
 
     const err = new NoxClientError(
       "NoxClient disconnected",
@@ -947,8 +989,8 @@ export class NoxClient {
     this.burstState.clear();
     const kps = this._kps;
     if (kps !== undefined) {
-      kps.claimsInFlight.clear();
-      kps.claimCursors.clear();
+      kps.unlisten?.();
+      kps.unlisten = undefined;
       if (kps.chainTimer !== undefined) clearInterval(kps.chainTimer);
       kps.chainTimer = undefined;
       void kps.transport.close();
@@ -1018,8 +1060,22 @@ export class NoxClient {
    * off, neither happens.
    *
    * A request that used v2 reply blocks is never resent with v1 ones: the
-   * resend uses v2 again, through a different entry. When no such route
-   * exists the timeout is returned.
+   * resend uses v2 again, through a different entry (or, with
+   * `resend.sameEntryFallback`, the same entry on another mix and exit when
+   * no other entry can carry it). When no such route exists the timeout is
+   * returned.
+   *
+   * KPS mode, after a packet submission failed (ARCHITECTURE §4.7): resend
+   * through a different entry when the failure happened before the request
+   * was written (`dial` or `open`: certainly not sent, safe for every
+   * request), or whatever the phase for requests that may be resent (`retry`
+   * not `"none"`). Two failures in a row on the pinned entry move it.
+   *
+   * The resend policy (`NoxClientConfig.resend`) adds: a hedged copy after
+   * `hedgeAfterMs` (the first reply wins), an immediate resend when the claim
+   * scheduler presumes a reply lost, and transport-failure resends counted
+   * apart from the timeout resend. A call sends at most
+   * `2 + transportResends` copies.
    */
   private async _sendWithRetry(
     payload: RelayerPayload,
@@ -1032,93 +1088,260 @@ export class NoxClient {
     this._requireWasm();
     throwIfAborted(extras?.signal);
     const first = this._planRoute(selectedExit, this._avoidedNodeIds(), extras?.entry);
-    try {
-      const response = await this._sendOnRoute(payload, surbCount, timeoutMs, first, extras);
-      this._clearAvoided(first.route);
-      this._noteEntrySuccess(first.route.entry);
-      return { response, exit: first.route.exit };
-    } catch (error) {
-      if (this._kps !== undefined && isTransportFailure(error)) {
-        return this._retryAfterKpsTransportFailure(payload, surbCount, timeoutMs, selectedExit, retry, first, error, extras);
-      }
-      if (!isResponseTimeout(error)) throw error;
-      // With retryOnTimeout off, a timeout leaves route selection unchanged.
-      if (this._config.retryOnTimeout === false) throw error;
-      this._avoidRoute(first.route);
-      if (retry === "none") throw error;
+    const policy = this._resend;
+    const attemptTimeoutMs = timeoutMs ?? this._config.timeoutMs;
+    const callerSignal = extras?.signal;
 
-      // Steer the resend away from this route's hops specifically; hops that
-      // timed out earlier are only a soft preference and may be reused.
-      const avoid = new Set([first.route.mix.id, first.route.exit.id]);
-      let second: PlannedRoute;
+    interface Attempt {
+      readonly planned: PlannedRoute;
+      readonly cancel: AbortController;
+      readonly startedAt: number;
+      readonly hedge: boolean;
+      live: boolean;
+    }
+
+    const outcome = await new Promise<{ response: Uint8Array; exit: TopologyNode }>((resolve, reject) => {
+      const attempts: Attempt[] = [];
+      let settled = false;
+      let routeResendUsed = false;
+      let transportLeft = policy.transportResends;
+      let hedgeTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const anyLive = (): boolean => attempts.some((attempt) => attempt.live);
+      const finish = (settle: () => void): void => {
+        if (settled) return;
+        settled = true;
+        if (hedgeTimer !== undefined) clearTimeout(hedgeTimer);
+        for (const attempt of attempts) {
+          if (!attempt.live) continue;
+          attempt.cancel.abort(new NoxClientError("Another copy of this request answered first", NoxClientErrorCode.Aborted));
+        }
+        settle();
+      };
+      const failIfIdle = (error: unknown): void => {
+        if (!anyLive()) finish(() => reject(error));
+      };
+      const end = (attempt: Attempt): void => {
+        if (!attempt.live) return;
+        attempt.live = false;
+        if (attempt.hedge) this._hedgesInFlight = Math.max(0, (this._hedgesInFlight ?? 0) - 1);
+      };
+
+      const launch = (planned: PlannedRoute, hedge: boolean): void => {
+        const cancel = new AbortController();
+        const attempt: Attempt = { planned, cancel, startedAt: Date.now(), hedge, live: true };
+        attempts.push(attempt);
+        if (hedge) this._hedgesInFlight = (this._hedgesInFlight ?? 0) + 1;
+        const attemptExtras: SendExtras = {
+          ...extras,
+          signal: linkSignals(callerSignal, cancel.signal),
+          onLost: () => onLost(attempt),
+        };
+        let sent: Promise<Uint8Array>;
+        try {
+          sent = this._sendOnRoute(payload, surbCount, timeoutMs, planned, attemptExtras);
+        } catch (error) {
+          sent = Promise.reject(error);
+        }
+        sent.then(
+          (response) => onSuccess(attempt, response),
+          (error: unknown) => onFailure(attempt, error),
+        );
+      };
+
+      const onSuccess = (attempt: Attempt, response: Uint8Array): void => {
+        end(attempt);
+        if (settled) return;
+        this._clearAvoided(attempt.planned.route);
+        this._noteEntrySuccess(attempt.planned.route.entry);
+        this._latencyTracker.record(Date.now() - attempt.startedAt);
+        if (attempts.length > 1) {
+          emitLog(this._log, "debug", "call.copy.won", {
+            copy: attempts.indexOf(attempt) + 1,
+            copies: attempts.length,
+            hedge: attempt.hedge,
+          });
+        }
+        finish(() => resolve({ response, exit: attempt.planned.route.exit }));
+      };
+
+      const takeTransportResend = (): boolean => {
+        if (transportLeft > 0) {
+          transportLeft -= 1;
+          return true;
+        }
+        if (!routeResendUsed) {
+          routeResendUsed = true;
+          return true;
+        }
+        return false;
+      };
+
+      const onFailure = (attempt: Attempt, error: unknown): void => {
+        end(attempt);
+        if (settled) return;
+        if (this._kps !== undefined && isTransportFailure(error)) {
+          this._noteEntryTransportFailure(attempt.planned.route.entry);
+          if (callerSignal?.aborted === true) {
+            failIfIdle(error);
+            return;
+          }
+          const phase = kpsFailurePhase(error);
+          const notSent = phase === "dial" || phase === "open";
+          if (notSent || retry !== "none") {
+            const next = this._planTransportResend(attempt.planned, selectedExit, policy);
+            if (next !== undefined && takeTransportResend()) {
+              emitLog(this._log, "info", "kps.resend", { phase: phase ?? "unknown", reason: notSent ? "not-sent" : "idempotent" });
+              launch(next, false);
+              return;
+            }
+          }
+          failIfIdle(error);
+          return;
+        }
+        if (isResponseTimeout(error)) {
+          // With retryOnTimeout off, a timeout leaves route selection unchanged.
+          if (this._config.retryOnTimeout === false) {
+            failIfIdle(error);
+            return;
+          }
+          this._avoidRoute(attempt.planned.route);
+          if (retry !== "none" && !routeResendUsed) {
+            const next = this._planResend(attempt.planned, selectedExit, retry, policy);
+            if (next !== undefined) {
+              routeResendUsed = true;
+              launch(next, false);
+              return;
+            }
+          }
+          failIfIdle(error);
+          return;
+        }
+        // Anything else (abort, oversize reply, bad config) ends the call.
+        finish(() => reject(error));
+      };
+
+      const onLost = (attempt: Attempt): void => {
+        if (settled || !attempt.live || !policy.resendOnLostReply) return;
+        if (retry === "none" || routeResendUsed || this._config.retryOnTimeout === false) return;
+        const next = this._planResend(attempt.planned, selectedExit, retry, policy);
+        if (next === undefined) return;
+        routeResendUsed = true;
+        emitLog(this._log, "info", "call.resend", { reason: "lost-reply", afterMs: Date.now() - attempt.startedAt });
+        launch(next, false);
+      };
+
+      launch(first, false);
+
+      if (policy.hedgeAfterMs > 0 && retry === "route" && this._config.retryOnTimeout !== false) {
+        const delay = this._latencyTracker.hedgeDelay(policy, attemptTimeoutMs);
+        hedgeTimer = setTimeout(() => {
+          hedgeTimer = undefined;
+          if (settled || routeResendUsed || !anyLive()) return;
+          if ((this._hedgesInFlight ?? 0) >= policy.maxHedgesInFlight) return;
+          const live = attempts.find((attempt) => attempt.live);
+          if (live === undefined) return;
+          const next = this._planResend(live.planned, selectedExit, retry, policy);
+          if (next === undefined) return;
+          routeResendUsed = true;
+          emitLog(this._log, "info", "call.resend", { reason: "hedge", afterMs: delay });
+          launch(next, true);
+        }, delay);
+      }
+    });
+    if (extras?.background !== true) this._noteForegroundCall();
+    return outcome;
+  }
+
+  /** Active resend policy (`RESEND_LEGACY` until a connect resolves one). */
+  private get _resend(): ResendPolicy {
+    return this._resendPolicy ?? RESEND_LEGACY;
+  }
+
+  private get _latencyTracker(): LatencyTracker {
+    this._latency ??= new LatencyTracker();
+    return this._latency;
+  }
+
+  /**
+   * A resend after a timeout, a lost reply or for a hedge: steer away from
+   * `failed`'s mix and exit specifically (hops that timed out earlier are
+   * only a soft preference). `undefined` when no different route exists.
+   */
+  private _planResend(
+    failed: PlannedRoute,
+    selectedExit: TopologyNode | undefined,
+    retry: RetryMode,
+    policy: Readonly<ResendPolicy>,
+  ): PlannedRoute | undefined {
+    const avoid = new Set([failed.route.mix.id, failed.route.exit.id]);
+    let next: PlannedRoute;
+    try {
+      next = failed.version === 2
+        ? this._planV2Retry(failed.route, selectedExit, retry, avoid)
+        : this._planRoute(
+          retry === "exit" ? this._pickPaidExit(new Set([failed.route.exit.id])) : selectedExit,
+          avoid,
+        );
+    } catch {
+      if (!policy.sameEntryFallback || failed.version !== 2) return undefined;
       try {
-        second = first.version === 2
-          ? this._planV2Retry(first.route, selectedExit, retry, avoid)
-          : this._planRoute(
-            retry === "exit" ? this._pickPaidExit(new Set([first.route.exit.id])) : selectedExit,
-            avoid,
-          );
+        // No other v2 entry: the same entry, on another mix and exit (single-bridge setups).
+        next = this._planStrictV2(selectedExit, avoid, undefined);
       } catch {
-        throw error;
+        return undefined;
       }
-      if (
-        second.route.entry.id === first.route.entry.id &&
-        second.route.mix.id === first.route.mix.id &&
-        second.route.exit.id === first.route.exit.id
-      ) {
-        throw error;
-      }
+    }
+    if (
+      next.route.entry.id === failed.route.entry.id &&
+      next.route.mix.id === failed.route.mix.id &&
+      next.route.exit.id === failed.route.exit.id
+    ) {
+      return undefined;
+    }
+    return next;
+  }
+
+  /** A resend after a KPS transport failure: another entry, or the same one with `sameEntryFallback`. */
+  private _planTransportResend(
+    failed: PlannedRoute,
+    selectedExit: TopologyNode | undefined,
+    policy: Readonly<ResendPolicy>,
+  ): PlannedRoute | undefined {
+    try {
+      return this._planRouteThroughOtherEntry(failed, selectedExit);
+    } catch {
+      if (!policy.sameEntryFallback) return undefined;
       try {
-        const response = await this._sendOnRoute(payload, surbCount, timeoutMs, second, extras);
-        this._clearAvoided(second.route);
-        this._noteEntrySuccess(second.route.entry);
-        return { response, exit: second.route.exit };
-      } catch (retryError) {
-        if (isResponseTimeout(retryError)) this._avoidRoute(second.route);
-        throw retryError;
+        return failed.version === 2
+          ? this._planStrictV2(selectedExit, this._avoidedNodeIds(), undefined)
+          : this._planRoute(selectedExit, this._avoidedNodeIds());
+      } catch {
+        return undefined;
       }
     }
   }
 
-  /**
-   * KPS mode, after a packet submission failed (ARCHITECTURE §4.7): resend once
-   * through a different entry when the failure happened before the request
-   * was written (`dial` or `open`: certainly not sent, safe for every request),
-   * or whatever the phase for requests that may be resent (`retry` not
-   * `"none"`). Two failures in a row on the pinned entry move it.
-   */
-  private async _retryAfterKpsTransportFailure(
-    payload: RelayerPayload,
-    surbCount: number,
-    timeoutMs: number | undefined,
-    selectedExit: TopologyNode | undefined,
-    retry: RetryMode,
-    first: PlannedRoute,
-    error: unknown,
-    extras: SendExtras | undefined,
-  ): Promise<{ response: Uint8Array; exit: TopologyNode }> {
-    this._noteEntryTransportFailure(first.route.entry);
-    if (extras?.signal?.aborted === true) throw error;
-    const phase = kpsFailurePhase(error);
-    const notSent = phase === "dial" || phase === "open";
-    if (!notSent && retry === "none") throw error;
-    let second: PlannedRoute;
-    try {
-      second = this._planRouteThroughOtherEntry(first, selectedExit);
-    } catch {
-      throw error;
-    }
-    emitLog(this._log, "info", "kps.resend", { phase: phase ?? "unknown", reason: notSent ? "not-sent" : "idempotent" });
-    try {
-      const response = await this._sendOnRoute(payload, surbCount, timeoutMs, second, extras);
-      this._clearAvoided(second.route);
-      this._noteEntrySuccess(second.route.entry);
-      return { response, exit: second.route.exit };
-    } catch (retryError) {
-      if (isTransportFailure(retryError)) this._noteEntryTransportFailure(second.route.entry);
-      else if (isResponseTimeout(retryError) && this._config.retryOnTimeout !== false) this._avoidRoute(second.route);
-      throw retryError;
-    }
+  /** The first wallet call settled: deferred background work may start. */
+  private _noteForegroundCall(): void {
+    const first = this._firstCall;
+    if (first === undefined || first.done) return;
+    first.done = true;
+    for (const waiter of first.waiters.splice(0)) waiter();
+  }
+
+  /** Resolves when the first wallet call settles or after `maxMs`, whichever comes first. */
+  private _afterFirstCall(maxMs: number): Promise<void> {
+    const first = this._firstCall;
+    if (first === undefined || first.done || maxMs <= 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(done, maxMs);
+      function done(): void {
+        clearTimeout(timer);
+        resolve();
+      }
+      first.waiters.push(done);
+    });
   }
 
   /** A fresh route through another KPS entry, preferring one with an open connection. */
@@ -1145,12 +1368,91 @@ export class NoxClient {
         candidates.filter((node) => !transport.isCoolingDown(kpsAddressOfEntry(node.address) ?? "")),
         candidates,
       ];
+    if (this._kps?.options.standby === true) {
+      const fastest = this._rankedOtherEntries().find((node) => !exclude.has(node.id) && candidates.includes(node));
+      if (fastest !== undefined) return fastest;
+    }
     for (const tier of tiers) {
       // Within a tier, settled members first: a new entry on probation spends the route's probation budget.
       const pool = preferSettled(tier);
       if (pool.length > 0) return pool[secureRandomIndex(pool.length)]!;
     }
     throw new NoxClientError("No other entry is available", NoxClientErrorCode.NoNodesAvailable);
+  }
+
+  /**
+   * KPS `standby`: keep the pinned entry and the fastest other entry
+   * connected (keepalives), and move the pinned entry to a connected one at
+   * once when the pinned connection closes.
+   */
+  private _startStandby(): void {
+    const kps = this._kps;
+    if (kps === undefined || !kps.options.standby) return;
+    this._refreshStandby();
+    kps.unlisten = kps.transport.onConnectionClosed((address, lane) => {
+      if (lane !== "primary" || this._kps !== kps || this.topologyTimer === null) return;
+      if (address === kpsAddressOfEntry(this._entryUrl)) this._failOverFromClosedEntry();
+      else this._refreshStandby();
+    });
+  }
+
+  /** Entry-capable nodes other than the pinned one, fastest first: connected, then by round trip and dial time. */
+  private _rankedOtherEntries(): TopologyNode[] {
+    const kps = this._kps;
+    const pinnedAddress = kpsAddressOfEntry(this._entryUrl);
+    const rule = this._entryRule();
+    const candidates = this._nodes.filter((node) => isEntryCapable(node, rule) && node.address !== this._entryUrl);
+    if (kps === undefined) return candidates;
+    const transport = kps.transport;
+    const score = (node: TopologyNode): [number, number, number] => {
+      const address = kpsAddressOfEntry(node.address) ?? "";
+      return [
+        transport.isConnected(address) ? 0 : transport.isCoolingDown(address) ? 2 : 1,
+        node.probation === true ? 1 : 0,
+        transport.rttMs(address) ?? transport.dialMs(address) ?? Number.MAX_SAFE_INTEGER,
+      ];
+    };
+    return candidates
+      .filter((node) => kpsAddressOfEntry(node.address) !== pinnedAddress)
+      .map((node) => ({ node, key: score(node) }))
+      .sort((left, right) => left.key[0] - right.key[0] || left.key[1] - right.key[1] || left.key[2] - right.key[2])
+      .map(({ node }) => node);
+  }
+
+  /** Retain the pinned entry and its standby; dial the standby in the background when it is down. */
+  private _refreshStandby(): void {
+    const kps = this._kps;
+    if (kps === undefined || !kps.options.standby) return;
+    const pinned = kpsAddressOfEntry(this._entryUrl);
+    // With gateways or bridges set, a standby is never dialled outside them.
+    const userAnchors = kps.options.discovery?.userAnchors;
+    const standby = this._rankedOtherEntries().find((node) => {
+      const address = kpsAddressOfEntry(node.address);
+      return address !== null && (userAnchors === undefined || userAnchors.has(address) || kps.transport.isConnected(address));
+    });
+    const standbyAddress = standby === undefined ? null : kpsAddressOfEntry(standby.address);
+    kps.transport.retain([pinned, standbyAddress].filter((address): address is string => address !== null));
+    if (standbyAddress !== null && !kps.transport.isConnected(standbyAddress)) kps.transport.prewarm(standbyAddress);
+  }
+
+  /** The pinned connection closed: move to a connected standby now; the old entry is redialled in the background. */
+  private _failOverFromClosedEntry(): void {
+    const kps = this._kps;
+    if (kps === undefined) return;
+    const from = kpsAddressOfEntry(this._entryUrl) ?? "";
+    const next = this._rankedOtherEntries().find((node) => kps.transport.isConnected(kpsAddressOfEntry(node.address) ?? ""));
+    if (next === undefined) {
+      kps.transport.prewarm(from);
+      this._refreshStandby();
+      return;
+    }
+    emitLog(this._log, "warn", "entry.failover", {
+      from: kpsAddressLabel(from),
+      to: kpsAddressLabel(kpsAddressOfEntry(next.address) ?? ""),
+    });
+    this._entryUrl = next.address;
+    kps.pinnedEntryFailures = 0;
+    this._refreshStandby();
   }
 
   private _noteEntrySuccess(entry: TopologyNode): void {
@@ -1180,7 +1482,6 @@ export class NoxClient {
       this._triggerChainCheck("entries");
       return;
     }
-    this._moveInFlightToAux(this._entryUrl);
     emitLog(this._log, "warn", "entry.switch", {
       from: kpsAddressLabel(kpsAddressOfEntry(this._entryUrl) ?? ""),
       to: kpsAddressLabel(kpsAddressOfEntry(next.address) ?? ""),
@@ -1188,13 +1489,7 @@ export class NoxClient {
     });
     this._entryUrl = next.address;
     kps.pinnedEntryFailures = 0;
-  }
-
-  /** Keep claiming replies of requests sent through `entryUrl` after it stops being pinned. */
-  private _moveInFlightToAux(entryUrl: string): void {
-    for (const requestId of this.pending.keys()) {
-      if (this.replenishment.entryFor(requestId) === entryUrl) this._watchAuxEntry(entryUrl, requestId);
-    }
+    this._refreshStandby();
   }
 
   /** Entry rule of the current mode: HTTP(S) ingress (classic) or `kps:` endpoint (KPS). */
@@ -1317,14 +1612,12 @@ export class NoxClient {
     const returnPath = buildReturnPath(forwardPath);
 
     const requestId = this.nextRequestId++;
+    const timing: RequestTiming = { startedAt: Date.now(), claims: 0 };
     const surbBlobs = this._generateSurbs(returnPath, requestId, surbCount, version);
 
     const entryUrl = route.entry.address;
-    if (entryUrl === this._entryUrl) {
-      this._wsSubscribe(this._pinnedEntrySurbIds());
-    } else {
-      this._watchAuxEntry(entryUrl, requestId);
-    }
+    const replyIds = this.surbPool.idsForRequest(requestId);
+    if (this.responseWs !== null && entryUrl === this._wsEntryUrl) this._wsSubscribe(replyIds);
 
     const payloadWithSurbs: RelayerPayload =
       payload.tag === "AnonymousRequest"
@@ -1402,8 +1695,10 @@ export class NoxClient {
         },
         reassembler: new Reassembler(),
         createdAt: Date.now(),
+        timing,
       };
       if (extras?.maxResponseBytes !== undefined) pendingRequest.maxResponseBytes = extras.maxResponseBytes;
+      if (extras?.onLost !== undefined) pendingRequest.onLost = extras.onLost;
       this.pending.set(requestId, pendingRequest);
 
       if (signal !== undefined) {
@@ -1420,6 +1715,7 @@ export class NoxClient {
     });
 
     this.replenishment.stashPath(requestId, forwardPath, { entryUrl, version });
+    this._claims?.track(requestId, entryUrl, replyIds);
     if (signal?.aborted === true) {
       this._failPending(
         requestId,
@@ -1431,6 +1727,9 @@ export class NoxClient {
     const sendAll = Promise.all(
       packets.map((pkt) => postPacket(entryUrl, pkt, undefined, this.fetch)),
     );
+    sendAll.then(() => {
+      timing.uploadedAt = Date.now();
+    }, noop);
     sendAll.catch((err: unknown) => {
       const req = this.pending.get(requestId);
       if (req !== undefined) {
@@ -1472,60 +1771,6 @@ export class NoxClient {
     return this.surbPool.generate(wasm, returnPath, requestId, count, version);
   }
 
-  /** Requests whose replies are claimed from an entry other than `_entryUrl`. */
-  private _auxRequestIds(): Set<bigint> {
-    const ids = new Set<bigint>();
-    for (const { requests } of this._auxEntries.values()) {
-      for (const id of requests) ids.add(id);
-    }
-    return ids;
-  }
-
-  /** SURB IDs to claim from the pinned entry: every one not routed elsewhere. */
-  private _pinnedEntrySurbIds(): string[] {
-    const aux = this._auxRequestIds();
-    if (aux.size === 0) return this.surbPool.activeSurbIds();
-    const ids: string[] = [];
-    for (const [id, entry] of this.surbPool.registry) {
-      if (!aux.has(entry.requestId)) ids.push(id);
-    }
-    return ids;
-  }
-
-  /** Claim one request's replies from a non-pinned entry until it settles. */
-  private _watchAuxEntry(entryUrl: string, requestId: bigint): void {
-    const existing = this._auxEntries.get(entryUrl);
-    if (existing !== undefined) {
-      existing.requests.add(requestId);
-      return;
-    }
-    const watch = {
-      requests: new Set([requestId]),
-      timer: setInterval(() => {
-        void this._pollAuxEntry(entryUrl);
-      }, this._kps?.options.claimIntervalMs ?? AUX_ENTRY_POLL_MS),
-    };
-    this._auxEntries.set(entryUrl, watch);
-  }
-
-  private async _pollAuxEntry(entryUrl: string): Promise<void> {
-    const watch = this._auxEntries.get(entryUrl);
-    if (watch === undefined) return;
-    for (const requestId of watch.requests) {
-      if (!this.pending.has(requestId)) watch.requests.delete(requestId);
-    }
-    if (watch.requests.size === 0) {
-      clearInterval(watch.timer);
-      this._auxEntries.delete(entryUrl);
-      return;
-    }
-    const ids = [...watch.requests].flatMap((id) => this.surbPool.idsForRequest(id));
-    if (ids.length === 0) return;
-    const items = await this._claimSingleFlight(entryUrl, ids);
-    if (items === null) return;
-    for (const item of items) this._handleResponseItem(item);
-  }
-
   private _buildSphinxPacket(
     forwardPath: PathHop[],
     payloadBytes: Uint8Array,
@@ -1534,23 +1779,63 @@ export class NoxClient {
     return buildSphinxPacket(wasm, forwardPath, payloadBytes, this._config.powDifficulty);
   }
 
+  /**
+   * Reply delivery: the classic WebSocket push for the entry it is connected
+   * to, and the claim scheduler for every other request (KPS mode claims over
+   * KPS streams only, ARCHITECTURE §3.6).
+   */
   private _startResponseStream(): void {
     const WebSocketImpl = this._webSocketImpl;
     if (WebSocketImpl !== null) {
+      this._wsEntryUrl = this._entryUrl;
       this.responseWs = new ResponseWebSocket(this._entryUrl, (item) => {
         this._onWsResponse(item);
       }, WebSocketImpl);
-      // Stall detection + burst recovery still needs a periodic check
-      this.stallTimer = setInterval(() => {
-        this._checkBurstStalls();
-      }, 1000);
-    } else {
-      // HTTP polling: environments without WebSocket (Node 18), and KPS mode,
-      // which claims over KPS streams only (ARCHITECTURE §3.6).
-      this.pollTimer = setInterval(() => {
-        void this._pollOnce();
-      }, this._kps?.options.claimIntervalMs ?? AUX_ENTRY_POLL_MS);
     }
+    const settings = this._claimSettings ?? resolveReplyClaimSettings(undefined, CLASSIC_REPLY_CLAIM_DEFAULTS);
+    this._claims = new ReplyClaimScheduler(
+      {
+        activeIds: (requestId) => this.surbPool.idsForRequest(requestId),
+        isPending: (requestId) => this.pending.has(requestId),
+        fetchFor: () => this._claimFetch(),
+        deliver: (item, claim) => this._handleResponseItem(item, claim),
+        onLost: (requestId) => this.pending.get(requestId)?.onLost?.(),
+        label: (entryUrl) => entryLabel(entryUrl),
+        ...(this._kps === undefined ? {} : { probeWaitMaxMs: (entryUrl: string) => this._probeClaimWait(entryUrl) }),
+        log: this._log,
+      },
+      settings,
+      (entryUrl) => this.responseWs !== null && entryUrl === this._wsEntryUrl,
+    );
+    // Stall detection and burst recovery for fragmented replies.
+    this.stallTimer = setInterval(() => {
+      this._checkBurstStalls();
+    }, STALL_CHECK_INTERVAL_MS);
+  }
+
+  /**
+   * Longest claim long-poll the entry's `nox-kps` relays: `limits.claimWaitMaxMs`
+   * when its `/metadata.json` lists `claim-v2`, else 0 (nox `docs/claim-api.md`).
+   */
+  private async _probeClaimWait(entryUrl: string): Promise<number> {
+    const address = kpsAddressOfEntry(entryUrl);
+    const kps = this._kps;
+    if (address === null || kps === undefined) return 0;
+    const metadata = await fetchRelayMetadata(address, kps.options.exchangeTimeoutMs, this.fetch);
+    const capabilities = metadata["capabilities"];
+    const limits = metadata["limits"] as Record<string, unknown> | undefined;
+    const waitMax = limits?.["claimWaitMaxMs"];
+    const relays = Array.isArray(capabilities) && capabilities.includes(CLAIM_V2_CAPABILITY);
+    const result = relays && typeof waitMax === "number" && Number.isSafeInteger(waitMax) && waitMax > 0 ? waitMax : 0;
+    emitLog(this._log, "info", "claim.relay", { entry: kpsAddressLabel(address), claimV2: relays, waitMaxMs: result });
+    return result;
+  }
+
+  /** `fetch` for reply claims: the KPS claim lane when enabled, else the client's `fetch`. */
+  private _claimFetch(): NoxFetch {
+    const kps = this._kps;
+    if (kps !== undefined && kps.options.claimLane) return kps.transport.fetchOn("claims");
+    return this.fetch;
   }
 
   /** Subscribe SURB IDs to the WebSocket stream. */
@@ -1573,7 +1858,10 @@ export class NoxClient {
    * Decrypt and dispatch one claimed reply. A reply whose ID names a v2 reply
    * block is matched by that ID only; trial decryption never covers v2.
    */
-  private _handleResponseItem(item: import("./types.js").BatchResponseItem): void {
+  private _handleResponseItem(
+    item: ClaimedItem | import("./types.js").BatchResponseItem,
+    claim?: DeliveredClaim,
+  ): void {
     if (this._wasm === null) return;
     const wasm = this._wasm;
 
@@ -1597,6 +1885,11 @@ export class NoxClient {
     }
 
     const { requestId, plaintext } = match;
+    const timing = this.pending.get(requestId)?.timing;
+    if (timing !== undefined && claim !== undefined) {
+      timing.claim ??= claim;
+      timing.claims += 1;
+    }
 
     let decoded: ReturnType<typeof decodeRelayerPayload>;
     try {
@@ -1613,59 +1906,6 @@ export class NoxClient {
         decoded.requestId,
         decoded.fragmentsRemaining,
       );
-    }
-  }
-
-  private async _pollOnce(): Promise<void> {
-    if (this._wasm === null || this.pending.size === 0) return;
-    const wasm = this._wasm;
-
-    const surbIds = this._pinnedEntrySurbIds();
-    if (surbIds.length === 0) return;
-
-    const items = await this._claimSingleFlight(this._entryUrl, surbIds);
-    if (items === null) return;
-
-    if (this._debugPoll && items.length > 0) {
-      this._debug(`[poll] got ${items.length} items, pending=${this.pending.size}`);
-    }
-
-    for (const item of items) this._handleResponseItem(item);
-
-    this._checkBurstStalls();
-  }
-
-  /**
-   * Claim replies from one entry. In KPS mode at most one claim per entry is
-   * in flight: a tick that finds one running is skipped, so a slow claim never
-   * stacks streams (ARCHITECTURE §3.6), and one claim carries at most
-   * `KPS_CLAIM_MAX_SURB_IDS` IDs, rotating through larger sets on successive
-   * ticks (the `nox-kps` claim limit). Returns `null` when skipped or failed.
-   */
-  private async _claimSingleFlight(
-    entryUrl: string,
-    surbIds: string[],
-  ): Promise<import("./types.js").BatchResponseItem[] | null> {
-    const kps = this._kps;
-    const inFlight = kps?.claimsInFlight;
-    if (inFlight?.has(entryUrl) === true) return null;
-    inFlight?.add(entryUrl);
-    let ids = surbIds;
-    if (kps !== undefined) {
-      const { window, next } = claimWindow(surbIds, kps.claimCursors.get(entryUrl) ?? 0, KPS_CLAIM_MAX_SURB_IDS);
-      ids = window;
-      if (next === 0) kps.claimCursors.delete(entryUrl);
-      else kps.claimCursors.set(entryUrl, next);
-    }
-    try {
-      return await claimResponses(entryUrl, ids, undefined, this.fetch);
-    } catch (pollErr) {
-      if (this._debugPoll) {
-        this._debug(`[poll] fetch error: ${String(pollErr).slice(0, 120)}`);
-      }
-      return null;
-    } finally {
-      inFlight?.delete(entryUrl);
     }
   }
 
@@ -1712,6 +1952,7 @@ export class NoxClient {
   ): void {
     const req = this.pending.get(requestId);
     if (req === undefined) return;
+    this._claims?.noteFragment(requestId, fragment);
 
     const bs = this.burstState.get(requestId);
     if (bs !== undefined) {
@@ -1762,10 +2003,40 @@ export class NoxClient {
       this.pending.delete(requestId);
       this.burstState.delete(requestId);
       this.replenishment.clearPath(requestId);
+      this._logTiming(req.timing, result.length);
       req.resolve(result);
       // Defer cleanup so remaining fragments in this batch can still match
       setTimeout(() => this.surbPool.cleanup(requestId), 100);
     }
+  }
+
+  /**
+   * `request.timing` (debug): upload (until the entry accepted the packet),
+   * wait (accepted until the delivering claim was sent; 0 when a long-poll
+   * claim was already open), claim (claim sent until its response head),
+   * download (head until the body was read), decode (decrypt, reassemble,
+   * decode). Durations only; never IDs, URLs or bodies.
+   */
+  private _logTiming(timing: RequestTiming | undefined, replyBytes: number): void {
+    if (timing === undefined || this._log === undefined) return;
+    const now = Date.now();
+    const fields: Record<string, string | number | boolean> = {
+      totalMs: now - timing.startedAt,
+      replyBytes,
+      claims: timing.claims,
+    };
+    if (timing.uploadedAt !== undefined) fields["uploadMs"] = timing.uploadedAt - timing.startedAt;
+    const claim = timing.claim;
+    if (claim !== undefined) {
+      const { startedAt, headAt, bodyAt } = claim.timing;
+      if (timing.uploadedAt !== undefined) fields["waitMs"] = Math.max(0, startedAt - timing.uploadedAt);
+      fields["claimMs"] = headAt - startedAt;
+      fields["downloadMs"] = bodyAt - headAt;
+      fields["decodeMs"] = Math.max(0, now - bodyAt);
+      fields["claimBytes"] = claim.bytes;
+      fields["format"] = claim.format;
+    }
+    emitLog(this._log, "debug", "request.timing", fields);
   }
 
   private async _handleNeedMoreSurbs(
@@ -1836,7 +2107,9 @@ export class NoxClient {
         powDifficulty: this._config.powDifficulty,
         fetch: this.fetch,
       });
-      this._wsSubscribe(this._pinnedEntrySurbIds());
+      if (this.responseWs !== null && this._wsEntryUrl !== null) {
+        this._wsSubscribe(this._claims?.idsAt(this._wsEntryUrl) ?? []);
+      }
     } catch (err) {
       this.burstState.delete(clientRequestId);
       if (this._debugPoll) {
@@ -2065,9 +2338,10 @@ export class NoxClient {
     const kps = this._kps;
     const discovery = kps?.options.discovery;
     if (kps === undefined || discovery === undefined || !discovery.chain) return;
-    setTimeout(() => {
+    // Wallet calls first: the first check waits for the first call to settle (bounded).
+    void this._afterFirstCall(discovery.firstCheckDeferMs).then(() => {
       if (this._kps === kps && this.topologyTimer !== null) void this._runChainCheck("ready", true);
-    }, 0);
+    });
     kps.chainTimer = setInterval(() => {
       void this._runChainCheck("timer", true);
     }, discovery.bootstrap.policy.chainRefreshSeconds * 1_000);
@@ -2273,8 +2547,10 @@ export class NoxClient {
       body: new TextEncoder().encode(body),
     });
     // The pinned entry cannot also be the exit of a route: such a read enters through another entry.
-    const extras = exit.id === this._pinnedEntry()?.id ? { entry: this._pickOtherEntry(new Set([exit.id])) } : undefined;
-    const reply = await this._sendAnonymous(inner, "discovery", undefined, expectedBytes, undefined, exit, "none", extras);
+    // A registry read is idempotent: it gets a parity block and a resend on another mix (same exit).
+    const extras: SendExtras = { minSurbs: DISCOVERY_MIN_SURBS, background: true };
+    if (exit.id === this._pinnedEntry()?.id) extras.entry = this._pickOtherEntry(new Set([exit.id]));
+    const reply = await this._sendAnonymous(inner, "discovery", undefined, expectedBytes, undefined, exit, "route", extras);
     const decoded = decodeHttpResponse(reply);
     if (decoded.status !== 200 || decoded.truncated) {
       throw new NoxClientError(
@@ -2372,18 +2648,18 @@ export class NoxClient {
     );
     if (!currentStillPresent) {
       if (this._kps !== undefined) {
-        this._moveInFlightToAux(this._entryUrl);
         this._kps.pinnedEntryFailures = 0;
       }
       this._entryUrl = pickEntryUrl(nodes, this._entryRule());
-      // Reconnect WS to new entry node
+      // Reconnect WS to new entry node; requests sent through the old one keep being claimed there.
       if (this.responseWs !== null) {
         this.responseWs.close();
         this.responseWs = new ResponseWebSocket(this._entryUrl, (item) => {
           this._onWsResponse(item);
         }, this._webSocketImpl ?? undefined);
+        this._wsEntryUrl = this._entryUrl;
         this.subscribedSurbIds.clear();
-        this._wsSubscribe(this._pinnedEntrySurbIds());
+        this._wsSubscribe(this._claims?.idsAt(this._entryUrl) ?? []);
       }
     }
   }
@@ -2966,6 +3242,8 @@ const KPS_OPTION_KEYS = new Set([
   "maxHeadBytes",
   "maxBodyBytes",
   "clockSkewToleranceSeconds",
+  "claimLane",
+  "standby",
 ]);
 
 /** `mode`, and the classic/KPS field split (ARCHITECTURE §3.9). */
@@ -3086,6 +3364,8 @@ function resolveKpsOptions(config: NoxClientConfig): ResolvedKpsOptions {
     anchorParallelism: boundedInteger(options.anchorParallelism, KPS_CLIENT_DEFAULTS.anchorParallelism, 1, 16, "kps.anchorParallelism"),
     exchangeTimeoutMs: kpsTransportSettingsFrom(options).exchangeTimeoutMs,
     claimIntervalMs: boundedInteger(options.claimIntervalMs, KPS_CLIENT_DEFAULTS.claimIntervalMs, 1, 60_000, "kps.claimIntervalMs"),
+    claimLane: optionalBoolean(options.claimLane, false, "kps.claimLane"),
+    standby: optionalBoolean(options.standby, false, "kps.standby"),
     clockSkewToleranceSeconds: boundedInteger(
       options.clockSkewToleranceSeconds,
       KPS_CLIENT_DEFAULTS.clockSkewToleranceSeconds,
@@ -3110,6 +3390,20 @@ function resolveKpsSettings(config: NoxClientConfig, pinned: PinnedSnapshot): No
     throw new NoxClientError("topologyRefreshMs must be a positive safe integer", NoxClientErrorCode.InvalidConfig);
   }
   return settings;
+}
+
+function optionalBoolean(value: unknown, fallback: boolean, field: string): boolean {
+  if (value === undefined) return fallback;
+  if (typeof value !== "boolean") {
+    throw new NoxClientError(`${field} must be a boolean`, NoxClientErrorCode.InvalidConfig);
+  }
+  return value;
+}
+
+/** Log label of an entry: its KPS address label, or "classic" (logs never carry URLs). */
+function entryLabel(entryUrl: string): string {
+  const address = kpsAddressOfEntry(entryUrl);
+  return address === null ? "classic" : kpsAddressLabel(address);
 }
 
 function boundedInteger(value: unknown, fallback: number, min: number, max: number, field: string): number {
@@ -3346,6 +3640,41 @@ const MAX_METADATA_BYTES = 16_384;
  * entry layer of every packet is encrypted to that member's key, which an
  * impostor cannot peel.
  */
+/** `nox-kps` capability that relays claim protocol v2 long-polls (nox `docs/claim-api.md`). */
+export const CLAIM_V2_CAPABILITY = "claim-v2";
+
+/** A relay's `/metadata.json` as an object (bounded size). Throws `TOPOLOGY_FETCH_FAILED`. */
+async function fetchRelayMetadata(address: string, timeoutMs: number, fetchImpl: NoxFetch): Promise<Record<string, unknown>> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let text: string;
+  try {
+    const response = await fetchImpl(`kps:${address}/metadata.json`, { signal: controller.signal });
+    if (!response.ok) {
+      throw new NoxClientError(`relay metadata answered HTTP ${response.status}`, NoxClientErrorCode.TopologyFetchFailed);
+    }
+    text = await response.text();
+  } catch (error) {
+    if (error instanceof NoxClientError) throw error;
+    throw new NoxClientError(`relay metadata fetch failed: ${describeUnknown(error)}`, NoxClientErrorCode.TopologyFetchFailed, error);
+  } finally {
+    clearTimeout(timer);
+  }
+  if (text.length > MAX_METADATA_BYTES) {
+    throw new NoxClientError("relay metadata is too large", NoxClientErrorCode.TopologyFetchFailed);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new NoxClientError("relay metadata is not JSON", NoxClientErrorCode.TopologyFetchFailed);
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new NoxClientError("relay metadata is not a JSON object", NoxClientErrorCode.TopologyFetchFailed);
+  }
+  return value as Record<string, unknown>;
+}
+
 async function fetchAnchorNode(address: string, timeoutMs: number, fetchImpl: NoxFetch): Promise<string> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -3548,12 +3877,21 @@ function resolveDiscovery(raw: unknown, pinned: PinnedSnapshot): ResolvedDiscove
     chain,
     firstSeen,
     onVerified: onVerified as ((state: VerifiedDiscovery) => void) | undefined,
+    userAnchors: bridges !== undefined ? new Set(bridges) : gateways !== undefined ? new Set(gateways) : undefined,
+    firstCheckDeferMs: boundedInteger(
+      options["firstCheckDeferMs"],
+      0,
+      0,
+      DISCOVERY_FIRST_CHECK_MAX_DEFER_MS * 8,
+      "kps.discovery.firstCheckDeferMs",
+    ),
   };
 }
 
 /** Keys of `KpsDiscoveryOptions`. */
 const DISCOVERY_OPTION_KEYS = new Set([
   "bootstrap",
+  "firstCheckDeferMs",
   "gateways",
   "bridges",
   "learned",
@@ -3635,4 +3973,8 @@ function parseSurbIdFromPacketId(packetId: string): string | null {
   const suffix = packetId.slice(lastDash + 1);
   if (suffix.length === 32 && HEX32_RE.test(suffix)) return suffix;
   return null;
+}
+
+function noop(): void {
+  // Intentionally empty: the rejection is handled by the next handler.
 }
