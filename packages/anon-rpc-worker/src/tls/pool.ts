@@ -225,6 +225,7 @@ export class TlsPool {
       this.deps.log.debug("tls.open", {
         tunnel: channel.tunnel.label,
         ms: this.deps.now() - startedAt,
+        cpuMs: Math.round(channel.handshakeCpuMs * 10) / 10,
         protocol: channel.protocol,
         spare: timing.background,
       });

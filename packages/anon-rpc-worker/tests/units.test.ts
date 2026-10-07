@@ -33,11 +33,13 @@ describe("config", () => {
       '{"v":1,"gateways":["' + kpsAddressFor(2) + '"],"logLevel":"warn","attemptTimeoutMs":5000,' +
         '"callDeadlineMs":20000,"maxConcurrentCalls":8,"maxRequestBytes":2048,"maxResponseBytes":100000,' +
         '"surbFormat":"v2","claimIntervalMs":100,"bootRetryMaxMs":10000,"topologySources":3,"warmup":true,' +
-        '"hedgeAfterMs":0}',
+        '"hedgeAfterMs":0,"tls":"preferred","tlsSession":"keep-alive","tlsSpares":0,"tlsKeepAliveMs":50000,' +
+        '"tlsMaxCallsPerSession":5,"tlsOpenTimeoutMs":2000,"tlsCopyAfterMs":500,"tlsGapMs":100,"tlsMaxCopies":5,"tlsSpareTtlMs":1000}',
     ) as Record<string, unknown>;
     const snapshot = JSON.stringify(raw);
     const config = parseConfig(raw);
     expect(config).toMatchObject({ gateways: [kpsAddressFor(2)], logLevel: "warn", surbFormat: "v2", warmup: true, topologySources: 3, hedgeAfterMs: 0 });
+    expect(config).toMatchObject({ tls: "preferred", tlsSession: "keep-alive", tlsSpares: 0, tlsKeepAliveMs: 50_000, tlsMaxCopies: 5 });
     expect(Object.isFrozen(config)).toBe(true);
     expect(JSON.stringify(raw)).toBe(snapshot);
   });
@@ -69,8 +71,22 @@ describe("config", () => {
     ["discovery mode", { discovery: "dns" }, /discovery must be one of chain, snapshot/u],
     ["trust proven", { trust: "proven" }, /trust is reserved/u],
     ["checkpoint", { checkpoint: { block: 1 } }, /checkpoint is reserved/u],
+    ["tls mode", { tls: "opportunistic" }, /tls must be one of required, preferred, off/u],
+    ["tls session", { tlsSession: "resume" }, /tlsSession must be one of per-call, keep-alive/u],
+    ["five spares", { tlsSpares: 5 }, /tlsSpares must be an integer in 0\.\.4/u],
+    ["keep-alive past the exit idle", { tlsKeepAliveMs: 50_001 }, /tlsKeepAliveMs must be an integer in 1000\.\.50000/u],
+    ["spare ttl past the exit idle", { tlsSpareTtlMs: 60_000 }, /tlsSpareTtlMs/u],
+    ["no copies", { tlsMaxCopies: 0 }, /tlsMaxCopies must be an integer in 1\.\.5/u],
+    ["copy timer", { tlsCopyAfterMs: 499 }, /tlsCopyAfterMs/u],
+    ["gap timer", { tlsGapMs: 10_001 }, /tlsGapMs/u],
+    ["open timeout", { tlsOpenTimeoutMs: 999 }, /tlsOpenTimeoutMs/u],
+    ["calls per session", { tlsMaxCallsPerSession: 0 }, /tlsMaxCallsPerSession/u],
   ])("rejects %s with bad-config", (_name, raw, message) => {
     expect(() => parseConfig(raw)).toThrow(expect.objectContaining({ code: "bad-config", message: expect.stringMatching(message) }));
+  });
+
+  it("defaults to the most private TLS settings: tunnels required, one session per call", () => {
+    expect(CONFIG_DEFAULTS).toMatchObject({ tls: "required", tlsSession: "per-call", tlsSpares: 1, tlsSpareTtlMs: 20_000 });
   });
 
   it("accepts gateways that no pinned member publishes: they are addresses, not identities", () => {

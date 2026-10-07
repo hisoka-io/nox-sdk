@@ -34,6 +34,8 @@ export class TlsChannel {
   readonly openedAt: number;
   /** Requests sent on this session. */
   calls = 0;
+  /** Milliseconds spent in the TLS module processing the server's handshake flight. */
+  handshakeCpuMs = 0;
   /** False once a response asked to close or the stream ended. */
   private keepAlive = true;
   private parser: HttpParserLike | undefined;
@@ -150,7 +152,13 @@ export class TlsChannel {
   }
 
   private onBytes(bytes: Uint8Array): void {
-    this.tls.pushIncoming(bytes);
+    if (this.tls.isHandshaking()) {
+      const started = performance.now();
+      this.tls.pushIncoming(bytes);
+      this.handshakeCpuMs += performance.now() - started;
+    } else {
+      this.tls.pushIncoming(bytes);
+    }
     this.feedParser(this.tls.takePlaintext());
     if (this.tls.closeNotifyReceived() && this.parser !== undefined && !this.parserDone) {
       this.parser.finishOnClose(true);

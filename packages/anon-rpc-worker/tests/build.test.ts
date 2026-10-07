@@ -95,6 +95,19 @@ describe("buildWorker", () => {
     expect(record.entry).toBe("src/worker.ts");
   });
 
+  it("embeds the TLS module, and a test root only when asked for one", async () => {
+    const release = await buildWorker({ outfile: outfile("tls"), write: false });
+    const tlsWasm = readFileSync(join(REPO_DIR, "packages", "nox-tls", "pkg-web", "nox_tls_bg.wasm"));
+    expect(Buffer.from(release.bundle).toString("utf8")).toContain(tlsWasm.toString("base64"));
+    expect(release.record.tls).toMatchObject({ bytes: tlsWasm.byteLength, keccak256: `0x${Buffer.from(keccak_256(tlsWasm)).toString("hex")}` });
+    expect(release.record.extraRoots).toBe(0);
+    const ca = join(REPO_DIR, "packages", "nox-tls", "tests", "fixtures", "ca.cert.der");
+    const test = await buildWorker({ outfile: outfile("tls-root"), write: false, extraRoot: ca });
+    expect(test.record.extraRoots).toBe(1);
+    expect(Buffer.from(test.bundle).toString("utf8")).toContain(readFileSync(ca).toString("base64"));
+    await expect(buildWorker({ outfile: outfile("tls-bad-root"), write: false, extraRoot: SNAPSHOT_PATH })).rejects.toThrow(/not a DER certificate/u);
+  });
+
   it("holds no live path to the ambient fetch or WebSocket", async () => {
     const { bundle } = await buildWorker({ outfile: outfile("policy"), write: false });
     const text = Buffer.from(bundle).toString("utf8");
