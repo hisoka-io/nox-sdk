@@ -85,3 +85,7 @@ jobs:
       - name: Run WASM tests (Node)
         working-directory: nox-sdk/packages/nox-wasm
         run: wasm-pack test --node -- --release --locked
+
+      - name: Test nox-tls (TLS client, native loopback against rustls)
+        working-directory: nox-sdk
+        run: cargo test -p nox-tls --locked
