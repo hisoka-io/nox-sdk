@@ -47,6 +47,12 @@ export interface MeshConfig {
   readonly blockPollIntervalSecs: number;
   /** Deadline for every node to serve the registry topology after registration. */
   readonly registrySyncTimeoutMs: number;
+  /**
+   * Exits accept TLS tunnels (`[tunnel] enabled`, set through the nodes'
+   * environment; nox before rc.9 ignores it). The mesh configs already allow
+   * private addresses, so a tunnel reaches the bed's HTTPS front on loopback.
+   */
+  readonly tunnels: boolean;
 }
 
 export interface AnvilConfig {
@@ -182,6 +188,7 @@ export function loadConfig(env: Env = process.env, e2eRoot: string = E2E_ROOT): 
       localRegistry: env["E2E_LOCAL_REGISTRY"] !== "0",
       blockPollIntervalSecs: intFrom(env, "E2E_BLOCK_POLL_SECS", 1, 1, 60),
       registrySyncTimeoutMs: intFrom(env, "E2E_REGISTRY_SYNC_TIMEOUT_MS", 60_000, 1_000, 600_000),
+      tunnels: env["E2E_TUNNELS"] !== "0",
     },
     anvil: {
       bin: env["ANVIL_BIN"] ?? "anvil",

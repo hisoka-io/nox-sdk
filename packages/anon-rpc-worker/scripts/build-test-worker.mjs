@@ -9,7 +9,8 @@
  *      the mesh nodes observe (address, deployment block, last registration);
  *   2. write a one-entry networks file for that registry (powDifficulty 0, the
  *      mesh's minimum) and capability hints from the liveness section of one
- *      node's served topology, as the release hints come from the seed;
+ *      node's served topology and from every node's own `/metrics/json`, as
+ *      the release hints come from the seed (which reads the same documents);
  *   3. `make-snapshot.mjs` at the registration block (anvil has no finalized
  *      history, so --allow-unsafe-block), which reads the chain, cross-checks
  *      the fingerprint and runs the SDK's on-chain verification;
@@ -22,12 +23,17 @@
  *
  * `--snapshot-block <n>` pins the snapshot at another block than the last
  * registration (the S1 spec pins it before a member joins).
+ * `--extra-root <ca.der>` embeds the bed's TLS test CA next to the Mozilla
+ * roots (the HTTPS front the TLS-tunnel spec calls); `--without-capability
+ * <name>` drops one hint from every member (a bundle that knows no tunnel
+ * exit). Neither exists in the release build.
  *
  * The snapshot, networks and capability files land next to the bundle, so a
  * run keeps every input of the bundle it tested. Never used for a release:
  * the release snapshot is snapshot/nox-snapshot.json from the live registry.
  *
  * Usage: node scripts/build-test-worker.mjs --testbed <testbed.json> --out <bundle.js> [--snapshot-block <n>]
+ *          [--extra-root <ca.der>] [--without-capability <name>]
  */
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -39,7 +45,7 @@ import { canonicalJson } from "./lib/snapshot-format.mjs";
 import { DISCOVERY_POLICY_DEFAULTS, verifyBootstrap } from "@hisoka-io/nox-client";
 
 export const TEST_NETWORK = "local-testbed";
-/** Deadline for reading one node's served topology. */
+/** Deadline for reading one node's served topology or metrics. */
 const TOPOLOGY_TIMEOUT_MS = 5_000;
 
 export class TestWorkerError extends Error {
@@ -152,6 +158,50 @@ export function capabilitiesFromTopology(topology, source) {
 }
 
 /**
+ * Capability hints each node lists in its own `/metrics/json` (served next to
+ * its `/topology`), keyed by member address.
+ * @param {unknown} info  testbed.json
+ * @returns {Promise<Record<string, string[]>>}
+ */
+export async function capabilitiesFromMetrics(info) {
+  const nodes = /** @type {{ mesh?: { nodes?: { address?: unknown, topologyUrl?: unknown }[] } }} */ (info).mesh?.nodes ?? [];
+  /** @type {Record<string, string[]>} */
+  const members = {};
+  for (const node of nodes) {
+    if (typeof node.address !== "string" || typeof node.topologyUrl !== "string") continue;
+    const url = new URL("/metrics/json", node.topologyUrl).href;
+    let metrics;
+    try {
+      const response = await fetch(url, { signal: AbortSignal.timeout(TOPOLOGY_TIMEOUT_MS) });
+      metrics = /** @type {{ capabilities?: unknown }} */ (await response.json());
+    } catch (error) {
+      throw new TestWorkerError(`cannot read ${url}: ${error instanceof Error ? error.message : String(error)}`, "topology");
+    }
+    const listed = Array.isArray(metrics.capabilities) ? metrics.capabilities.filter((hint) => typeof hint === "string") : [];
+    members[node.address.toLowerCase()] = [...new Set(listed)].sort();
+  }
+  return members;
+}
+
+/**
+ * Hints from both sources, one list per member, minus `without`.
+ * @param {Record<string, string[]>} first
+ * @param {Record<string, string[]>} second
+ * @param {string | undefined} without
+ * @returns {Record<string, string[]>}
+ */
+export function mergeCapabilities(first, second, without) {
+  /** @type {Record<string, string[]>} */
+  const merged = {};
+  for (const address of [...new Set([...Object.keys(first), ...Object.keys(second)])].sort()) {
+    const hints = new Set([...(first[address] ?? []), ...(second[address] ?? [])]);
+    if (without !== undefined) hints.delete(without);
+    if (hints.size > 0) merged[address] = [...hints].sort();
+  }
+  return merged;
+}
+
+/**
  * @param {string[]} argv
  * @returns {Promise<number>}
  */
@@ -162,11 +212,16 @@ export async function main(argv) {
       testbed: { type: "string" },
       out: { type: "string" },
       "snapshot-block": { type: "string" },
+      "extra-root": { type: "string" },
+      "without-capability": { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
-    process.stdout.write("usage: build-test-worker.mjs --testbed <testbed.json> --out <bundle.js> [--snapshot-block <n>]\n");
+    process.stdout.write(
+      "usage: build-test-worker.mjs --testbed <testbed.json> --out <bundle.js> [--snapshot-block <n>]\n" +
+        "                             [--extra-root <ca.der>] [--without-capability <name>]\n",
+    );
     return 0;
   }
   if (values.testbed === undefined || values.out === undefined) {
@@ -209,10 +264,9 @@ export async function main(argv) {
     throw new TestWorkerError(`cannot read ${topologyUrl}: ${error instanceof Error ? error.message : String(error)}`, "topology");
   }
   const capabilitiesPath = join(dir, "capabilities.json");
-  writeFileSync(
-    capabilitiesPath,
-    `${JSON.stringify(capabilitiesFromTopology(topology, `liveness section of ${topologyUrl} (local mesh node)`), null, 2)}\n`,
-  );
+  const served = capabilitiesFromTopology(topology, `liveness section of ${topologyUrl} and /metrics/json of every node (local mesh)`);
+  const capabilities = { ...served, members: mergeCapabilities(served.members, await capabilitiesFromMetrics(info), values["without-capability"]) };
+  writeFileSync(capabilitiesPath, `${JSON.stringify(capabilities, null, 2)}\n`);
 
   const snapshotPath = join(dir, "nox-snapshot.json");
   const snapshotCode = await snapshotMain([
@@ -234,7 +288,9 @@ export async function main(argv) {
   }
   const bootstrapPath = join(dir, "nox-bootstrap.json");
   writeFileSync(bootstrapPath, canonicalJson(bootstrap));
-  const buildCode = await buildMain(["--snapshot", snapshotPath, "--bootstrap", bootstrapPath, "--outfile", out]);
+  const buildArgs = ["--snapshot", snapshotPath, "--bootstrap", bootstrapPath, "--outfile", out];
+  if (values["extra-root"] !== undefined) buildArgs.push("--extra-root", resolve(values["extra-root"]));
+  const buildCode = await buildMain(buildArgs);
   if (buildCode !== 0) throw new TestWorkerError(`build exited with ${buildCode}`, "build");
   return 0;
 }
