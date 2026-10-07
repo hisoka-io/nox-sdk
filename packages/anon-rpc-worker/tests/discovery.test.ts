@@ -11,7 +11,7 @@ import { runNoxWorker } from "../src/core.js";
 import { LEARNED_CACHE_KEY } from "../src/storage.js";
 import { FakeHarness } from "./helpers/fake-harness.js";
 import { FakeNoxNetwork, fakeWasm } from "./helpers/fake-nox-network.js";
-import { certhashFor, exitReply, FIXTURE_PROVIDERS, kpsAddressFor, makeBootstrap, makePinned, memberAddress } from "./helpers/fixtures.js";
+import { certhashFor, exitReply, fakeTlsBindings, FIXTURE_PROVIDERS, kpsAddressFor, makeBootstrap, makePinned, memberAddress, tlsOff } from "./helpers/fixtures.js";
 import { RegistryRpc } from "./helpers/registry-rpc.js";
 
 const ambientFetch = vi.fn(() => {
@@ -61,13 +61,14 @@ function boot(config: unknown, options: { bootstrap?: (pinned: PinnedSnapshot) =
   network.registryView = () => rpc.view();
   network.observedBlock = () => rpc.blockNumber + 5;
   options.prepare?.({ pinned, network, rpc });
-  const harness = new FakeHarness(config, network.kps);
+  const harness = new FakeHarness(tlsOff(config), network.kps);
   for (const [key, value] of options.store ?? []) harness.store.set(key, value);
   let latest: NoxClient | undefined;
   void runNoxWorker(harness.api, {
     snapshot: pinned,
     bootstrap: (options.bootstrap ?? makeBootstrap)(pinned),
     loadWasm: async () => fakeWasm(),
+    loadTls: async () => fakeTlsBindings(),
     connect: async (clientConfig) => {
       const client = await NoxClient.connect(clientConfig);
       clients.push(client);

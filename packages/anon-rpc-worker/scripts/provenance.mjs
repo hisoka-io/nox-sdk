@@ -6,8 +6,10 @@
  *
  *   dist/anon-rpc-worker.provenance.json
  *   { package, version, gitCommit, gitTreeClean,
- *     toolchain: { rustc, wasmPack, wasmBindgen, wasmOpt, wasmPinsChecked, node, pnpm, esbuild, pins },
- *     inputs: { snapshotKeccak, snapshotBlock, bootstrapKeccak, wasmSha256, wasmKeccak, lockfileSha256 },
+ *     toolchain: { rustc, wasmPack, wasmBindgen, wasmOpt, clang, wasmPinsChecked, node, pnpm, esbuild, pins },
+ *     inputs: { snapshotKeccak, snapshotBlock, bootstrapKeccak, wasmSha256, wasmKeccak,
+ *               tlsWasmSha256, tlsWasmKeccak, lockfileSha256 },
+ *     tls: { webpkiRoots, webpkiRootsReleased, extraRoots },
  *     output: { bytes, sha256, keccak256 },
  *     builder: { os, arch } }
  *
@@ -15,7 +17,10 @@
  * on one platform give identical provenance bytes as well. Sources:
  * dist/build-record.json (scripts/build.mjs), the WASM toolchain record of
  * scripts/build-wasm.sh (.build/wasm-toolchain.json), scripts/toolchain.env,
- * the pinned snapshot, the pnpm lockfile and git. Every digest is recomputed
+ * the pinned snapshot, the pnpm lockfile, Cargo.lock and the nox-tls
+ * manifest (the compiled-in Mozilla root store and its release date), and git.
+ * `tls.extraRoots` counts test-bed roots embedded next to the Mozilla ones; a
+ * release has 0. Every digest is recomputed
  * from the files on disk and must agree with the records.
  *
  * Usage:
@@ -143,6 +148,32 @@ function gitCheckoutState(repoDir) {
 }
 
 /**
+ * The Mozilla root store nox-tls compiles in: the webpki-roots version
+ * Cargo.lock resolves, and the release date packages/nox-tls/Cargo.toml
+ * records for that version (`[package.metadata.webpki-roots]`). A lock that
+ * moved to another version without the manifest following is an error.
+ * @param {string} repoDir
+ * @returns {{ webpkiRoots: string, webpkiRootsReleased: string }}
+ */
+export function webpkiRoots(repoDir) {
+  const lock = readFileSync(join(repoDir, "Cargo.lock"), "utf8");
+  const locked = [...lock.matchAll(/\[\[package\]\]\nname = "webpki-roots"\nversion = "([^"]+)"/gu)].map((match) => match[1]);
+  const manifest = readFileSync(join(repoDir, "packages", "nox-tls", "Cargo.toml"), "utf8");
+  const section = /\[package\.metadata\.webpki-roots\]\nversion = "([^"]+)"\nreleased = "(\d{4}-\d{2}-\d{2})"/u.exec(manifest);
+  if (section === null || section[1] === undefined || section[2] === undefined) {
+    throw new ProvenanceError("packages/nox-tls/Cargo.toml has no [package.metadata.webpki-roots] version and released date", "missing-input");
+  }
+  if (locked.length !== 1 || locked[0] !== section[1]) {
+    throw new ProvenanceError(
+      `Cargo.lock resolves webpki-roots ${locked.join(", ") || "nowhere"} but packages/nox-tls/Cargo.toml records ${section[1]}; ` +
+        "update [package.metadata.webpki-roots] with the new version and its release date",
+      "inconsistent",
+    );
+  }
+  return { webpkiRoots: section[1], webpkiRootsReleased: section[2] };
+}
+
+/**
  * Build the provenance document.
  * @param {{ distDir: string, wasmRecordPath: string, sourceCommit?: string | undefined,
  *           packageDir?: string, repoDir?: string, snapshotPath?: string, toolchainPath?: string }} options
@@ -171,6 +202,14 @@ export function makeProvenance(options) {
   let wasmToolchain = null;
   if (existsSync(options.wasmRecordPath)) {
     wasmToolchain = readJsonObject(options.wasmRecordPath, "WASM toolchain record");
+    const recordedTls = record["tls"];
+    if (isRecord(recordedTls) && wasmToolchain["tlsWasmSha256"] !== recordedTls["sha256"]) {
+      throw new ProvenanceError(
+        `the embedded nox-tls module (sha256 ${String(recordedTls["sha256"])}) is not the one ${options.wasmRecordPath} describes ` +
+          `(${String(wasmToolchain["tlsWasmSha256"])}); run scripts/build-wasm.sh and scripts/build.mjs again`,
+        "inconsistent",
+      );
+    }
     if (wasmToolchain["wasmSha256"] !== wasm["sha256"]) {
       throw new ProvenanceError(
         `the embedded nox-wasm module (sha256 ${String(wasm["sha256"])}) is not the one ${options.wasmRecordPath} describes ` +
@@ -220,6 +259,7 @@ export function makeProvenance(options) {
   }
 
   const toolchainText = readFileSync(options.toolchainPath ?? TOOLCHAIN_PATH, "utf8");
+  const tls = isRecord(record["tls"]) ? record["tls"] : null;
 
   return {
     package: manifest["name"],
@@ -230,6 +270,7 @@ export function makeProvenance(options) {
       wasmPack: wasmTool("wasmPack"),
       wasmBindgen: wasmTool("wasmBindgen"),
       wasmOpt: wasmTool("wasmOpt"),
+      clang: wasmTool("clang"),
       wasmPinsChecked: wasmToolchain === null ? null : wasmToolchain["pinsChecked"] === true,
       node: process.version,
       pnpm,
@@ -242,8 +283,13 @@ export function makeProvenance(options) {
       bootstrapKeccak,
       wasmSha256: wasm["sha256"],
       wasmKeccak: wasm["keccak256"],
+      tlsWasmSha256: tls === null ? null : tls["sha256"],
+      tlsWasmKeccak: tls === null ? null : tls["keccak256"],
       lockfileSha256: sha256Hex(readFileSync(join(repoDir, "pnpm-lock.yaml"))),
     },
+    tls: tls === null
+      ? null
+      : { ...webpkiRoots(repoDir), extraRoots: typeof record["extraRoots"] === "number" ? record["extraRoots"] : 0 },
     output,
     builder: { os: process.platform, arch: process.arch },
   };

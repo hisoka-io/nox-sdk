@@ -13,8 +13,11 @@ import {
   type PinnedMember,
   type PinnedSnapshot,
   type RelayerNode,
+  type TopologyNode,
+  type TunnelSendHandle,
 } from "@hisoka-io/nox-client";
 import type { NoxClientPort } from "../../src/core.js";
+import type { NoxTlsBindings } from "../../src/tls/module.js";
 
 export function certhashFor(label: string): string {
   const digest = createHash("sha256").update(label).digest();
@@ -192,6 +195,17 @@ export class FakeClient implements NoxClientPort {
     return this.echo(data);
   }
 
+  /** Exits advertising `tunnel_v1`: none unless a test sets some. */
+  tunnelNodes: TopologyNode[] = [];
+
+  tunnelExits(): TopologyNode[] {
+    return this.tunnelNodes;
+  }
+
+  tunnelSend(): TunnelSendHandle {
+    throw new Error("FakeClient has no tunnel exits; tests of the tunnel path use tests/helpers/fake-tunnel.ts");
+  }
+
   disconnect(): void {
     this.disconnected += 1;
   }
@@ -225,4 +239,24 @@ export function deferred<T>(): { promise: Promise<T>; resolve(value: T): void; r
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+/** TLS module stand-in for tests that never open a tunnel. */
+export function fakeTlsBindings(): NoxTlsBindings {
+  const unused = (): never => {
+    throw new Error("the TLS module is not used in this test");
+  };
+  return {
+    newSession: unused,
+    newParser: unused,
+    encodeRequest: unused,
+    info: { crate: "0.0.0", webpkiRoots: 0 },
+  };
+}
+
+/** `config` with `tls: "off"` unless it sets `tls`: tests of the exit `HttpRequest` path. */
+export function tlsOff(config: unknown): unknown {
+  if (config === undefined) return { tls: "off" };
+  if (typeof config !== "object" || config === null || Array.isArray(config)) return config;
+  return "tls" in config ? config : { tls: "off", ...config };
 }

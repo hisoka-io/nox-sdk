@@ -27,6 +27,13 @@ export interface NoxHttpPort {
   ): Promise<Uint8Array>;
 }
 
+/** TLS tunnels for fetch hops (src/tls/transport.ts). */
+export interface TunnelHop {
+  /** `"tunnel"` or `"http"` for this hop; throws the call's rejection when the hop may not leave. */
+  route(request: PreparedRequest, hop: number, startedOnTunnel: boolean): "tunnel" | "http";
+  exchange(request: PreparedRequest, budget: CallBudget): Promise<DecodedHttpResponse>;
+}
+
 /** Limits from the worker config. */
 export interface FetchSettings {
   readonly attemptTimeoutMs: number;
@@ -185,17 +192,27 @@ export interface CallBudget {
  * need time and writes are never resent (ARCHITECTURE §4.7). The SDK still
  * resends any request whose packet was certainly never sent (a KPS dial or
  * stream-open failure) through another entry.
+ *
+ * With `tunnels`, each hop first asks it for its transport: a hop that goes
+ * through a TLS tunnel is exchanged there, and once one hop did, every later
+ * hop must too.
  */
 export async function sendPrepared(
   request: PreparedRequest,
   port: NoxHttpPort,
   settings: FetchSettings,
   budget: CallBudget,
+  tunnels?: TunnelHop,
 ): Promise<AnonFetchResponse> {
   if (budget.remainingMs() <= 0) throw callError(CALL_CODES.timeout, "The call deadline passed before sending");
   let current = request;
+  let onTunnel = false;
   for (let hop = 0; ; hop++) {
-    const reply = await exchange(current, port, settings, budget);
+    const via = tunnels?.route(current, hop, onTunnel) ?? "http";
+    const reply = tunnels !== undefined && via === "tunnel"
+      ? await tunnels.exchange(current, budget)
+      : await exchange(current, port, settings, budget);
+    if (via === "tunnel") onTunnel = true;
     checkStatus(reply);
     if (!REDIRECT_STATUSES.has(reply.status) || current.redirect === "manual") {
       return finishResponse(reply, current, settings);

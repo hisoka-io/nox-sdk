@@ -58,7 +58,7 @@ describe.skipIf(!built)("worker bundle smoke", () => {
       }
     });
     const network = new FakeNoxNetwork(pinned, () => exitReply(200, [], "{}"));
-    const harness = new FakeHarness({ topologySources: 1, callDeadlineMs: 3_000, attemptTimeoutMs: 3_000 }, network.kps);
+    const harness = new FakeHarness({ topologySources: 1, callDeadlineMs: 3_000, attemptTimeoutMs: 3_000, tls: "preferred" }, network.kps);
     (globalThis as { anonRpcWorker?: unknown }).anonRpcWorker = harness.api;
     new Function(code)();
     try {

@@ -4,7 +4,7 @@ import { LOCAL_ANSWER_MAX_ENTRIES, LocalAnswers } from "../src/local-answers.js"
 import { runNoxWorker, type WorkerDeps } from "../src/core.js";
 import type { AnonFetchResponse } from "../src/spec-types.js";
 import { FakeHarness, idleKps } from "./helpers/fake-harness.js";
-import { FakeClient, exitReply, makeBootstrap, makePinned, scriptedConnect } from "./helpers/fixtures.js";
+import { FakeClient, exitReply, fakeTlsBindings, makeBootstrap, makePinned, scriptedConnect, tlsOff } from "./helpers/fixtures.js";
 
 const SETTINGS: FetchSettings = { attemptTimeoutMs: 12_000, maxRequestBytes: 65_536, maxResponseBytes: 1_000_000 };
 const URL_A = "https://rpc.example.test/";
@@ -137,7 +137,7 @@ describe("LocalAnswers", () => {
 describe("worker-local answers in the worker", () => {
   it("answers eth_chainId locally after the background check, so later calls send nothing", async () => {
     const pinned = makePinned();
-    const harness = new FakeHarness(undefined, idleKps());
+    const harness = new FakeHarness(tlsOff(undefined), idleKps());
     const client = new FakeClient(pinned, () =>
       exitReply(200, [["content-type", "application/json"]], '{"jsonrpc":"2.0","id":1,"result":"0xaa36a7"}'));
     const scripted = scriptedConnect(client);
@@ -145,6 +145,7 @@ describe("worker-local answers in the worker", () => {
       snapshot: pinned,
       bootstrap: makeBootstrap(pinned),
       loadWasm: async () => ({ marker: true }),
+      loadTls: async () => fakeTlsBindings(),
       connect: scripted.connect,
       sleep: () => new Promise((resolve) => setTimeout(resolve, 1)),
     };

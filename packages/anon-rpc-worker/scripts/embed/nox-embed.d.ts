@@ -17,3 +17,13 @@ declare module "nox-embed:wasm-glue" {
   export * from "@hisoka-io/nox-wasm";
   export function initSync(options: { module: BufferSource | WebAssembly.Module }): unknown;
 }
+
+declare module "nox-embed:tls-base64" {
+  const base64: string;
+  export default base64;
+}
+
+declare module "nox-embed:tls-glue" {
+  export * from "nox-embed:tls";
+  export function initSync(options: { module: BufferSource | WebAssembly.Module }): unknown;
+}

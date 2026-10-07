@@ -4,7 +4,7 @@ import { bootBackoffMs, installUnhandledRejectionLog, runNoxWorker, snapshotIden
 import { REMOVAL_CACHE_KEY } from "../src/storage.js";
 import type { KpsApi } from "../src/spec-types.js";
 import { FakeHarness, idleKps } from "./helpers/fake-harness.js";
-import { FakeClient, deferred, exitReply, kpsAddressFor, makeBootstrap, makePinned, scriptedConnect } from "./helpers/fixtures.js";
+import { FakeClient, deferred, exitReply, fakeTlsBindings, kpsAddressFor, makeBootstrap, makePinned, scriptedConnect, tlsOff } from "./helpers/fixtures.js";
 
 const unhandled: unknown[] = [];
 const onUnhandled = (reason: unknown): void => {
@@ -28,13 +28,14 @@ function setup(options: {
   deps?: Partial<WorkerDeps>;
 } = {}) {
   const pinned = makePinned();
-  const harness = new FakeHarness(options.config, "kps" in options ? options.kps : idleKps());
+  const harness = new FakeHarness(tlsOff(options.config), "kps" in options ? options.kps : idleKps());
   const client = new FakeClient(pinned);
   const scripted = scriptedConnect(client, options.failures);
   const deps: WorkerDeps = {
     snapshot: pinned,
     bootstrap: makeBootstrap(pinned),
     loadWasm: async () => ({ marker: true }),
+    loadTls: async () => fakeTlsBindings(),
     connect: scripted.connect,
     sleep: fastSleep,
     ...options.deps,
@@ -257,7 +258,7 @@ describe("boot", () => {
         new TextEncoder().encode(JSON.stringify({ snapshot, block: 1, removed, at: fresh })),
       );
       const scripted = scriptedConnect(new FakeClient(pinned));
-      void runNoxWorker(harness.api, { snapshot: pinned, bootstrap: makeBootstrap(pinned), loadWasm: async () => ({}), connect: scripted.connect });
+      void runNoxWorker(harness.api, { snapshot: pinned, bootstrap: makeBootstrap(pinned), loadWasm: async () => ({}), loadTls: async () => fakeTlsBindings(), connect: scripted.connect });
       await harness.ready;
       expect(scripted.configs[0]?.kps?.deprioritize).toEqual(expected);
     }
@@ -470,7 +471,7 @@ describe("logging policy", () => {
       throw new Error("log sink down");
     };
     const api = { ...harness.api, log: { debug: throwing, info: throwing, warn: throwing, error: throwing } };
-    void runNoxWorker(api, { snapshot: pinned, bootstrap: makeBootstrap(pinned), loadWasm: async () => ({}), connect: scriptedConnect(new FakeClient(pinned)).connect });
+    void runNoxWorker(api, { snapshot: pinned, bootstrap: makeBootstrap(pinned), loadWasm: async () => ({}), loadTls: async () => fakeTlsBindings(), connect: scriptedConnect(new FakeClient(pinned)).connect });
     await harness.ready;
     expect(harness.readyCount).toBe(1);
   });

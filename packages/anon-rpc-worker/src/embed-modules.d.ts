@@ -13,3 +13,19 @@ declare module "nox-embed:bootstrap" {
   const bootstrap: unknown;
   export default bootstrap;
 }
+
+declare module "nox-embed:tls" {
+  /** Initialise the embedded nox-tls module (no fetch; the bytes are in the bundle). */
+  export default function init(): Promise<void>;
+  export const TlsClientConfig: import("./tls/module.js").NoxTlsExports["TlsClientConfig"];
+  export const TlsClientSession: import("./tls/module.js").NoxTlsExports["TlsClientSession"];
+  export const HttpResponseParser: import("./tls/module.js").NoxTlsExports["HttpResponseParser"];
+  export const encodeHttpRequest: import("./tls/module.js").NoxTlsExports["encodeHttpRequest"];
+  export const buildInfo: import("./tls/module.js").NoxTlsExports["buildInfo"];
+}
+
+declare module "nox-embed:tls-root" {
+  /** A test bed's CA certificate (DER), trusted next to the compiled-in roots; `null` in every release build. */
+  const extraRootDer: Uint8Array | null;
+  export default extraRootDer;
+}
