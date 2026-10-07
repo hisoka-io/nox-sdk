@@ -16,6 +16,8 @@ import {
   decodePaidQuoteOutcomeV2,
   encodePaidTransactionOutcomeV2,
   encodePaidQuoteOutcomeV2,
+  encodeTunnelReplyV1,
+  decodeTunnelReplyV1,
   PAYLOAD_VERSION,
 } from "../src/bincode.js";
 import type {
@@ -536,5 +538,83 @@ describe("bincode error handling", () => {
       const e = err as NoxClientError;
       expect(e.code).toBe(NoxClientErrorCode.DecryptionFailed);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// TunnelV1 (tag 8): shared wire vectors with nox-core (E2E-TLS design §2.3)
+// ---------------------------------------------------------------------------
+
+describe("TunnelV1 wire vectors", () => {
+  const tunnelId = Uint8Array.from({ length: 16 }, (_, index) => index);
+  const fromHex = (text: string): Uint8Array => Uint8Array.from(text.match(/../gu) ?? [], (pair) => parseInt(pair, 16));
+
+  const requests: [ServiceRequest, string][] = [
+    [
+      {
+        tag: "TunnelV1",
+        tunnelId,
+        seq: 0,
+        open: { host: "rpc.example", port: 443 },
+        ackOffset: 0n,
+        data: fromHex("16030100020100"),
+        close: false,
+        holdMs: 20_000,
+      },
+      "0108000000000102030405060708090a0b0c0d0e0f00000000010b000000000000007270632e6578616d706c65bb01000000000000000007000000000000001603010002010000204e0000",
+    ],
+    [
+      {
+        tag: "TunnelV1",
+        tunnelId,
+        seq: 3,
+        open: null,
+        ackOffset: 5_123n,
+        data: new Uint8Array(0),
+        close: true,
+        holdMs: 20_000,
+      },
+      "0108000000000102030405060708090a0b0c0d0e0f03000000000314000000000000000000000000000001204e0000",
+    ],
+  ];
+
+  it("encodes the two request vectors byte for byte, with tag 8 appended", () => {
+    for (const [request, expected] of requests) {
+      const encoded = encodeServiceRequest(request);
+      expect(hex(encoded)).toBe(expected);
+      expect(hex(encoded.slice(1, 5))).toBe("08000000");
+      expect(decodeServiceRequest(encoded)).toEqual(request);
+    }
+  });
+
+  it("encodes and decodes the three reply vectors byte for byte", () => {
+    const replies: [Parameters<typeof encodeTunnelReplyV1>[0], string][] = [
+      [
+        { kind: "Data", seq: 1, offset: 4_096n, data: fromHex("170303000155"), fin: "Eof" },
+        "010000000001000000001000000000000006000000000000001703030001550100000000",
+      ],
+      [
+        { kind: "Data", seq: 2, offset: 0n, data: fromHex("1603030002"), fin: null },
+        "01000000000200000000000000000000000500000000000000160303000200",
+      ],
+      [
+        { kind: "Rejected", seq: 0, code: "DestinationBlocked", retryable: false, detail: "blocked" },
+        "01010000000000000005000000000700000000000000626c6f636b6564",
+      ],
+    ];
+    for (const [reply, expected] of replies) {
+      expect(hex(encodeTunnelReplyV1(reply))).toBe(expected);
+      expect(decodeTunnelReplyV1(fromHex(expected))).toEqual(reply);
+    }
+  });
+
+  it("refuses trailing bytes, unknown indices and an open that does not match seq", () => {
+    const data = "01000000000200000000000000000000000500000000000000160303000200";
+    expect(() => decodeTunnelReplyV1(fromHex(`${data}00`))).toThrow("trailing bytes");
+    expect(() => decodeTunnelReplyV1(fromHex(`0102${data.slice(4)}`))).toThrow("unknown variant");
+    expect(() => decodeTunnelReplyV1(fromHex(`${data.slice(0, -2)}0103000000`))).toThrow("unknown fin");
+    expect(() => decodeTunnelReplyV1(fromHex("0101000000000000000f000000000000000000000000"))).toThrow("unknown reject code");
+    const request = requests[1]![0];
+    expect(() => encodeServiceRequest({ ...request, seq: 0 } as ServiceRequest)).toThrow("open must be present");
   });
 });

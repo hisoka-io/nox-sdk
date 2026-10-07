@@ -34,6 +34,13 @@ export const PAID_V2_CAPABILITY = "paid_v2";
 export const SURB_V2_CAPABILITY = "surb_v2";
 
 /**
+ * Capability an exit advertises when it relays TLS tunnels
+ * (`ServiceRequest::TunnelV1`). Exits without it drop tunnel requests
+ * without a reply, so tunnels go only to exits that advertise it.
+ */
+export const TUNNEL_V1_CAPABILITY = "tunnel_v1";
+
+/**
  * Reply block format:
  * - "auto": v2 when every hop of the chosen route advertises `surb_v2`, v1 otherwise;
  * - "v1": always v1 (the 0.3.0 behaviour);
@@ -463,6 +470,38 @@ export interface HttpRequestOptions {
   signal?: AbortSignal;
   /** Largest reply accepted; a larger one fails with `RESPONSE_TOO_LARGE`. */
   maxResponseBytes?: number;
+}
+
+/** One copy of a tunnel exchange (`NoxClient.tunnelSend`). */
+export interface TunnelSendOptions {
+  /** Reply blocks attached; 0 sends without listening for a reply (a teardown). */
+  surbs: number;
+  /** Stop listening after this long; `done` then rejects with `RESPONSE_TIMEOUT`. */
+  timeoutMs: number;
+  /** Abort: stop listening and free the reply blocks; `done` rejects with `ABORTED`. */
+  signal?: AbortSignal;
+  /** Node ids kept out of the entry and mix positions when another choice exists. */
+  avoid?: ReadonlySet<string>;
+  /**
+   * Called with each reply part (the body of one `ServiceResponse`, an
+   * encoded `TunnelReplyV1`). Returning `"done"` stops listening.
+   */
+  onReply?: (body: Uint8Array) => "more" | "done";
+  /** Background work (spares, teardowns): not counted as the first wallet call. */
+  background?: boolean;
+}
+
+/** A tunnel exchange copy in flight. */
+export interface TunnelSendHandle {
+  /** Entry and mix this copy took, so the next copy can avoid them. */
+  readonly entryId: string;
+  readonly mixId: string;
+  /**
+   * Resolves once `onReply` returned `"done"`, or, with no reply blocks, once
+   * the entry accepted the packets. Rejects on timeout, abort or a packet
+   * transport failure.
+   */
+  readonly done: Promise<void>;
 }
 
 /** Configuration for `NoxClient.connect()`. */

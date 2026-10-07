@@ -113,7 +113,82 @@ export type ServiceRequest =
     }
   | { tag: "ReplenishSurbs"; requestId: bigint; surbs: Uint8Array[] }
   | ({ tag: "PaidTransactionV2" } & PaidTransactionRequestV2)
-  | ({ tag: "PaidQuoteRequestV2" } & PaidQuoteRequestV2);
+  | ({ tag: "PaidQuoteRequestV2" } & PaidQuoteRequestV2)
+  | ({ tag: "TunnelV1" } & TunnelRequestV1);
+
+/** Bytes of a tunnel id: client-random, never reused. */
+export const TUNNEL_ID_LEN = 16;
+/** Most `data` bytes in one tunnel `Data` part (one reply block each). */
+export const TUNNEL_PART_MAX_DATA = 30_656;
+/** Most UTF-8 bytes of a tunnel rejection's `detail`. */
+export const TUNNEL_REJECT_DETAIL_MAX = 256;
+
+/**
+ * One tunnel exchange (`ServiceRequest::TunnelV1`, bincode tag 8): TLS
+ * records to write to the exit's TCP connection, and an acknowledgement of
+ * the bytes already received. Only exits that advertise `tunnel_v1` accept it.
+ */
+export interface TunnelRequestV1 {
+  readonly tunnelId: Uint8Array;
+  /** 0 opens the tunnel; +1 for each new write or close. Copies repeat it. */
+  readonly seq: number;
+  /** Present exactly when `seq` is 0. */
+  readonly open: TunnelOpenV1 | null;
+  /** Contiguous downstream bytes the client holds. */
+  readonly ackOffset: bigint;
+  /** Identical on every copy of one `seq`; the exit writes each `seq` once. */
+  readonly data: Uint8Array;
+  /** After writing `data`, half-close the upstream write side. */
+  readonly close: boolean;
+  /** How long the exit may hold this exchange's reply blocks (clamped by the exit). */
+  readonly holdMs: number;
+}
+
+export interface TunnelOpenV1 {
+  readonly host: string;
+  readonly port: number;
+}
+
+/** Transport hints on a `Data` part; completeness comes from HTTP framing or TLS close_notify. */
+export const TUNNEL_FIN_V1 = ["Eof", "NeedSurbs", "Expired"] as const;
+export type TunnelFinV1 = (typeof TUNNEL_FIN_V1)[number];
+
+export const TUNNEL_REJECT_CODES_V1 = [
+  "Malformed",
+  "Disabled",
+  "PortNotAllowed",
+  "HostNotAllowed",
+  "NotTls",
+  "DestinationBlocked",
+  "DnsFailed",
+  "ConnectFailed",
+  "SessionLimit",
+  "RateLimited",
+  "UnknownSession",
+  "OutOfOrder",
+  "ByteLimit",
+  "UpstreamClosed",
+  "Expired",
+] as const;
+export type TunnelRejectCodeV1 = (typeof TUNNEL_REJECT_CODES_V1)[number];
+
+/** One reply part of a tunnel exchange, carried in one reply block. */
+export type TunnelReplyV1 =
+  | {
+      readonly kind: "Data";
+      readonly seq: number;
+      /** Position of `data` in the tunnel's downstream byte stream. */
+      readonly offset: bigint;
+      readonly data: Uint8Array;
+      readonly fin: TunnelFinV1 | null;
+    }
+  | {
+      readonly kind: "Rejected";
+      readonly seq: number;
+      readonly code: TunnelRejectCodeV1;
+      readonly retryable: boolean;
+      readonly detail: string;
+    };
 
 export const PAID_TRANSACTION_REJECTION_CODES_V2 = [
   "MalformedRequest",
@@ -530,6 +605,80 @@ function invalidV2Encoding(message: string): NoxClientError {
   );
 }
 
+/** Encode a tunnel reply part (exit side; used by tests and simulators). */
+export function encodeTunnelReplyV1(reply: TunnelReplyV1): Uint8Array {
+  const w = new Writer();
+  w.u8(PAYLOAD_VERSION);
+  if (reply.kind === "Data") {
+    w.u32(0);
+    w.u32(reply.seq);
+    w.u64(reply.offset);
+    w.bytes(reply.data);
+    if (reply.fin === null) {
+      w.u8(0);
+    } else {
+      w.u8(1);
+      w.u32(TUNNEL_FIN_V1.indexOf(reply.fin));
+    }
+  } else {
+    w.u32(1);
+    w.u32(reply.seq);
+    w.u32(TUNNEL_REJECT_CODES_V1.indexOf(reply.code));
+    w.u8(reply.retryable ? 1 : 0);
+    w.string(reply.detail);
+  }
+  return w.finish();
+}
+
+/**
+ * Decode one tunnel reply part. Strict: an unknown variant, fin or code
+ * index, an over-long `detail` and trailing bytes are all refused.
+ */
+export function decodeTunnelReplyV1(bytes: Uint8Array): TunnelReplyV1 {
+  checkVersion(bytes);
+  const r = new Reader(bytes, 1);
+  const variant = r.u32();
+  let reply: TunnelReplyV1;
+  if (variant === 0) {
+    const seq = r.u32();
+    const offset = r.u64();
+    const data = r.bytes();
+    if (data.length > TUNNEL_PART_MAX_DATA) {
+      throw invalidTunnelReply(`part of ${data.length} bytes exceeds ${TUNNEL_PART_MAX_DATA}`);
+    }
+    const fin = r.option(() => {
+      const index = r.u32();
+      const value = TUNNEL_FIN_V1[index];
+      if (value === undefined) throw invalidTunnelReply(`unknown fin index ${index}`);
+      return value;
+    });
+    reply = { kind: "Data", seq, offset, data, fin };
+  } else if (variant === 1) {
+    const seq = r.u32();
+    const index = r.u32();
+    const code = TUNNEL_REJECT_CODES_V1[index];
+    if (code === undefined) throw invalidTunnelReply(`unknown reject code index ${index}`);
+    const retryable = r.bool();
+    const detailBytes = r.bytes();
+    if (detailBytes.length > TUNNEL_REJECT_DETAIL_MAX) {
+      throw invalidTunnelReply(`detail of ${detailBytes.length} bytes exceeds ${TUNNEL_REJECT_DETAIL_MAX}`);
+    }
+    reply = { kind: "Rejected", seq, code, retryable, detail: new TextDecoder().decode(detailBytes) };
+  } else {
+    throw invalidTunnelReply(`unknown variant ${variant}`);
+  }
+  r.expectEnd("TunnelReplyV1");
+  return reply;
+}
+
+function invalidTunnelReply(message: string): NoxClientError {
+  return new NoxClientError(`Invalid TunnelReplyV1: ${message}`, NoxClientErrorCode.DecryptionFailed);
+}
+
+function invalidTunnelEncoding(message: string): NoxClientError {
+  return new NoxClientError(`Invalid TunnelV1 request: ${message}`, NoxClientErrorCode.PacketBuildFailed);
+}
+
 function checkVersion(bytes: Uint8Array): void {
   if (bytes.length === 0) {
     throw new NoxClientError(
@@ -552,6 +701,12 @@ class Writer {
 
   u8(v: number): void {
     this.raw(new Uint8Array([v & 0xff]));
+  }
+
+  u16(v: number): void {
+    const b = new Uint8Array(2);
+    new DataView(b.buffer).setUint16(0, v & 0xffff, true);
+    this.raw(b);
   }
 
   u32(v: number): void {
@@ -629,6 +784,13 @@ class Reader {
     return this.view.getUint8(this.pos++);
   }
 
+  u16(): number {
+    this.ensure(2);
+    const v = this.view.getUint16(this.pos, true);
+    this.pos += 2;
+    return v;
+  }
+
   u32(): number {
     this.ensure(4);
     const v = this.view.getUint32(this.pos, true);
@@ -664,6 +826,24 @@ class Reader {
 
   optString(): string | null {
     return this.u8() === 0 ? null : this.string();
+  }
+
+  /** bincode `bool`: exactly 0 or 1. */
+  bool(): boolean {
+    const v = this.u8();
+    if (v > 1) {
+      throw new NoxClientError(`Invalid bool byte ${v} at offset ${this.pos - 1}`, NoxClientErrorCode.DecryptionFailed);
+    }
+    return v === 1;
+  }
+
+  /** bincode `Option`: a 0 or 1 tag, then the value. */
+  option<T>(read: () => T): T | null {
+    const tag = this.u8();
+    if (tag > 1) {
+      throw new NoxClientError(`Invalid option tag ${tag} at offset ${this.pos - 1}`, NoxClientErrorCode.DecryptionFailed);
+    }
+    return tag === 0 ? null : read();
   }
 
   expectEnd(typeName: string): void {
@@ -869,6 +1049,25 @@ function writeServiceRequest(w: Writer, req: ServiceRequest): void {
       w.u32(req.returnDataLimit);
       w.u64(req.validUntilUnix);
       return;
+    case "TunnelV1":
+      w.u32(8);
+      writeFixed(w, req.tunnelId, TUNNEL_ID_LEN, "TunnelV1.tunnelId");
+      w.u32(req.seq);
+      if ((req.open !== null) !== (req.seq === 0)) {
+        throw invalidTunnelEncoding("open must be present exactly when seq is 0");
+      }
+      if (req.open === null) {
+        w.u8(0);
+      } else {
+        w.u8(1);
+        w.string(req.open.host);
+        w.u16(req.open.port);
+      }
+      w.u64(req.ackOffset);
+      w.bytes(req.data);
+      w.u8(req.close ? 1 : 0);
+      w.u32(req.holdMs);
+      return;
   }
   return assertNever(req);
 }
@@ -942,6 +1141,21 @@ function readServiceRequest(r: Reader): ServiceRequest {
         returnDataLimit: r.u32(),
         validUntilUnix: r.u64(),
       };
+    case 8: {
+      const tunnelId = r.fixedBytes(TUNNEL_ID_LEN);
+      const seq = r.u32();
+      const open = r.option(() => ({ host: r.string(), port: r.u16() }));
+      return {
+        tag: "TunnelV1",
+        tunnelId,
+        seq,
+        open,
+        ackOffset: r.u64(),
+        data: r.bytes(),
+        close: r.bool(),
+        holdMs: r.u32(),
+      };
+    }
     default:
       throw new NoxClientError(
         `Unknown ServiceRequest variant index ${variant}`,

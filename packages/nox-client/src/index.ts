@@ -35,6 +35,8 @@ export type {
   HttpRequestOptions,
   ReplyClaimSettings,
   ResendPolicy,
+  TunnelSendHandle,
+  TunnelSendOptions,
 } from "./types.js";
 
 export {
@@ -43,6 +45,7 @@ export {
   DEFAULTS,
   PAID_V2_CAPABILITY,
   SURB_V2_CAPABILITY,
+  TUNNEL_V1_CAPABILITY,
 } from "./types.js";
 
 export {
@@ -107,6 +110,13 @@ export {
   PAID_TRANSACTION_REJECTION_CODES_V2,
   PAYLOAD_VERSION,
   SUBMIT_REJECTION_CODES,
+  encodeTunnelReplyV1,
+  decodeTunnelReplyV1,
+  TUNNEL_ID_LEN,
+  TUNNEL_PART_MAX_DATA,
+  TUNNEL_REJECT_DETAIL_MAX,
+  TUNNEL_FIN_V1,
+  TUNNEL_REJECT_CODES_V1,
 } from "./bincode.js";
 
 export type {
@@ -121,6 +131,11 @@ export type {
   ExecutionQuoteV1,
   SubmitRejectionCode,
   SubmitTransactionResponse,
+  TunnelRequestV1,
+  TunnelOpenV1,
+  TunnelReplyV1,
+  TunnelFinV1,
+  TunnelRejectCodeV1,
 } from "./bincode.js";
 
 export { decodeHttpResponse } from "./http_response.js";
