@@ -21,9 +21,11 @@
  *                    equals the snapshot, and that the registry emitted no
  *                    event after the snapshot block.
  *   --release        also apply the release gate: the snapshot is of the
- *                    configured release network, and every member publishes a
+ *                    configured release network, every member publishes a
  *                    KPS address in its metadataUrl, except the addresses given
- *                    with --allow-missing-kps (named in the release notes).
+ *                    with --allow-missing-kps (named in the release notes),
+ *                    and at least one exit's capability hints carry
+ *                    `tunnel_v1` (the worker defaults to tls "required").
  *                    With --offline this checks the document only (the
  *                    output says so): metadataUrl values are taken as
  *                    committed, so a canary overlay would pass. A release
@@ -37,6 +39,11 @@
  * The RPC URL can also come from NOX_SNAPSHOT_RPC_URL.
  */
 import { readFileSync } from "node:fs";
+/** Capability of exits that relay TLS tunnels. */
+const TUNNEL_CAPABILITY = "tunnel_v1";
+/** Registry roles that serve as exits. */
+const EXIT_ROLE = 2;
+const FULL_ROLE = 3;
 /** Independent RPC providers a release snapshot is re-read through (ARCHITECTURE §5.2). */
 export const RELEASE_MIN_PROVIDERS = 2;
 import { resolve } from "node:path";
@@ -128,7 +135,9 @@ export function inputDifferences(snapshot, network, capabilities) {
 
 /**
  * Release gate (ARCHITECTURE §5.1): every member publishes a KPS address,
- * except the ones the release notes name.
+ * except the ones the release notes name, and some exit relays TLS tunnels.
+ * Pinned members' capabilities come from the bundle alone, so a bundle whose
+ * hints name no tunnel exit would refuse every call under tls "required".
  * @param {NoxAnonRpcSnapshot} snapshot
  * @param {Set<string>} allowMissing
  * @returns {string[]}
@@ -146,6 +155,15 @@ export function releaseGateProblems(snapshot, allowMissing) {
     out.push(
       `member ${member.address} publishes no KPS address in its metadataUrl ` +
         `(${member.metadataUrl === "" ? "empty" : JSON.stringify(member.metadataUrl)}${parsed.reason === null ? "" : `: ${parsed.reason}`})`,
+    );
+  }
+  const tunnelExit = snapshot.members.some(
+    (member) => (member.role === EXIT_ROLE || member.role === FULL_ROLE) && member.capabilities.includes(TUNNEL_CAPABILITY),
+  );
+  if (!tunnelExit) {
+    out.push(
+      `no exit carries ${TUNNEL_CAPABILITY} in snapshot/capabilities.json, so the worker (tls "required") would refuse every call; ` +
+        "regenerate the hints from the seed once exits relay tunnels",
     );
   }
   return out;
@@ -305,7 +323,8 @@ export async function main(argv) {
     const scope = values.offline ? " (document only, the chain was not read)" : "";
     if (problems.length === 0) {
       process.stdout.write(
-        `release gate${scope}: pass (${network.name}, every member publishes a KPS address or is named in --allow-missing-kps)\n`,
+        `release gate${scope}: pass (${network.name}, every member publishes a KPS address or is named in --allow-missing-kps, ` +
+          `an exit carries ${TUNNEL_CAPABILITY})\n`,
       );
     } else {
       failed = true;

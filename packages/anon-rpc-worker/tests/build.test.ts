@@ -318,6 +318,18 @@ describe("provenance", () => {
     expect(() => makeProvenance({ distDir: join(dir, "p3"), wasmRecordPath: wasmRecord })).toThrow(/nox-tls module .* is not the one/u);
   });
 
+  it("refuses a bundle with an extra root in a release build", async () => {
+    const ca = join(REPO_DIR, "packages", "nox-tls", "tests", "fixtures", "ca.cert.der");
+    await buildWorker({ outfile: outfile("p6"), extraRoot: ca });
+    const options = { distDir: join(dir, "p6"), wasmRecordPath: join(dir, "absent.json") };
+    expect(makeProvenance(options)["tls"]).toMatchObject({ extraRoots: 1 });
+    expect(() => makeProvenance({ ...options, release: true })).toThrow(/a release build embeds none/u);
+    await buildWorker({ outfile: outfile("p7") });
+    expect(makeProvenance({ distDir: join(dir, "p7"), wasmRecordPath: join(dir, "absent.json"), release: true })["tls"]).toMatchObject({
+      extraRoots: 0,
+    });
+  });
+
   it("refuses a bundle that changed after the build", async () => {
     await buildWorker({ outfile: outfile("p4") });
     writeFileSync(join(dir, "p4", "anon-rpc-worker.js"), "tampered");

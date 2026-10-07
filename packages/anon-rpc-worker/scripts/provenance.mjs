@@ -25,9 +25,10 @@
  *
  * Usage:
  *   node scripts/provenance.mjs [--dist dist] [--wasm-record .build/wasm-toolchain.json]
- *                               [--source-commit <sha>]
+ *                               [--source-commit <sha>] [--release]
  * --source-commit names the commit when the tree is an export without .git
- * (the container builds of scripts/verify-reproducible.sh).
+ * (the container builds of scripts/verify-reproducible.sh). --release
+ * (scripts/build-worker.sh --release) refuses a bundle with extra roots.
  */
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
@@ -175,7 +176,7 @@ export function webpkiRoots(repoDir) {
 
 /**
  * Build the provenance document.
- * @param {{ distDir: string, wasmRecordPath: string, sourceCommit?: string | undefined,
+ * @param {{ distDir: string, wasmRecordPath: string, sourceCommit?: string | undefined, release?: boolean,
  *           packageDir?: string, repoDir?: string, snapshotPath?: string, toolchainPath?: string }} options
  * @returns {Record<string, unknown>}
  */
@@ -260,6 +261,13 @@ export function makeProvenance(options) {
 
   const toolchainText = readFileSync(options.toolchainPath ?? TOOLCHAIN_PATH, "utf8");
   const tls = isRecord(record["tls"]) ? record["tls"] : null;
+  const extraRoots = typeof record["extraRoots"] === "number" ? record["extraRoots"] : 0;
+  if (options.release === true && extraRoots !== 0) {
+    throw new ProvenanceError(
+      `the bundle trusts ${extraRoots} extra root(s) next to the Mozilla ones (build.mjs --extra-root); a release build embeds none`,
+      "inconsistent",
+    );
+  }
 
   return {
     package: manifest["name"],
@@ -289,7 +297,7 @@ export function makeProvenance(options) {
     },
     tls: tls === null
       ? null
-      : { ...webpkiRoots(repoDir), extraRoots: typeof record["extraRoots"] === "number" ? record["extraRoots"] : 0 },
+      : { ...webpkiRoots(repoDir), extraRoots },
     output,
     builder: { os: process.platform, arch: process.arch },
   };
@@ -306,11 +314,12 @@ export async function main(argv) {
       dist: { type: "string", default: "dist" },
       "wasm-record": { type: "string", default: DEFAULT_WASM_RECORD },
       "source-commit": { type: "string" },
+      release: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
-    process.stdout.write("usage: provenance.mjs [--dist dist] [--wasm-record <file>] [--source-commit <sha>]\n");
+    process.stdout.write("usage: provenance.mjs [--dist dist] [--wasm-record <file>] [--source-commit <sha>] [--release]\n");
     return 0;
   }
   const distDir = resolve(PACKAGE_DIR, values.dist);
@@ -321,6 +330,7 @@ export async function main(argv) {
       distDir,
       wasmRecordPath: resolve(PACKAGE_DIR, values["wasm-record"]),
       sourceCommit: values["source-commit"],
+      release: values.release,
     });
   } catch (error) {
     if (error instanceof ProvenanceError) throw error;
