@@ -2715,6 +2715,9 @@ export class NoxClient {
   /**
    * POST a JSON-RPC body to `url` through exit `exitId` (one route, no
    * resend). Resolves with the body text on HTTP 200 with a complete body.
+   * Registry reads use the exit `HttpRequest` path, also where callers run
+   * their own requests through TLS tunnels: public chain data, accepted only
+   * when a quorum of exit and provider pairs agrees.
    */
   private async _postViaExit(exitId: string, url: string, body: string, expectedBytes: number): Promise<string> {
     const exit = this._nodes.find((node) => node.id === exitId);

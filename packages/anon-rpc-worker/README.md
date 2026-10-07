@@ -124,7 +124,10 @@ roots current by moving to new worker releases. Resends of a tunnel exchange go 
 entry and mix and carry identical bytes, which the exit writes once; after a lost tunnel only reads that may be resent
 run again on a new tunnel.
 
-Next milestones: Encrypted Client Hello for providers that publish it, and a hybrid post-quantum key exchange
+`tls` governs the wallet's calls. The chain check's registry reads (discovery) use the exit `HttpRequest` path: public
+chain data, accepted only when a quorum of exit and provider pairs agrees byte for byte.
+
+Next milestones: registry reads through tunnels as well, Encrypted Client Hello for providers that publish it, and a hybrid post-quantum key exchange
 (X25519MLKEM768).
 
 Errors: `permission-denied` (the exit refuses the destination), `network-error` (no tunnel exit, a certificate
