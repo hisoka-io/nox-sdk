@@ -18,7 +18,7 @@
 // parked empty, restored afterwards), so the entries the worker can use are
 // exactly the ones each test leaves reachable. The bundle is built for this
 // spec: snapshot after the parking and after the late node left, bootstrap
-// anchors = the anchor node only, empty worker config.
+// anchors = the anchor node only, worker config { tls: "off" } only.
 
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -176,13 +176,14 @@ test.describe.serial("S1: identity from chain, location at run time", () => {
   }
 
   async function bootEmpty(page: Page, specifierUrl: string, readyTimeoutMs: number, config?: Record<string, unknown>) {
-    // The adopters' default: no config at all. The bundle's bootstrap supplies the anchor.
+    // The adopters' default apart from `tls`: no gateways or bridges, the bundle's bootstrap supplies the anchor.
+    // The bed's upstream is a plain-http URL, served by the exit HttpRequest path.
     return page.evaluate((request) => window.e2e.boot(request), {
       id: WORKER_ID,
       address: pin().worker.address,
       specifierRpcUrl: specifierUrl,
       readyTimeoutMs,
-      ...(config === undefined ? {} : { config }),
+      config: { tls: "off", ...config },
     });
   }
 

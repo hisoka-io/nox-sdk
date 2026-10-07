@@ -6,7 +6,8 @@
 # Usage: packages/anon-rpc-worker/scripts/build-worker.sh [--release] [--stage all|wasm|js]
 #                                                         [--source-commit <sha>]
 #
-#   --release        refuse a dirty git tree, require the pinned toolchain
+#   --release        refuse a dirty git tree and a bundle with extra roots
+#                    (provenance.mjs --release), require the pinned toolchain
 #                    (scripts/toolchain.env) for the WASM stage and the pinned
 #                    pnpm (root package.json) and esbuild (package.json) for
 #                    the JS stage; a Node version other than NODE_VERSION is
@@ -90,5 +91,6 @@ if [[ "$stage" == "all" || "$stage" == "js" ]]; then
   node scripts/build.mjs
   provenance_args=()
   [[ -n "$source_commit" ]] && provenance_args+=(--source-commit "$source_commit")
+  [[ "$release" -eq 1 ]] && provenance_args+=(--release)
   node scripts/provenance.mjs ${provenance_args[@]+"${provenance_args[@]}"}
 fi

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { main as makeSnapshot } from "../scripts/make-snapshot.mjs";
-import { recordedBlockProblems, main as verifySnapshot } from "../scripts/verify-snapshot.mjs";
+import { recordedBlockProblems, releaseGateProblems, main as verifySnapshot } from "../scripts/verify-snapshot.mjs";
 import { writeHashFile } from "../scripts/hash.mjs";
 import { SNAPSHOT_PATH } from "../scripts/lib/paths.mjs";
 import { isMissingStateError } from "../scripts/lib/registry.mjs";
@@ -343,10 +343,23 @@ describe("verify-snapshot.mjs", () => {
   it("applies the release gate", async () => {
     expect(await verifySnapshot(["--offline", "--release"])).toBe(1);
     expect(stdout()).toContain("release gate (document only, the chain was not read): FAIL");
+    expect(stdout()).toContain("publishes no KPS address");
     const all = committed.members.map((member) => member.address).join(",");
     output.length = 0;
-    expect(await verifySnapshot(["--offline", "--release", "--allow-missing-kps", all])).toBe(0);
-    expect(stdout()).toContain("release gate (document only, the chain was not read): pass");
+    expect(await verifySnapshot(["--offline", "--release", "--allow-missing-kps", all])).toBe(1);
+    expect(stdout()).not.toContain("publishes no KPS address");
+    expect(stdout()).toContain("no exit carries tunnel_v1");
+
+    const allowed = new Set(committed.members.map((member) => member.address));
+    expect(releaseGateProblems(committed, allowed)).toHaveLength(1);
+    const exit = committed.members.findIndex((member) => member.role === 2);
+    const relay = committed.members.findIndex((member) => member.role === 1);
+    const withCapability = (index: number): NoxAnonRpcSnapshot => ({
+      ...committed,
+      members: committed.members.map((member, at) => (at === index ? { ...member, capabilities: [...member.capabilities, "tunnel_v1"] } : member)),
+    });
+    expect(releaseGateProblems(withCapability(exit), allowed)).toEqual([]);
+    expect(releaseGateProblems(withCapability(relay), allowed)).toHaveLength(1);
   });
 
   it("passes the release gate against the chain only through two providers", async () => {
@@ -357,8 +370,8 @@ describe("verify-snapshot.mjs", () => {
     expect(await verifySnapshot(["--rpc", a.url, "--release", "--allow-missing-kps", all])).toBe(1);
     expect(stdout()).toContain("read through 1 provider(s); a release snapshot needs 2");
     output.length = 0;
-    expect(await verifySnapshot(["--rpc", a.url, "--rpc", b.url, "--release", "--allow-missing-kps", all])).toBe(0);
-    expect(stdout()).toContain("release gate: pass");
-    expect(stdout()).not.toContain("FAIL");
+    expect(await verifySnapshot(["--rpc", a.url, "--rpc", b.url, "--release", "--allow-missing-kps", all])).toBe(1);
+    expect(stdout()).not.toContain("provider(s); a release snapshot needs");
+    expect(stdout()).toContain("no exit carries tunnel_v1");
   });
 });

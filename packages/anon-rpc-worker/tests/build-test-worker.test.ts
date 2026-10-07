@@ -2,7 +2,7 @@
 // The chain and build steps it chains are covered by snapshot-chain and build tests.
 import { describe, expect, it } from "vitest";
 import { DISCOVERY_POLICY_DEFAULTS, verifyBootstrap, type PinnedSnapshot } from "@hisoka-io/nox-client";
-import { bootstrapFromTestbed, capabilitiesFromTopology, main, testbedRegistry, TestWorkerError } from "../scripts/build-test-worker.mjs";
+import { bootstrapFromTestbed, capabilitiesFromTopology, main, mergeCapabilities, testbedRegistry, TestWorkerError } from "../scripts/build-test-worker.mjs";
 import { kpsAddressFor, makePinned } from "./helpers/fixtures.js";
 
 const REGISTRY = {
@@ -53,6 +53,17 @@ describe("build-test-worker", () => {
       },
     });
     expect(capabilitiesFromTopology({}, "empty").members).toEqual({});
+  });
+
+  it("merges served and self-reported hints, and can leave one capability out", () => {
+    const served = { "0xb1": ["surb_v2"], "0xb2": ["paid_v2"] };
+    const reported = { "0xb1": ["tunnel_v1", "surb_v2"], "0xb3": ["tunnel_v1"] };
+    expect(mergeCapabilities(served, reported, undefined)).toEqual({
+      "0xb1": ["surb_v2", "tunnel_v1"],
+      "0xb2": ["paid_v2"],
+      "0xb3": ["tunnel_v1"],
+    });
+    expect(mergeCapabilities(served, reported, "tunnel_v1")).toEqual({ "0xb1": ["surb_v2"], "0xb2": ["paid_v2"] });
   });
 
   it("builds the bed's discovery bootstrap from testbed.json and the snapshot", () => {

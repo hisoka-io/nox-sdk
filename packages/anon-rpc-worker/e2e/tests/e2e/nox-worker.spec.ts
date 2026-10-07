@@ -498,6 +498,8 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
         logLevel: "debug",
         attemptTimeoutMs: DRILL_ATTEMPT_TIMEOUT_MS,
         callDeadlineMs: DRILL_CALL_DEADLINE_MS,
+        // The drills call the upstream anvil by its plain-http URL (exit HttpRequest path).
+        tls: "off",
       };
     }
 

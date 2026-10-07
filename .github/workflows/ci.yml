@@ -49,6 +49,61 @@ jobs:
         run: pnpm --filter @hisoka-io/nox-client --fail-if-no-match build
 
   # --------------------------------------------------------------------------
+  # anon-rpc worker: nox-wasm and nox-tls built for wasm32 with the pinned
+  # toolchain (scripts/toolchain.env: Rust image, clang, wasm-pack,
+  # wasm-bindgen, binaryen), then typecheck and the worker's vitest suite.
+  # --------------------------------------------------------------------------
+  worker:
+    name: Worker (pinned WASM build + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nox-sdk
+
+    steps:
+      - name: Checkout nox-sdk
+        uses: actions/checkout@v4
+        with:
+          path: nox-sdk
+
+      - name: Build nox-wasm and nox-tls with the pinned toolchain
+        run: |
+          source packages/anon-rpc-worker/scripts/toolchain.env
+          source packages/anon-rpc-worker/scripts/lib/pinned-tools.sh
+          fail() { echo "$*" >&2; exit 1; }
+          arch=x86_64
+          fetch_tools "$RUNNER_TEMP/nox-tools"
+          docker run --rm -v "$PWD:/src" -v "$RUNNER_TEMP/nox-tools:/opt/nox-tools:ro" -w /src \
+            -e "PATH=/opt/nox-tools/bin:/opt/nox-tools/binaryen/bin:/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+            "$RUST_IMAGE" bash -euo pipefail -c "
+              trap 'chown -R $(id -u):$(id -g) /src' EXIT
+              rm -f /etc/apt/sources.list /etc/apt/sources.list.d/*
+              echo 'deb [check-valid-until=no] https://snapshot.debian.org/archive/debian/$DEBIAN_SNAPSHOT bookworm main' >/etc/apt/sources.list.d/snapshot.list
+              apt-get -qq -o Acquire::Retries=3 update
+              DEBIAN_FRONTEND=noninteractive apt-get -qq install -y --no-install-recommends \
+                clang-${CLANG_VERSION%%.*}=$CLANG_PACKAGE_VERSION llvm-${CLANG_VERSION%%.*}=$CLANG_PACKAGE_VERSION >/dev/null
+              rustup target add wasm32-unknown-unknown >/dev/null
+              bash packages/anon-rpc-worker/scripts/build-wasm.sh --check-pins"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: nox-sdk/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck and test (vitest)
+        run: pnpm --filter @hisoka-io/anon-rpc-worker --fail-if-no-match test
+
+  # --------------------------------------------------------------------------
   # Rust WASM build — wasm-pack build --target bundler
   # --------------------------------------------------------------------------
   wasm:
@@ -85,3 +140,7 @@ jobs:
       - name: Run WASM tests (Node)
         working-directory: nox-sdk/packages/nox-wasm
         run: wasm-pack test --node -- --release --locked
+
+      - name: Test nox-tls (TLS client, native loopback against rustls)
+        working-directory: nox-sdk
+        run: cargo test -p nox-tls --locked

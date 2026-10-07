@@ -60,11 +60,17 @@ function requirePinnedMesh(source: { readonly path: string; readonly bytes: Uint
   );
 }
 
+/**
+ * The bundle under test. `variant` names a second build for the same mesh
+ * (its own directory and log) and `extraArgs` go to the build command after
+ * the template, e.g. `--extra-root` for the TLS-tunnel spec.
+ */
 export async function resolveWorkerBundle(
   config: TestbedConfig,
   runRoot: string,
   testbedJson: string,
   logDir: string,
+  variant?: { readonly name: string; readonly extraArgs: readonly string[] },
 ): Promise<WorkerBundleSource> {
   const template = config.worker.buildCommand;
   if (template === undefined) {
@@ -79,15 +85,15 @@ export async function resolveWorkerBundle(
     requirePinnedMesh(prebuilt, testbedJson);
     return prebuilt;
   }
-  const out = join(runRoot, "nox-worker", "anon-rpc-worker.js");
+  const out = join(runRoot, variant === undefined ? "nox-worker" : `nox-worker-${variant.name}`, "anon-rpc-worker.js");
   mkdirSync(dirname(out), { recursive: true });
-  const rendered = renderBuildCommand(template, { testbed_json: testbedJson, out });
+  const rendered = [renderBuildCommand(template, { testbed_json: testbedJson, out }), ...(variant?.extraArgs ?? [])].join(" ");
   const { command, args } = splitCommand(rendered);
   const proc = ManagedProcess.start({
     label: "worker build (NOX_WORKER_BUILD_CMD)",
     command,
     args,
-    logFile: join(logDir, "worker-build.log"),
+    logFile: join(logDir, variant === undefined ? "worker-build.log" : `worker-build-${variant.name}.log`),
   });
   const timer = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), config.worker.buildTimeoutMs));
   const outcome = await Promise.race([proc.exited, timer]);

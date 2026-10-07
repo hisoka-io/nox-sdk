@@ -3,6 +3,7 @@ import {
   NoxClientErrorCode,
   DEFAULTS,
   PAID_V2_CAPABILITY,
+  TUNNEL_V1_CAPABILITY,
   type HttpRequestOptions,
   type KpsBootstrap,
   type KpsModeOptions,
@@ -24,6 +25,8 @@ import {
   type SurbFormat,
   type TopologyNode,
   type TopologySnapshot,
+  type TunnelSendHandle,
+  type TunnelSendOptions,
   type VerifiedDiscovery,
 } from "./types.js";
 import { KpsHttpTransport, kpsFailurePhase } from "./kps/transport.js";
@@ -97,6 +100,7 @@ import {
   type PaidQuoteRequestV2,
   type PaidTransactionOutcomeV2,
   type SubmitTransactionResponse,
+  type TunnelRequestV1,
 } from "./bincode.js";
 import type { FragmentWire } from "./bincode.js";
 import { Reassembler } from "./fragmentation.js";
@@ -204,6 +208,12 @@ interface PendingRequest {
   timing: RequestTiming;
 }
 
+/** A tunnel exchange copy listening for reply parts (`NoxClient.tunnelSend`). */
+interface StreamPending {
+  onReply(body: Uint8Array): "more" | "done";
+  finish(error?: NoxClientError): void;
+}
+
 /** When one request passed each phase (`Date.now()` values). */
 interface RequestTiming {
   readonly startedAt: number;
@@ -309,6 +319,8 @@ export class NoxClient {
   private readonly adaptive: AdaptiveSurbBudget;
 
   private readonly pending = new Map<bigint, PendingRequest>();
+  /** Tunnel exchange copies, by request id; they bypass reassembly and the resend logic. */
+  private readonly _streams = new Map<bigint, StreamPending>();
 
   private readonly burstState = new Map<
     bigint,
@@ -955,6 +967,62 @@ export class NoxClient {
     return response;
   }
 
+  /**
+   * Exits that relay TLS tunnels: role exit or full, advertising `tunnel_v1`
+   * in the verified topology. Capability hints are untrusted; a false one
+   * costs the caller an open timeout, never plaintext.
+   */
+  tunnelExits(): TopologyNode[] {
+    return this._nodes.filter(
+      (node) => (node.role === 2 || node.role === 3) && node.capabilities?.includes(TUNNEL_V1_CAPABILITY) === true,
+    );
+  }
+
+  /**
+   * Send one copy of a tunnel exchange to `exit` on a fresh entry and mix
+   * (outside `avoid` when possible) and hand each reply part to `onReply`.
+   * No reassembly, reply-block top-up or resend happens here: the tunnel
+   * client decides when to send another copy, and every copy of one `seq`
+   * must carry identical `data`.
+   */
+  tunnelSend(exit: TopologyNode, request: TunnelRequestV1, options: TunnelSendOptions): TunnelSendHandle {
+    this._requireWasm();
+    throwIfAborted(options.signal);
+    const { route, version } = this._planTunnelRoute(exit, options.avoid ?? new Set());
+    const forwardPath: PathHop[] = [
+      { pubKeyHex: bytesToHex(route.entry.publicKey), address: route.entry.routingAddress },
+      { pubKeyHex: bytesToHex(route.mix.publicKey), address: route.mix.routingAddress },
+      { pubKeyHex: bytesToHex(route.exit.publicKey), address: route.exit.routingAddress },
+    ];
+    const requestId = this.nextRequestId++;
+    const replySurbs = options.surbs > 0
+      ? this._generateSurbs(buildReturnPath(forwardPath), requestId, options.surbs, version)
+      : [];
+    const inner = encodeServiceRequest({ tag: "TunnelV1", ...request });
+    const packets = this._packetsFor(forwardPath, encodeRelayerPayload({ tag: "AnonymousRequest", inner, replySurbs }));
+    const entryUrl = route.entry.address;
+
+    let done: Promise<void>;
+    if (options.surbs === 0) {
+      done = this._upload(entryUrl, packets).catch((error: unknown) => {
+        throw new NoxClientError(`Packet transport failed: ${String(error)}`, NoxClientErrorCode.TransportFailed, error);
+      });
+    } else {
+      done = this._listenStream(requestId, options);
+      const replyIds = this.surbPool.idsForRequest(requestId);
+      if (this.responseWs !== null && entryUrl === this._wsEntryUrl) this._wsSubscribe(replyIds);
+      // Every reply block may carry a part: claim them all from the start.
+      this._claims?.track(requestId, entryUrl, replyIds, replyIds.length);
+      this._upload(entryUrl, packets).catch((error: unknown) => {
+        this._streams.get(requestId)?.finish(
+          new NoxClientError(`Packet transport failed: ${String(error)}`, NoxClientErrorCode.TransportFailed, error),
+        );
+      });
+    }
+    if (options.background !== true) done.then(() => this._noteForegroundCall(), () => this._noteForegroundCall());
+    return { entryId: route.entry.id, mixId: route.mix.id, done };
+  }
+
   /** Send a custom `RelayerPayload` directly. Prefer submitPaidTransaction/rpcCall/httpRequest. */
   async send(payload: RelayerPayload): Promise<Uint8Array> {
     const opKey = payload.tag;
@@ -992,6 +1060,7 @@ export class NoxClient {
       this.replenishment.clearPath(requestId);
     }
     this.pending.clear();
+    for (const stream of [...this._streams.values()]) stream.finish(err);
     this.burstState.clear();
     const kps = this._kps;
     if (kps !== undefined) {
@@ -1670,39 +1739,7 @@ export class NoxClient {
 
     const payloadBytes = encodeRelayerPayload(payloadWithSurbs);
 
-    const MAX_PAYLOAD_SIZE = 31_716;
-    let packets: Uint8Array[];
-
-    if (payloadBytes.length <= MAX_PAYLOAD_SIZE) {
-      packets = [this._buildSphinxPacket(forwardPath, payloadBytes)];
-    } else {
-      // Fragment payload across multiple Sphinx packets
-      const FRAG_OVERHEAD = 32;
-      const chunkSize = MAX_PAYLOAD_SIZE - FRAG_OVERHEAD;
-      const totalFragments = Math.ceil(payloadBytes.length / chunkSize);
-      // Random, so fragments from different clients never share an ID at the exit.
-      const messageId = secureRandomU64();
-      packets = [];
-
-      for (let seq = 0; seq < totalFragments; seq++) {
-        const start = seq * chunkSize;
-        const end = Math.min(start + chunkSize, payloadBytes.length);
-        const chunk = payloadBytes.slice(start, end);
-
-        const fragPayload: RelayerPayload = {
-          tag: "Fragment",
-          frag: {
-            messageId: messageId,
-            totalFragments,
-            sequence: seq,
-            data: chunk,
-            fec: null,
-          },
-        };
-        const fragBytes = encodeRelayerPayload(fragPayload);
-        packets.push(this._buildSphinxPacket(forwardPath, fragBytes));
-      }
-    }
+    const packets = this._packetsFor(forwardPath, payloadBytes);
 
     const effectiveTimeout = timeoutMs ?? this._config.timeoutMs;
     const responsePromise = new Promise<Uint8Array>((resolve, reject) => {
@@ -1768,18 +1805,9 @@ export class NoxClient {
       return responsePromise;
     }
 
-    this._uploadsInFlight.set(entryUrl, (this._uploadsInFlight.get(entryUrl) ?? 0) + 1);
-    const sendAll = Promise.all(
-      packets.map((pkt) => postPacket(entryUrl, pkt, undefined, this.fetch)),
-    );
-    void sendAll.then(() => {
+    this._upload(entryUrl, packets).then(() => {
       timing.uploadedAt = Date.now();
-    }, noop).finally(() => {
-      const left = (this._uploadsInFlight.get(entryUrl) ?? 1) - 1;
-      if (left <= 0) this._uploadsInFlight.delete(entryUrl);
-      else this._uploadsInFlight.set(entryUrl, left);
-    });
-    sendAll.catch((err: unknown) => {
+    }, (err: unknown) => {
       const req = this.pending.get(requestId);
       if (req !== undefined) {
         this.pending.delete(requestId);
@@ -1797,6 +1825,99 @@ export class NoxClient {
     });
 
     return responsePromise;
+  }
+
+  /** Sphinx packets for one payload: one packet, or `Fragment` packets when it does not fit. */
+  private _packetsFor(forwardPath: PathHop[], payloadBytes: Uint8Array): Uint8Array[] {
+    const MAX_PAYLOAD_SIZE = 31_716;
+    if (payloadBytes.length <= MAX_PAYLOAD_SIZE) return [this._buildSphinxPacket(forwardPath, payloadBytes)];
+    const FRAG_OVERHEAD = 32;
+    const chunkSize = MAX_PAYLOAD_SIZE - FRAG_OVERHEAD;
+    const totalFragments = Math.ceil(payloadBytes.length / chunkSize);
+    // Random, so fragments from different clients never share an ID at the exit.
+    const messageId = secureRandomU64();
+    const packets: Uint8Array[] = [];
+    for (let seq = 0; seq < totalFragments; seq++) {
+      const start = seq * chunkSize;
+      const chunk = payloadBytes.slice(start, Math.min(start + chunkSize, payloadBytes.length));
+      const fragBytes = encodeRelayerPayload({
+        tag: "Fragment",
+        frag: { messageId, totalFragments, sequence: seq, data: chunk, fec: null },
+      });
+      packets.push(this._buildSphinxPacket(forwardPath, fragBytes));
+    }
+    return packets;
+  }
+
+  /** Post packets to an entry, counted in `_uploadsInFlight` until the entry accepted them. */
+  private _upload(entryUrl: string, packets: Uint8Array[]): Promise<void> {
+    this._uploadsInFlight.set(entryUrl, (this._uploadsInFlight.get(entryUrl) ?? 0) + 1);
+    const sendAll = Promise.all(packets.map((pkt) => postPacket(entryUrl, pkt, undefined, this.fetch)));
+    void sendAll.then(noop, noop).finally(() => {
+      const left = (this._uploadsInFlight.get(entryUrl) ?? 1) - 1;
+      if (left <= 0) this._uploadsInFlight.delete(entryUrl);
+      else this._uploadsInFlight.set(entryUrl, left);
+    });
+    return sendAll.then(noop);
+  }
+
+  /**
+   * A route to a fixed tunnel exit. The pinned entry is used unless it is the
+   * exit or the caller asked to avoid it; then another entry, when one exists.
+   */
+  private _planTunnelRoute(exit: TopologyNode, avoid: ReadonlySet<string>): PlannedRoute {
+    const pinned = this._pinnedEntry();
+    let entry: TopologyNode | undefined;
+    if (pinned !== undefined && (pinned.id === exit.id || avoid.has(pinned.id))) {
+      try {
+        entry = this._pickOtherEntry(new Set([exit.id, ...avoid]));
+      } catch (error) {
+        if (pinned.id === exit.id) entry = this._pickOtherEntry(new Set([exit.id]));
+        else if (!(error instanceof NoxClientError)) throw error;
+      }
+    }
+    return this._planRoute(exit, new Set([...this._avoidedNodeIds(), ...avoid]), entry);
+  }
+
+  /** Register a stream pending for `requestId`; resolves on "done", rejects on timeout or abort. */
+  private _listenStream(requestId: bigint, options: TunnelSendOptions): Promise<void> {
+    const { signal, onReply } = options;
+    return new Promise<void>((resolve, reject) => {
+      const onAbort = (): void =>
+        stream.finish(new NoxClientError("Tunnel exchange aborted by the caller", NoxClientErrorCode.Aborted, signal?.reason));
+      const timer = setTimeout(
+        () => stream.finish(new NoxClientError(`Tunnel exchange got no complete reply within ${options.timeoutMs}ms`, NoxClientErrorCode.ResponseTimeout)),
+        options.timeoutMs,
+      );
+      const stream: StreamPending = {
+        onReply: onReply ?? (() => "more"),
+        finish: (error) => {
+          if (this._streams.get(requestId) !== stream) return;
+          this._streams.delete(requestId);
+          clearTimeout(timer);
+          signal?.removeEventListener("abort", onAbort);
+          // Parts of this copy already in the claimed batch may still be decrypted.
+          setTimeout(() => this.surbPool.cleanup(requestId), 100);
+          if (error === undefined) resolve();
+          else reject(error);
+        },
+      };
+      this._streams.set(requestId, stream);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  /** One reply part for a tunnel copy: a single-fragment `ServiceResponse`. */
+  private _deliverStream(requestId: bigint, stream: StreamPending, fragment: FragmentWire): void {
+    if (fragment.totalFragments !== 1 || fragment.sequence !== 0 || fragment.fec !== null) return;
+    let verdict: "more" | "done";
+    try {
+      verdict = stream.onReply(fragment.data);
+    } catch (error) {
+      stream.finish(new NoxClientError(`Tunnel reply handler failed: ${String(error)}`, NoxClientErrorCode.DecryptionFailed, error));
+      return;
+    }
+    if (verdict === "done") stream.finish();
   }
 
   /** Remove a pending request and its reply state, then reject it with `error`. */
@@ -1845,7 +1966,7 @@ export class NoxClient {
     this._claims = new ReplyClaimScheduler(
       {
         activeIds: (requestId) => this.surbPool.idsForRequest(requestId),
-        isPending: (requestId) => this.pending.has(requestId),
+        isPending: (requestId) => this.pending.has(requestId) || this._streams.has(requestId),
         fetchFor: () => this._claimFetch(),
         deliver: (item, claim) => this._handleResponseItem(item, claim),
         onLost: (requestId) => this.pending.get(requestId)?.onLost?.(),
@@ -1954,6 +2075,11 @@ export class NoxClient {
       return;
     }
 
+    const stream = this._streams.get(requestId);
+    if (stream !== undefined) {
+      if (decoded.tag === "ServiceResponse") this._deliverStream(requestId, stream, decoded.fragment);
+      return;
+    }
     if (decoded.tag === "ServiceResponse") {
       this._handleFragment(requestId, decoded.fragment);
     } else if (decoded.tag === "NeedMoreSurbs") {
@@ -2589,6 +2715,9 @@ export class NoxClient {
   /**
    * POST a JSON-RPC body to `url` through exit `exitId` (one route, no
    * resend). Resolves with the body text on HTTP 200 with a complete body.
+   * Registry reads use the exit `HttpRequest` path, also where callers run
+   * their own requests through TLS tunnels: public chain data, accepted only
+   * when a quorum of exit and provider pairs agrees.
    */
   private async _postViaExit(exitId: string, url: string, body: string, expectedBytes: number): Promise<string> {
     const exit = this._nodes.find((node) => node.id === exitId);

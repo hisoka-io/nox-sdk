@@ -12,7 +12,9 @@
  * call `signalFailed`; transient ones retry forever with back-off while
  * `ready` stays pending. After ready the SDK checks NoxRegistry through the
  * mixnet in the background (S1); each verified check refreshes the
- * learned-anchor cache.
+ * learned-anchor cache. With `tls` other than `"off"` the embedded TLS module
+ * is compiled at boot too, off the first call's path, and https calls go
+ * through TLS tunnels (src/tls/).
  */
 import {
   DISCOVERY_FIRST_CHECK_MAX_DEFER_MS,
@@ -51,6 +53,10 @@ import {
   type PreparedRequest,
 } from "./fetch-map.js";
 import { LocalAnswers } from "./local-answers.js";
+import type { NoxTlsBindings } from "./tls/module.js";
+import { TlsPool } from "./tls/pool.js";
+import { TlsTransport } from "./tls/transport.js";
+import type { TunnelPort } from "./tls/tunnel.js";
 import { createLogger, describeError, errorCode, type LogLevel, type WorkerLogger } from "./log.js";
 import {
   LearnedCacheWriter,
@@ -63,7 +69,7 @@ import {
 } from "./storage.js";
 
 /** The slice of `NoxClient` the worker uses. */
-export interface NoxClientPort extends NoxHttpPort {
+export interface NoxClientPort extends NoxHttpPort, TunnelPort {
   readonly nodes: readonly { readonly id: string }[];
   sendEcho(data: Uint8Array): Promise<Uint8Array>;
   disconnect(): void;
@@ -77,6 +83,8 @@ export interface WorkerDeps {
   readonly bootstrap: unknown;
   /** Initialise the embedded WASM and return its bindings; throws when WebAssembly is blocked. */
   loadWasm(): Promise<NoxWasmBindings>;
+  /** Initialise the embedded TLS module (only when `tls` is not `"off"`). */
+  loadTls(): Promise<NoxTlsBindings>;
   /** `NoxClient.connect`. */
   connect(config: NoxClientConfig): Promise<NoxClientPort>;
   /** Milliseconds since the epoch. Default `Date.now`. */
@@ -158,6 +166,8 @@ class NoxWorker {
   private cacheTimer: ReturnType<typeof setInterval> | undefined;
   private learnedWriter: LearnedCacheWriter | undefined;
   private callSeq = 0;
+  private tlsPool: TlsPool | undefined;
+  private tunnels: TlsTransport | undefined;
   private readonly answers = new LocalAnswers();
   private readonly now: () => number;
   private readonly random: () => number;
@@ -231,6 +241,21 @@ class NoxWorker {
     }
     this.log.info("boot.wasm");
 
+    let tls: NoxTlsBindings | undefined;
+    if (cfg.tls !== "off") {
+      try {
+        tls = await this.deps.loadTls();
+      } catch (error) {
+        this.fail(
+          FAILED_CODES.wasmBlocked,
+          `The TLS module could not be compiled or instantiated (${describeError(error)}); ` +
+            "the embedder's Content-Security-Policy must allow 'wasm-unsafe-eval'",
+        );
+        return;
+      }
+      this.log.info("boot.tls", { mode: cfg.tls, session: cfg.tlsSession, roots: tls.info.webpkiRoots });
+    }
+
     void this.acceptLoop(cfg);
 
     const snapshotId = snapshotIdentity(pinned);
@@ -250,6 +275,15 @@ class NoxWorker {
       return;
     }
     this.client = client;
+    if (tls !== undefined) {
+      this.tlsPool = new TlsPool(client, tls, cfg, {
+        now: this.now,
+        random: this.random,
+        randomBytes: (length) => crypto.getRandomValues(new Uint8Array(length)),
+        log: this.log,
+      });
+      this.tunnels = new TlsTransport(this.tlsPool, tls, cfg, this.log, this.now);
+    }
     this.startRemovalCache(pinned, snapshotId, stored);
     this.api.signalReady();
     this.log.info("ready");
@@ -273,6 +307,9 @@ class NoxWorker {
   private shutdown(reason: NoxWorkerError): void {
     if (this.cacheTimer !== undefined) clearInterval(this.cacheTimer);
     this.cacheTimer = undefined;
+    this.tlsPool?.close();
+    this.tlsPool = undefined;
+    this.tunnels = undefined;
     this.client?.disconnect();
     this.client = undefined;
     for (const waiter of this.readyWaiters) waiter.reject(reason);
@@ -481,7 +518,7 @@ class NoxWorker {
         return local.response;
       }
       const client = await this.waitReady(budget.signal);
-      const response = await sendPrepared(prepared, client, cfg, budget);
+      const response = await sendPrepared(prepared, client, cfg, budget, this.tunnels);
       if (this.answers.observe(prepared, response) === "verify") this.verifyAnswer(prepared, client, cfg);
       if (this.log.enabled("debug")) {
         this.log.debug("call.done", {
@@ -501,6 +538,8 @@ class NoxWorker {
       throw final;
     } finally {
       budget.dispose();
+      // Spares open only once a wallet call settled (background work never delays the first call).
+      this.tlsPool?.enableBackground();
     }
   }
 
@@ -511,7 +550,7 @@ class NoxWorker {
    */
   private verifyAnswer(prepared: PreparedRequest, client: NoxClientPort, cfg: NoxWorkerConfig): void {
     const budget = new CallControl(undefined, cfg.callDeadlineMs, this.now);
-    sendPrepared(prepared, client, cfg, budget)
+    sendPrepared(prepared, client, cfg, budget, this.tunnels)
       .then(
         (response) => {
           this.answers.observe(prepared, response);

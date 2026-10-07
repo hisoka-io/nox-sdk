@@ -167,15 +167,19 @@ export class ReplyClaimScheduler {
     private readonly now: () => number = () => Date.now(),
   ) {}
 
-  /** Start claiming a request's replies from `entryUrl`. */
-  track(requestId: bigint, entryUrl: string, initialIds: readonly string[]): void {
+  /**
+   * Start claiming a request's replies from `entryUrl`. `dataWanted` blocks
+   * are claimed from the start (default 1: the rest once a fragment names
+   * the data shard count).
+   */
+  track(requestId: bigint, entryUrl: string, initialIds: readonly string[], dataWanted = 1): void {
     if (this.closed) return;
     this.targets.set(requestId, {
       requestId,
       entryUrl,
       initialIds: [...initialIds],
       sentAt: this.now(),
-      dataWanted: 1,
+      dataWanted,
       suspectSince: undefined,
       lostReported: false,
     });

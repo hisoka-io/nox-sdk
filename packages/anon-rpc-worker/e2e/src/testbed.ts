@@ -496,9 +496,14 @@ export async function workerConfigFor(config: TestbedConfig, info: TestbedInfo):
   return defaultWorkerConfig(info);
 }
 
-export function defaultWorkerConfig(info: TestbedInfo): { gateways: string[]; logLevel: string } {
+/**
+ * Every sidecar as a gateway, debug logs, and `tls: "off"`: the specs that use
+ * it call the upstream anvil by its plain-http URL through the exit's
+ * `HttpRequest` path (tls-tunnel.spec.ts sets its own TLS settings).
+ */
+export function defaultWorkerConfig(info: TestbedInfo): { gateways: string[]; logLevel: string; tls: string } {
   const gateways = (info.mesh?.nodes ?? [])
     .map((node) => node.kpsAddress)
     .filter((address): address is string => address !== undefined);
-  return { gateways, logLevel: "debug" };
+  return { gateways, logLevel: "debug", tls: "off" };
 }

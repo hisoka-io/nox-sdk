@@ -1050,6 +1050,7 @@ describe("replies through a non-pinned entry", () => {
     pool.registry.set("bb".repeat(16), { requestId: 2n, recoveryJson: "{}", version: 2 });
     Reflect.set(client, "surbPool", pool);
     Reflect.set(client, "pending", new Map([[1n, {}], [2n, {}]]));
+    Reflect.set(client, "_streams", new Map());
     Reflect.set(client, "_wasm", null);
     Reflect.set(client, "_webSocketImpl", null);
     Reflect.set(client, "responseWs", null);

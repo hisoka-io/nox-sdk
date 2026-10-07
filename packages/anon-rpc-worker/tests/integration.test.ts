@@ -8,7 +8,7 @@ import { NoxClient, type ServiceRequest } from "@hisoka-io/nox-client";
 import { runNoxWorker } from "../src/core.js";
 import { FakeHarness } from "./helpers/fake-harness.js";
 import { FakeNoxNetwork, fakeWasm } from "./helpers/fake-nox-network.js";
-import { exitReply, kpsAddressFor, makeBootstrap, makePinned } from "./helpers/fixtures.js";
+import { exitReply, fakeTlsBindings, kpsAddressFor, makeBootstrap, makePinned, tlsOff } from "./helpers/fixtures.js";
 
 const ambientFetch = vi.fn(() => {
   throw new Error("the worker must never call the global fetch");
@@ -36,11 +36,12 @@ afterEach(() => {
 function boot(config: unknown, exit: (request: ServiceRequest) => Uint8Array) {
   const pinned = makePinned();
   const network = new FakeNoxNetwork(pinned, exit);
-  const harness = new FakeHarness(config, network.kps);
+  const harness = new FakeHarness(tlsOff(config), network.kps);
   void runNoxWorker(harness.api, {
     snapshot: pinned,
     bootstrap: makeBootstrap(pinned),
     loadWasm: async () => fakeWasm(),
+    loadTls: async () => fakeTlsBindings(),
     connect: async (clientConfig) => {
       const client = await NoxClient.connect(clientConfig);
       disconnects.push(() => client.disconnect());
@@ -118,11 +119,12 @@ describe("worker on the real SDK in KPS mode", () => {
     const pinned = makePinned();
     const network = new FakeNoxNetwork(pinned, () => exitReply(200, [], "{}"));
     for (let index = 1; index <= pinned.members.length; index++) network.refused.add(kpsAddressFor(index));
-    const harness = new FakeHarness({ topologySources: 1 }, network.kps);
+    const harness = new FakeHarness(tlsOff({ topologySources: 1 }), network.kps);
     void runNoxWorker(harness.api, {
       snapshot: pinned,
       bootstrap: makeBootstrap(pinned),
       loadWasm: async () => fakeWasm(),
+      loadTls: async () => fakeTlsBindings(),
       connect: async (config) => {
         const client = await NoxClient.connect(config);
         disconnects.push(() => client.disconnect());
@@ -152,11 +154,12 @@ describe("worker liveness versus registry evidence (real SDK, two anchors)", () 
     const pinned = makePinned();
     const network = new FakeNoxNetwork(pinned, ok);
     prepare(network, pinned);
-    const harness = new FakeHarness(anchors, network.kps);
+    const harness = new FakeHarness(tlsOff(anchors), network.kps);
     void runNoxWorker(harness.api, {
       snapshot: pinned,
       bootstrap: makeBootstrap(pinned),
       loadWasm: async () => fakeWasm(),
+      loadTls: async () => fakeTlsBindings(),
       connect: async (clientConfig) => {
         const client = await NoxClient.connect({ ...clientConfig, topologyRefreshMs: 40 });
         disconnects.push(() => client.disconnect());

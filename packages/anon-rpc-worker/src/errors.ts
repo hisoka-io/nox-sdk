@@ -54,8 +54,14 @@ export const CALL_CODES = Object.freeze({
   tooLarge: "too-large",
   /** Not an absolute http(s) URL, or an invalid method, header or redirect mode. */
   unsupported: "unsupported",
-  /** The exit's reply could not be decoded or is not a valid HTTP response. */
+  /**
+   * The exit's reply could not be decoded or is not a valid HTTP response; or
+   * TLS through a tunnel failed its own checks (a refused record, an alert, a
+   * failed record authentication, a body cut short).
+   */
   protocolError: "protocol-error",
+  /** The tunnel exit's policy refuses the destination (port, host name or a blocked address). */
+  permissionDenied: "permission-denied",
   /** An unexpected exception (a bug). */
   internalError: "internal-error",
 } as const);

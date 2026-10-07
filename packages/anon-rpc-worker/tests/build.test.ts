@@ -95,6 +95,19 @@ describe("buildWorker", () => {
     expect(record.entry).toBe("src/worker.ts");
   });
 
+  it("embeds the TLS module, and a test root only when asked for one", async () => {
+    const release = await buildWorker({ outfile: outfile("tls"), write: false });
+    const tlsWasm = readFileSync(join(REPO_DIR, "packages", "nox-tls", "pkg-web", "nox_tls_bg.wasm"));
+    expect(Buffer.from(release.bundle).toString("utf8")).toContain(tlsWasm.toString("base64"));
+    expect(release.record.tls).toMatchObject({ bytes: tlsWasm.byteLength, keccak256: `0x${Buffer.from(keccak_256(tlsWasm)).toString("hex")}` });
+    expect(release.record.extraRoots).toBe(0);
+    const ca = join(REPO_DIR, "packages", "nox-tls", "tests", "fixtures", "ca.cert.der");
+    const test = await buildWorker({ outfile: outfile("tls-root"), write: false, extraRoot: ca });
+    expect(test.record.extraRoots).toBe(1);
+    expect(Buffer.from(test.bundle).toString("utf8")).toContain(readFileSync(ca).toString("base64"));
+    await expect(buildWorker({ outfile: outfile("tls-bad-root"), write: false, extraRoot: SNAPSHOT_PATH })).rejects.toThrow(/not a DER certificate/u);
+  });
+
   it("holds no live path to the ambient fetch or WebSocket", async () => {
     const { bundle } = await buildWorker({ outfile: outfile("policy"), write: false });
     const text = Buffer.from(bundle).toString("utf8");
@@ -249,7 +262,10 @@ describe("provenance", () => {
     // --source-commit is for exported trees: give provenance a repository root without .git.
     const exported = join(dir, "exported-repo");
     mkdirSync(exported, { recursive: true });
-    for (const file of ["package.json", "pnpm-lock.yaml"]) writeFileSync(join(exported, file), readFileSync(join(REPO_DIR, file)));
+    mkdirSync(join(exported, "packages", "nox-tls"), { recursive: true });
+    for (const file of ["package.json", "pnpm-lock.yaml", "Cargo.lock", "packages/nox-tls/Cargo.toml"]) {
+      writeFileSync(join(exported, file), readFileSync(join(REPO_DIR, file)));
+    }
     const options = (name: string) => ({
       distDir: join(dir, name),
       wasmRecordPath: join(dir, "absent.json"),
@@ -285,13 +301,33 @@ describe("provenance", () => {
 
   it("records the WASM toolchain and refuses a record of another module", async () => {
     await buildWorker({ outfile: outfile("p3") });
-    const record = JSON.parse(readFileSync(join(dir, "p3", "build-record.json"), "utf8")) as { wasm: { sha256: string } };
+    const record = JSON.parse(readFileSync(join(dir, "p3", "build-record.json"), "utf8")) as {
+      wasm: { sha256: string };
+      tls: { sha256: string };
+    };
     const wasmRecord = join(dir, "wasm-toolchain.json");
-    writeFileSync(wasmRecord, JSON.stringify({ wasmSha256: record.wasm.sha256, rustc: "rustc 1.95.0", wasmPack: "0.13.1", wasmBindgen: "0.2.114", wasmOpt: "117", pinsChecked: true }));
+    const tools = { rustc: "rustc 1.95.0", wasmPack: "0.13.1", wasmBindgen: "0.2.114", wasmOpt: "117", clang: "19.1.7", pinsChecked: true };
+    writeFileSync(wasmRecord, JSON.stringify({ ...tools, wasmSha256: record.wasm.sha256, tlsWasmSha256: record.tls.sha256 }));
     const provenance = makeProvenance({ distDir: join(dir, "p3"), wasmRecordPath: wasmRecord });
-    expect(provenance["toolchain"]).toMatchObject({ rustc: "rustc 1.95.0", wasmOpt: "117", wasmPinsChecked: true });
-    writeFileSync(wasmRecord, JSON.stringify({ wasmSha256: "00".repeat(32) }));
-    expect(() => makeProvenance({ distDir: join(dir, "p3"), wasmRecordPath: wasmRecord })).toThrow(/is not the one/u);
+    expect(provenance["toolchain"]).toMatchObject({ rustc: "rustc 1.95.0", wasmOpt: "117", clang: "19.1.7", wasmPinsChecked: true });
+    expect(provenance["inputs"]).toMatchObject({ tlsWasmSha256: record.tls.sha256 });
+    expect(provenance["tls"]).toMatchObject({ webpkiRoots: expect.stringMatching(/^\d+\.\d+\.\d+$/u), extraRoots: 0 });
+    writeFileSync(wasmRecord, JSON.stringify({ ...tools, wasmSha256: "00".repeat(32), tlsWasmSha256: record.tls.sha256 }));
+    expect(() => makeProvenance({ distDir: join(dir, "p3"), wasmRecordPath: wasmRecord })).toThrow(/nox-wasm module .* is not the one/u);
+    writeFileSync(wasmRecord, JSON.stringify({ ...tools, wasmSha256: record.wasm.sha256, tlsWasmSha256: "00".repeat(32) }));
+    expect(() => makeProvenance({ distDir: join(dir, "p3"), wasmRecordPath: wasmRecord })).toThrow(/nox-tls module .* is not the one/u);
+  });
+
+  it("refuses a bundle with an extra root in a release build", async () => {
+    const ca = join(REPO_DIR, "packages", "nox-tls", "tests", "fixtures", "ca.cert.der");
+    await buildWorker({ outfile: outfile("p6"), extraRoot: ca });
+    const options = { distDir: join(dir, "p6"), wasmRecordPath: join(dir, "absent.json") };
+    expect(makeProvenance(options)["tls"]).toMatchObject({ extraRoots: 1 });
+    expect(() => makeProvenance({ ...options, release: true })).toThrow(/a release build embeds none/u);
+    await buildWorker({ outfile: outfile("p7") });
+    expect(makeProvenance({ distDir: join(dir, "p7"), wasmRecordPath: join(dir, "absent.json"), release: true })["tls"]).toMatchObject({
+      extraRoots: 0,
+    });
   });
 
   it("refuses a bundle that changed after the build", async () => {

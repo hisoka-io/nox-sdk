@@ -2,6 +2,27 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
+## 0.8.0 (unreleased)
+
+Additive; every 0.7.0 configuration behaves as before.
+
+### Added
+
+- End-to-end TLS tunnels through exits (`ServiceRequest::TunnelV1`, bincode tag 8, nox `docs/tunnel.md`): the
+  wire types `TunnelRequestV1`, `TunnelOpenV1`, `TunnelReplyV1` (`encodeTunnelReplyV1`, `decodeTunnelReplyV1`,
+  strict: trailing bytes and unknown indices are refused), `TUNNEL_ID_LEN`, `TUNNEL_PART_MAX_DATA`,
+  `TUNNEL_REJECT_DETAIL_MAX`, `TUNNEL_FIN_V1`, `TUNNEL_REJECT_CODES_V1`, pinned to the nox-core vectors byte for byte.
+- `TUNNEL_V1_CAPABILITY` and `NoxClient.tunnelExits()`: exits that advertise `tunnel_v1`. Tunnel requests go only to
+  them; exits before nox rc.9 drop tag 8 without a reply.
+- `NoxClient.tunnelSend(exit, request, options)` (`TunnelSendOptions`, `TunnelSendHandle`): one copy of a tunnel
+  exchange to a fixed exit on a fresh entry and mix (outside `avoid` when possible). Each reply part goes to
+  `onReply` as it arrives; reassembly, reply-block top-up and resends stay with the caller. `surbs: 0` sends a
+  teardown without listening.
+
+### Changed
+
+- `ReplyClaimScheduler.track` takes the number of reply blocks to claim from the start (default 1, as before).
+
 ## 0.7.0 (2026-10-06)
 
 Additive; every 0.6.0 configuration behaves as before except where noted under Changed. Works against entries on

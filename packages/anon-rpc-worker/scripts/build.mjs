@@ -37,6 +37,14 @@
  *     repository (packages/nox-client/src), so the bundle is built from
  *     reviewed sources and not from a separately built dist/;
  *   - "nox-embed:wasm-bytes" exports noxWasmBytes(), the raw module bytes;
+ *   - "nox-embed:tls" resolves to scripts/embed/nox-tls-shim.js: the
+ *     wasm-bindgen web glue of packages/nox-tls (pkg-web, the worker's TLS
+ *     client) with an init from its embedded bytes, rewritten the same way;
+ *     the default entry must embed it;
+ *   - "nox-embed:tls-root" default-exports the DER bytes of `--extra-root` (a
+ *     test bed's CA, trusted next to the compiled-in roots) or null. The
+ *     release build (scripts/build-worker.sh) never passes it, and the build
+ *     record and provenance count the extra roots;
  *   - "nox-embed:bootstrap" default-exports the discovery bootstrap
  *     (snapshot/nox-bootstrap.json, or --bootstrap), embedded the same way;
  *     the default entry must embed it;
@@ -51,6 +59,7 @@
  * Usage:
  *   node scripts/build.mjs [--entry <file>] [--outfile <file>] [--snapshot <file>] [--bootstrap <file>]
  *                          [--wasm <nox_wasm_bg.wasm>] [--wasm-glue <nox_wasm.js>]
+ *                          [--tls-wasm <nox_tls_bg.wasm>] [--tls-glue <nox_tls.js>] [--extra-root <ca.der>]
  */
 import { build as esbuild, version as esbuildVersion } from "esbuild";
 import {
@@ -112,9 +121,15 @@ export const NOX_CLIENT_SOURCE = join(REPO_DIR, "packages", "nox-client", "src",
  */
 export const GLUE_URL_EXPRESSION = "new URL('nox_wasm_bg.wasm', import.meta.url)";
 
+/** The same expression in the nox-tls glue. */
+export const TLS_GLUE_URL_EXPRESSION = "new URL('nox_tls_bg.wasm', import.meta.url)";
+
 /** What the build puts in its place: the embedded module is the only source. */
 export const GLUE_URL_REPLACEMENT =
   '(() => { throw new Error("nox-wasm: this worker bundle embeds its WebAssembly module and never loads one by URL"); })()';
+
+/** The nox-tls build the worker embeds (packages/nox-tls, `build-wasm.sh`). */
+export const NOX_TLS_PKG = join(REPO_DIR, "packages", "nox-tls", "pkg-web");
 
 /** Typed build failure; `code` is stable, the message says what to do. */
 export class BuildError extends Error {
@@ -173,6 +188,9 @@ export function resolveNoxWasm(packageDir) {
  * @property {string} [wasmGlue]   wasm-bindgen web glue matching `wasm`
  * @property {string} [snapshot]   pinned snapshot to embed (default snapshot/nox-snapshot.json)
  * @property {string} [bootstrap]  discovery bootstrap to embed (default snapshot/nox-bootstrap.json)
+ * @property {string} [tlsWasm]    nox_tls_bg.wasm to embed (default: packages/nox-tls/pkg-web)
+ * @property {string} [tlsGlue]    wasm-bindgen web glue matching `tlsWasm`
+ * @property {string} [extraRoot]  a test bed's CA certificate (DER) for nox-embed:tls-root
  * @property {boolean} [write]     write the outputs (default true)
  */
 
@@ -193,6 +211,8 @@ export function resolveNoxWasm(packageDir) {
  * @property {{ path: string, bytes: number, sha256: string, keccak256: string }} wasm
  * @property {{ path: string, bytes: number, sha256: string, keccak256: string }} snapshot
  * @property {{ path: string, bytes: number, sha256: string, keccak256: string } | null} bootstrap
+ * @property {{ path: string, bytes: number, sha256: string, keccak256: string } | null} tls
+ * @property {number} extraRoots
  * @property {ModuleInput[]} modules
  */
 
@@ -234,14 +254,17 @@ export async function buildWorker(options = {}) {
   const buildHint = "run `pnpm --filter @hisoka-io/nox-wasm build:web`, or scripts/verify-reproducible.sh for the pinned toolchain";
   requireFile(wasmPath, `nox-wasm module not found at ${wasmPath}; ${buildHint}`);
   requireFile(gluePath, `nox-wasm web glue not found at ${gluePath}; ${buildHint}`);
-  const wasmBytes = readFileSync(wasmPath);
-  if (wasmBytes.length < WASM_MAGIC.length || !WASM_MAGIC.every((byte, i) => wasmBytes[i] === byte)) {
-    throw new BuildError(
-      `${wasmPath} is not a WebAssembly 1.0 binary (bad magic/version header)`,
-      "invalid-wasm",
-    );
-  }
+  const wasmBytes = readWasm(wasmPath, `nox-wasm module not found at ${wasmPath}; ${buildHint}`);
   const wasmBase64 = wasmBytes.toString("base64");
+  const tlsWasmPath = resolve(options.tlsWasm ?? join(NOX_TLS_PKG, "nox_tls_bg.wasm"));
+  const tlsGluePath = resolve(options.tlsGlue ?? join(NOX_TLS_PKG, "nox_tls.js"));
+  const tlsHint = "run scripts/build-wasm.sh, or scripts/verify-reproducible.sh for the pinned toolchain";
+  // Test entries may leave the TLS module out; the production entry must embed it.
+  const requireTls = entry === DEFAULT_ENTRY || options.tlsWasm !== undefined;
+  const tlsBytes = requireTls || existsSync(tlsWasmPath) ? readWasm(tlsWasmPath, `nox-tls module not found at ${tlsWasmPath}; ${tlsHint}`) : null;
+  if (tlsBytes !== null) requireFile(tlsGluePath, `nox-tls web glue not found at ${tlsGluePath}; ${tlsHint}`);
+  const tlsBase64 = tlsBytes === null ? null : tlsBytes.toString("base64");
+  const extraRoot = options.extraRoot === undefined ? null : readExtraRoot(resolve(options.extraRoot));
   const snapshotPath = resolve(options.snapshot ?? SNAPSHOT_PATH);
   const snapshotText = readCanonicalSnapshot(snapshotPath);
   // The production entry must embed the bootstrap; test entries may leave it out.
@@ -270,7 +293,7 @@ export async function buildWorker(options = {}) {
       write: false,
       logLevel: "silent",
       logOverride: { "empty-import-meta": "error" },
-      plugins: [noxEmbedPlugin({ wasmBase64, gluePath, snapshotText, bootstrapText })],
+      plugins: [noxEmbedPlugin({ wasmBase64, gluePath, snapshotText, bootstrapText, tlsBase64, tlsGluePath, extraRoot })],
     });
   } catch (error) {
     throw new BuildError(`esbuild failed for ${entry}: ${errorMessage(error)}`, "bundle-failed");
@@ -288,7 +311,8 @@ export async function buildWorker(options = {}) {
   }
   const output = /** @type {import("esbuild").OutputFile} */ (result.outputFiles[0]);
   const bundle = output.contents;
-  checkBundle(output.text, wasmBase64, snapshotText, requireBootstrap ? bootstrapText : null);
+  checkBundle(output.text, wasmBase64, snapshotText, requireBootstrap ? bootstrapText : null, requireTls ? tlsBase64 : null);
+  const embedsTls = tlsBase64 !== null && output.text.includes(JSON.stringify(tlsBase64));
   const embeddedBootstrap = embeddedModuleText(output.text, "bootstrap");
 
   const record = makeRecord({
@@ -303,6 +327,9 @@ export async function buildWorker(options = {}) {
     snapshotText,
     bootstrapPath: embeddedBootstrap === null ? null : bootstrapPath,
     bootstrapText: embeddedBootstrap,
+    tlsWasmPath: embedsTls ? tlsWasmPath : null,
+    tlsBytes: embedsTls ? tlsBytes : null,
+    extraRoots: extraRoot === null ? 0 : 1,
     bundle,
     metafile: result.metafile,
   });
@@ -320,6 +347,35 @@ export async function buildWorker(options = {}) {
  */
 export function readCanonicalSnapshot(path) {
   return readCanonicalJson(path, "pinned snapshot", "run scripts/make-snapshot.mjs or pass --snapshot");
+}
+
+/**
+ * Read a WebAssembly module to embed; it must start with the 1.0 header.
+ * @param {string} path
+ * @param {string} missing  message when the file does not exist
+ * @returns {Buffer}
+ */
+function readWasm(path, missing) {
+  requireFile(path, missing);
+  const bytes = readFileSync(path);
+  if (bytes.length < WASM_MAGIC.length || !WASM_MAGIC.every((byte, i) => bytes[i] === byte)) {
+    throw new BuildError(`${path} is not a WebAssembly 1.0 binary (bad magic/version header)`, "invalid-wasm");
+  }
+  return bytes;
+}
+
+/**
+ * Read a test bed's CA certificate: DER, one X.509 SEQUENCE.
+ * @param {string} path
+ * @returns {Buffer}
+ */
+function readExtraRoot(path) {
+  requireFile(path, `extra root certificate ${path} not found`);
+  const der = readFileSync(path);
+  if (der.length < 64 || der[0] !== 0x30) {
+    throw new BuildError(`${path} is not a DER certificate (expected an ASN.1 SEQUENCE)`, "missing-input");
+  }
+  return der;
 }
 
 /**
@@ -358,11 +414,12 @@ export function snapshotModuleSource(snapshotText) {
 }
 
 /**
- * esbuild plugin that provides the embedded-WASM, snapshot and bootstrap modules.
- * @param {{ wasmBase64: string, gluePath: string, snapshotText: string, bootstrapText: string | null }} inputs
+ * esbuild plugin that provides the embedded-WASM, TLS, snapshot and bootstrap modules.
+ * @param {{ wasmBase64: string, gluePath: string, snapshotText: string, bootstrapText: string | null,
+ *           tlsBase64: string | null, tlsGluePath: string, extraRoot: Buffer | null }} inputs
  * @returns {import("esbuild").Plugin}
  */
-function noxEmbedPlugin({ wasmBase64, gluePath, snapshotText, bootstrapText }) {
+function noxEmbedPlugin({ wasmBase64, gluePath, snapshotText, bootstrapText, tlsBase64, tlsGluePath, extraRoot }) {
   // esbuild evaluates these filters as Go regular expressions: no JS flags.
   return {
     name: "nox-embed",
@@ -379,6 +436,29 @@ function noxEmbedPlugin({ wasmBase64, gluePath, snapshotText, bootstrapText }) {
         if (args.path !== gluePath) return undefined;
         return { contents: rewriteGlue(readFileSync(gluePath, "utf8"), gluePath), loader: "js", resolveDir: dirname(gluePath) };
       });
+      build.onResolve({ filter: /^nox-embed:tls$/ }, () => ({ path: join(EMBED_DIR, "nox-tls-shim.js") }));
+      build.onResolve({ filter: /^nox-embed:tls-glue$/ }, () => ({ path: tlsGluePath }));
+      build.onLoad({ filter: /nox_tls\.js$/ }, (args) => {
+        if (args.path !== tlsGluePath) return undefined;
+        const source = rewriteGlue(readFileSync(tlsGluePath, "utf8"), tlsGluePath, TLS_GLUE_URL_EXPRESSION);
+        return { contents: source, loader: "js", resolveDir: dirname(tlsGluePath) };
+      });
+      build.onResolve({ filter: /^nox-embed:tls-base64$/ }, () => ({ path: "tls-base64", namespace: "nox-embed" }));
+      build.onLoad({ filter: /^tls-base64$/, namespace: "nox-embed" }, () => {
+        if (tlsBase64 === null) {
+          throw new BuildError("the entry imports nox-embed:tls but no nox-tls module was found", "missing-input");
+        }
+        return { contents: `export default ${JSON.stringify(tlsBase64)};\n`, loader: "js" };
+      });
+      build.onResolve({ filter: /^nox-embed:tls-root$/ }, () => ({ path: "tls-root", namespace: "nox-embed" }));
+      build.onLoad({ filter: /^tls-root$/, namespace: "nox-embed" }, () => ({
+        contents: extraRoot === null
+          ? "export default null;\n"
+          : `import { decodeBase64 } from ${JSON.stringify(join(EMBED_DIR, "base64.js"))};\n` +
+            `export default decodeBase64(${JSON.stringify(extraRoot.toString("base64"))}, "test root");\n`,
+        loader: "js",
+        resolveDir: EMBED_DIR,
+      }));
       build.onResolve({ filter: /^nox-embed:wasm-base64$/ }, () => ({
         path: "wasm-base64",
         namespace: "nox-embed",
@@ -415,18 +495,19 @@ function noxEmbedPlugin({ wasmBase64, gluePath, snapshotText, bootstrapText }) {
  * glue fails the build here instead of silently shipping a fetch path.
  * @param {string} source
  * @param {string} gluePath
+ * @param {string} [expression]  the glue's module lookup (default: nox-wasm's)
  * @returns {string}
  */
-export function rewriteGlue(source, gluePath) {
-  const occurrences = source.split(GLUE_URL_EXPRESSION).length - 1;
+export function rewriteGlue(source, gluePath, expression = GLUE_URL_EXPRESSION) {
+  const occurrences = source.split(expression).length - 1;
   if (occurrences !== 1) {
     throw new BuildError(
-      `${gluePath}: expected the wasm-bindgen glue to contain ${JSON.stringify(GLUE_URL_EXPRESSION)} exactly once, found ${occurrences}; ` +
-        "review scripts/embed/nox-wasm-shim.js against the new glue before bundling it",
+      `${gluePath}: expected the wasm-bindgen glue to contain ${JSON.stringify(expression)} exactly once, found ${occurrences}; ` +
+        "review the embed shims in scripts/embed/ against the new glue before bundling it",
       "bundle-check-failed",
     );
   }
-  const rewritten = source.replace(GLUE_URL_EXPRESSION, GLUE_URL_REPLACEMENT);
+  const rewritten = source.replace(expression, GLUE_URL_REPLACEMENT);
   if (rewritten.includes("import.meta")) {
     throw new BuildError(`${gluePath}: the glue uses import.meta outside the module lookup; review the embed shim`, "bundle-check-failed");
   }
@@ -493,13 +574,14 @@ export const FORBIDDEN_BUNDLE_PATTERNS = Object.freeze([
 
 /**
  * Structural checks on the emitted bundle. With `bootstrapText`, the bundle
- * must embed exactly that bootstrap.
+ * must embed exactly that bootstrap; with `tlsBase64`, the nox-tls module.
  * @param {string} text
  * @param {string} wasmBase64
  * @param {string} snapshotText
  * @param {string | null} [bootstrapText]
+ * @param {string | null} [tlsBase64]
  */
-export function checkBundle(text, wasmBase64, snapshotText, bootstrapText = null) {
+export function checkBundle(text, wasmBase64, snapshotText, bootstrapText = null, tlsBase64 = null) {
   if (bootstrapText !== null) {
     const embeddedBootstrap = embeddedModuleText(text, "bootstrap");
     if (embeddedBootstrap === null) {
@@ -533,6 +615,12 @@ export function checkBundle(text, wasmBase64, snapshotText, bootstrapText = null
       "bundle-check-failed",
     );
   }
+  if (tlsBase64 !== null && !text.includes(JSON.stringify(tlsBase64))) {
+    throw new BuildError(
+      "the bundle does not embed the nox-tls module: the worker source must import \"nox-embed:tls\" and use it",
+      "bundle-check-failed",
+    );
+  }
   if (text.includes("import.meta")) {
     throw new BuildError(
       "the bundle references import.meta, which has no meaning in a classic script loaded by importScripts()",
@@ -545,6 +633,7 @@ export function checkBundle(text, wasmBase64, snapshotText, bootstrapText = null
  * @param {{ packageDir: string, entry: string, outfile: string, tsconfigPath: string, banner: string,
  *           wasmPath: string, wasmBytes: Buffer, snapshotPath: string, snapshotText: string,
  *           bootstrapPath: string | null, bootstrapText: string | null,
+ *           tlsWasmPath: string | null, tlsBytes: Buffer | null, extraRoots: number,
  *           bundle: Uint8Array, metafile: import("esbuild").Metafile }} parts
  * @returns {BuildRecord}
  */
@@ -601,6 +690,15 @@ function makeRecord(parts) {
         sha256: sha256Hex(bootstrapBytes),
         keccak256: keccak256Hex(bootstrapBytes),
       },
+    tls: parts.tlsBytes === null || parts.tlsWasmPath === null
+      ? null
+      : {
+        path: toPosix(relative(packageDir, parts.tlsWasmPath)),
+        bytes: parts.tlsBytes.byteLength,
+        sha256: sha256Hex(parts.tlsBytes),
+        keccak256: keccak256Hex(parts.tlsBytes),
+      },
+    extraRoots: parts.extraRoots,
     modules,
   };
 }
@@ -683,12 +781,16 @@ export async function main(argv) {
       "wasm-glue": { type: "string" },
       snapshot: { type: "string" },
       bootstrap: { type: "string" },
+      "tls-wasm": { type: "string" },
+      "tls-glue": { type: "string" },
+      "extra-root": { type: "string" },
       help: { type: "boolean", short: "h", default: false },
     },
   });
   if (values.help) {
     process.stdout.write(
-      "usage: build.mjs [--entry src/worker.ts] [--outfile dist/anon-rpc-worker.js] [--snapshot <file>] [--bootstrap <file>] [--wasm <file>] [--wasm-glue <file>]\n",
+      "usage: build.mjs [--entry src/worker.ts] [--outfile dist/anon-rpc-worker.js] [--snapshot <file>] [--bootstrap <file>]\n" +
+        "                 [--wasm <file>] [--wasm-glue <file>] [--tls-wasm <file>] [--tls-glue <file>] [--extra-root <ca.der>]\n",
     );
     return 0;
   }
@@ -700,6 +802,9 @@ export async function main(argv) {
   if (values["wasm-glue"] !== undefined) options.wasmGlue = values["wasm-glue"];
   if (values.snapshot !== undefined) options.snapshot = values.snapshot;
   if (values.bootstrap !== undefined) options.bootstrap = values.bootstrap;
+  if (values["tls-wasm"] !== undefined) options.tlsWasm = values["tls-wasm"];
+  if (values["tls-glue"] !== undefined) options.tlsGlue = values["tls-glue"];
+  if (values["extra-root"] !== undefined) options.extraRoot = values["extra-root"];
   const { record } = await buildWorker(options);
   const { artifact, wasm, snapshot } = record;
   process.stdout.write(
@@ -708,6 +813,8 @@ export async function main(argv) {
       `  keccak256 ${artifact.keccak256}  (the workerHash a specifier pins)`,
       `  sha256    ${artifact.sha256}`,
       `  nox-wasm  ${wasm.path} (${wasm.bytes} bytes, sha256 ${wasm.sha256})`,
+      ...(record.tls === null ? [] : [`  nox-tls   ${record.tls.path} (${record.tls.bytes} bytes, sha256 ${record.tls.sha256})`]),
+      ...(record.extraRoots === 0 ? [] : [`  extra roots ${record.extraRoots} (test build: never publish this bundle)`]),
       `  snapshot  ${snapshot.path} (keccak256 ${snapshot.keccak256})`,
       ...(record.bootstrap === null ? [] : [`  bootstrap ${record.bootstrap.path} (keccak256 ${record.bootstrap.keccak256})`]),
       `  esbuild   ${record.esbuild.version}, ${record.modules.length} modules`,

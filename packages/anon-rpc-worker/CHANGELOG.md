@@ -2,6 +2,33 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
+## 0.4.0 (unreleased)
+
+Built on `@hisoka-io/nox-client` 0.8.0. Every 0.3.0 config stays valid; with the new defaults, https calls go
+through TLS tunnels and need exits on nox rc.9 or later with `[tunnel]` enabled.
+
+### Added
+
+- End-to-end TLS (README "End-to-end TLS"): the worker runs TLS 1.3 and 1.2 itself (rustls with ring in a second
+  embedded WebAssembly module, `packages/nox-tls`, compiled at boot) and exits relay TLS records over one TCP
+  connection per tunnel. Requests and responses stay end-to-end encrypted between the worker and the RPC provider,
+  and the mixnet keeps the sender anonymous; the exit sees the provider's host name, timing and sizes.
+- Config `tls` (`"required"` default, `"preferred"`, `"off"`), `tlsSession` (`"per-call"` default, `"keep-alive"`),
+  `tlsSpares`, `tlsSpareTtlMs`, `tlsKeepAliveMs`, `tlsMaxCallsPerSession`, `tlsOpenTimeoutMs`, `tlsCopyAfterMs`,
+  `tlsGapMs`, `tlsMaxCopies`.
+- Per-call sessions with handshaken spares per recently used host, opened in the background after the first wallet
+  call settled; keep-alive sessions as an opt-in. Resumption and 0-RTT stay off; ALPN is `http/1.1`.
+- HTTP/1.1 in the worker: caller headers keep their order and duplicates; framing, hop-by-hop and `User-Agent`
+  headers are set by the encoder alone; CR, LF and NUL are refused; a whole JSON request is padded to a size bucket;
+  responses are complete only by HTTP framing or TLS close_notify.
+- Call code `permission-denied` (the tunnel exit refuses the destination). Log events `boot.tls`, `tls.open`,
+  `tls.fallback`, `tls.reject`, `tls.exit.skipped`, `tls.retry`.
+- Build: `nox-tls` built with the pinned toolchain and a pinned clang (`DEBIAN_SNAPSHOT`, `CLANG_PACKAGE_VERSION`,
+  `CLANG_VERSION` in `scripts/toolchain.env`); provenance records its digest, clang, the webpki-roots version and
+  release date, and `extraRoots`. `build.mjs --extra-root` and `build-test-worker.mjs --extra-root` for test beds;
+  `build-worker.sh --release` refuses a bundle with extra roots.
+- Release gate: `verify-snapshot.mjs --release` requires an exit whose capability hints carry `tunnel_v1`.
+
 ## 0.3.0 (2026-10-06)
 
 Every 0.2.0 config stays valid. Works against entries on nox 0.4.0-rc.6 and on nodes with claim protocol v2.

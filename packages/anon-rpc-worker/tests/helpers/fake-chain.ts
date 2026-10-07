@@ -60,13 +60,21 @@ export class FakeChain {
   async start(): Promise<string> {
     this.server = createServer((request, response) => {
       void readBody(request).then((body) => {
-        const parsed: unknown = JSON.parse(body);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          // A client that gave up mid-request: answer as a JSON-RPC server does.
+          response.writeHead(200, { "content-type": "application/json" });
+          response.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }));
+          return;
+        }
         const reply = Array.isArray(parsed)
           ? parsed.map((item) => this.answer(item as JsonRpcRequest))
           : this.answer(parsed as JsonRpcRequest);
         response.writeHead(200, { "content-type": "application/json" });
         response.end(JSON.stringify(reply));
-      });
+      }, () => response.destroy());
     });
     await new Promise<void>((resolve) => this.server?.listen(0, "127.0.0.1", resolve));
     const { port } = this.server.address() as AddressInfo;

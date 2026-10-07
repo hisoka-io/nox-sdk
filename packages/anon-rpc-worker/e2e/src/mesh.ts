@@ -159,7 +159,8 @@ export async function startMesh(options: StartMeshOptions): Promise<RunningMesh>
         ]),
     ],
     // Keep node logs after teardown for post-mortems (<data-dir>/node_N/node.log).
-    env: { NOX_KEEP_LOGS: "1" },
+    // The nodes inherit this environment, so it also switches exit tunnels on.
+    env: { NOX_KEEP_LOGS: "1", ...(config.tunnels ? { NOX__TUNNEL__ENABLED: "true" } : {}) },
     logFile,
     processGroup: true,
   });
