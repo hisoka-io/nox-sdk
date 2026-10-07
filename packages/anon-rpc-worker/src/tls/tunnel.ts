@@ -122,7 +122,6 @@ export class Tunnel {
   private contiguous = 0n;
   private readonly held = new Map<bigint, Uint8Array>();
   private eofAt: bigint | undefined;
-  private lastRoute: { entryId: string; mixId: string } | undefined;
   private ended = false;
 
   constructor(
@@ -174,6 +173,7 @@ export class Tunnel {
       let confirmed = false;
       let copiesSent = 0;
       let timedCopies = 0;
+      let lastRoute: { entryId: string; mixId: string } | undefined;
       let silenceTimer: ReturnType<typeof setTimeout> | undefined;
       let gapTimer: ReturnType<typeof setTimeout> | undefined;
       let openTimer: ReturnType<typeof setTimeout> | undefined;
@@ -213,9 +213,8 @@ export class Tunnel {
         }
         const holdMs = Math.max(MIN_HOLD_MS, Math.min(MAX_HOLD_MS, remaining));
         const request: TunnelRequestV1 = { ...base, ackOffset: this.contiguous, holdMs };
-        const avoid = this.lastRoute === undefined
-          ? new Set<string>()
-          : new Set([this.lastRoute.entryId, this.lastRoute.mixId]);
+        // A copy steers clear of the previous copy's entry and mix.
+        const avoid = lastRoute === undefined ? new Set<string>() : new Set([lastRoute.entryId, lastRoute.mixId]);
         let handle: TunnelSendHandle;
         try {
           handle = this.port.tunnelSend(this.exit, request, {
@@ -231,7 +230,7 @@ export class Tunnel {
           return;
         }
         copiesSent += 1;
-        this.lastRoute = { entryId: handle.entryId, mixId: handle.mixId };
+        lastRoute = { entryId: handle.entryId, mixId: handle.mixId };
         // A copy that could not be uploaded counts as silence: try another entry.
         handle.done.catch(() => {
           if (!settled && !listeners.signal.aborted && !confirmed) timedCopy();
