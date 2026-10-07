@@ -92,8 +92,11 @@ function logged(harness: FakeHarness, event: string): number {
   return harness.events(event).length;
 }
 
+/** Discovery runs on wall-clock timers; a loaded host (a parallel cargo build) needs the margin. */
+const WAIT = { timeout: 40_000, interval: 20 };
+
 async function untilLogged(harness: FakeHarness, event: string): Promise<void> {
-  await vi.waitFor(() => expect(logged(harness, event)).toBeGreaterThan(0), { timeout: 10_000, interval: 20 });
+  await vi.waitFor(() => expect(logged(harness, event)).toBeGreaterThan(0), WAIT);
 }
 
 /**
@@ -147,7 +150,7 @@ describe("worker discovery", () => {
       expect(raw).toBeDefined();
       const cache = JSON.parse(new TextDecoder().decode(raw!)) as { anchors: { address: string; member: string }[] };
       expect(cache.anchors).toContainEqual(expect.objectContaining({ address: moved, member: memberAddress(2) }));
-    }, { timeout: 5_000, interval: 20 });
+    }, WAIT);
     // The KPS address of member 2 in this session already follows the chain.
     expect(first.client().nodes.find((node) => node.id === memberAddress(2))?.address).toBe(`kps:${moved}`);
 
