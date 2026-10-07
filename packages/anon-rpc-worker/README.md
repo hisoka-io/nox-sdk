@@ -10,15 +10,16 @@ ready the worker reads the registry through the mixnet itself. Where the nodes a
 looked up at run time, so operators change IPs whenever they like and new nodes join without a new bundle. A cold
 boot needs no seed server and no public RPC; the bundle reaches the network only through the harness's KPS dialer.
 
-What each party sees: the entry node sees the wallet's IP address and encrypted packets; the exit node sees the
-HTTP request (RPC URL, headers it forwards, body) and never who sent it. End-to-end TLS inside the worker,
-which also hides the request from the exit, is the next milestone.
+What each party sees: the entry node sees the wallet's IP address and encrypted packets. With end-to-end TLS (the
+default, `tls: "required"`), requests, responses and the sender's identity stay end-to-end encrypted between the
+worker and the RPC provider: the worker runs TLS itself and the exit relays TLS ciphertext over one TCP connection,
+seeing the provider's host name, timing and sizes (see [End-to-end TLS](#end-to-end-tls)).
 
 ## Layout
 
 | Path | Contents |
 |---|---|
-| `src/` | The worker: `worker.ts` (bundle entry), `core.ts` (boot, readiness, accept loop, deadlines), `config.ts`, `fetch-map.ts` (`fetch` to Nox `HttpRequest`), `jsonrpc.ts`, `errors.ts`, `log.ts`, `storage.ts`, `spec-types.ts` (anon-rpc SPEC 0.3.2 worker types) |
+| `src/` | The worker: `worker.ts` (bundle entry), `core.ts` (boot, readiness, accept loop, deadlines), `config.ts`, `fetch-map.ts` (`fetch` to Nox `HttpRequest`, redirects, gzip), `tls/` (end-to-end TLS: `tunnel.ts` one exit tunnel, `channel.ts` TLS and HTTP/1.1 over it, `pool.ts` sessions, spares and exit choice, `transport.ts` the per-hop transport and error mapping, `module.ts` the TLS module bindings), `jsonrpc.ts`, `errors.ts`, `log.ts`, `storage.ts`, `spec-types.ts` (anon-rpc SPEC 0.3.2 worker types) |
 | `snapshot/` | The pinned registry snapshot, its keccak-256, JSON Schema and reviewed capability hints, and the discovery bootstrap (`nox-bootstrap.json`) |
 | `scripts/` | Snapshot generator and verifier, reproducible WASM and bundle build, hashing, provenance |
 | `specifier/` | Worker specifier contracts (Foundry) and a read-only deploy planner and inspector |
@@ -51,6 +52,16 @@ optional, and every config valid for 0.1.0 stays valid:
 | `bootRetryMaxMs` | integer | 60,000 | 5,000-300,000 |
 | `topologySources` | integer | 2 | 1-4 |
 | `warmup` | boolean | false | one echo through a full route before ready |
+| `tls` | `"required"`, `"preferred"`, `"off"` | `"required"` | end-to-end TLS, see [End-to-end TLS](#end-to-end-tls) |
+| `tlsSession` | `"per-call"`, `"keep-alive"` | `"per-call"` | one TLS session per call, or sessions shared by the calls to one host |
+| `tlsSpares` | integer | 1 | 0-4 handshaken spare sessions per recently used host (per-call mode) |
+| `tlsSpareTtlMs` | integer | 20,000 | 1,000-50,000; an unused spare is closed after this long |
+| `tlsKeepAliveMs` | integer | 30,000 | 1,000-50,000; how long a keep-alive session serves calls after it opened |
+| `tlsMaxCallsPerSession` | integer | 100 | 1-1,000 calls per keep-alive session |
+| `tlsOpenTimeoutMs` | integer | 5,000 | 1,000-30,000; an exit that does not answer a tunnel open in this long is skipped for 10 minutes |
+| `tlsCopyAfterMs` | integer | 2,500 | 500-30,000; another copy of the current tunnel exchange when nothing arrived for this long (raised to the observed p95) |
+| `tlsGapMs` | integer | 800 | 100-10,000; another copy when a gap in the reply stream stays open this long |
+| `tlsMaxCopies` | integer | 3 | 1-5 copies per exchange for silence or a gap |
 
 An unknown key, a wrong type or an out-of-range value fails the boot with `bad-config`, naming the field.
 
@@ -63,6 +74,63 @@ Examples:
 ```json5
 { gateways: ["100.56.0.72:15005:uEiBVDwIs40bsslDkM-BYb2AOHw3PHe70_bj5U_09r7vdIQ"] }
 ```
+
+## End-to-end TLS
+
+The worker carries a TLS client (rustls with ring, compiled to WebAssembly, `packages/nox-tls`) and runs TLS with
+the RPC provider itself. A Nox exit that advertises `tunnel_v1` holds one TCP connection to the provider per tunnel
+and relays TLS records both ways (`ServiceRequest::TunnelV1`, nox `docs/tunnel.md`). Requests, responses and the
+sender's identity stay end-to-end encrypted between the worker and the provider; the exit relays ciphertext.
+
+What the exit learns: the provider's host name (from SNI, its own DNS lookup and the IP) and port 443; when a tunnel
+opens and closes; the number, size and timing of TLS records in both directions (JSON request bodies are padded to
+512 B, 1 KiB, 4 KiB, 16 KiB, then 16 KiB steps, so a transaction and a block-number read look alike; response sizes
+stay visible); the TLS client fingerprint, shared by every worker of one version; in keep-alive mode, which calls
+share a session. The URL path and query (API keys included), headers, JSON-RPC methods and parameters, signed
+transactions, response content and the sender stay hidden from it, and the worker detects any change or truncation
+of a response.
+
+`tls`:
+
+| `tls` | https on port 443, host by name | http, another port, or an IP-literal host | no known exit advertises `tunnel_v1` |
+|---|---|---|---|
+| `"required"` (default) | tunnel | rejects `unsupported` | rejects `network-error` |
+| `"preferred"` | tunnel | exit `HttpRequest` (logged `tls.fallback`) | exit `HttpRequest` (logged `tls.fallback`) |
+| `"off"` | exit `HttpRequest` | exit `HttpRequest` | exit `HttpRequest` |
+
+The transport is chosen before any byte of a call leaves the worker, and a call that started on a tunnel never
+continues on `HttpRequest`, redirects included. Capability data comes from the exits through the seed, both run by
+the operator, so only `"required"` keeps requests end-to-end encrypted against an operator that withholds
+`tunnel_v1`; `"preferred"` covers passive exits. An exit that answers `Disabled`, or no tunnel open within
+`tlsOpenTimeoutMs`, is skipped for 10 minutes and the open moves to another tunnel exit.
+
+Session modes:
+
+- `"per-call"` (default): every call has its own TLS session and `Connection: close`; no resumption, no 0-RTT, a
+  fresh key share each time. `tlsSpares` keeps handshaken, unused sessions for hosts the wallet called, opened in
+  the background (only after the first wallet call settled) on a random tunnel exit after an exponential delay
+  (mean 2 s), each serving one call. Each call travels in its own session; at low traffic the timing of a spare's
+  open can still chain sequential calls of one wallet to one host, which weakens as traffic grows.
+- `"keep-alive"`: calls to one host share a session on one exit for `tlsKeepAliveMs`, up to 4 sessions per host.
+  The exit links the calls of a session, and the provider sees them on one TLS connection.
+
+Latency: a call on a ready session (a spare, or a warm keep-alive session) costs what the exit `HttpRequest` path
+costs. The first call to a host, and calls beyond the ready spares, add one mixnet round trip for the handshake.
+
+Certificates are checked against the Mozilla root store compiled into the bundle (webpki-roots; the version and its
+release date are in the provenance, refreshed with every worker release), with the host name and the device clock;
+a wrong clock fails with a message that names it. Each worker release ships its root store, so wallets keep their
+roots current by moving to new worker releases. Resends of a tunnel exchange go to the same exit through another
+entry and mix and carry identical bytes, which the exit writes once; after a lost tunnel only reads that may be resent
+run again on a new tunnel.
+
+Next milestones: Encrypted Client Hello for providers that publish it, and a hybrid post-quantum key exchange
+(X25519MLKEM768).
+
+Errors: `permission-denied` (the exit refuses the destination), `network-error` (no tunnel exit, a certificate
+failure, the exit cannot reach the provider), `protocol-error` (TLS or HTTP checks failed, a truncated response),
+`too-large`, `timeout`. Log events: `boot.tls`, `tls.open` (debug: handshake time and CPU), `tls.fallback{reason}`,
+`tls.reject{code}`, `tls.exit.skipped`, `tls.retry`; none carries bytes or a host name.
 
 ## Discovery (identity from chain, location at run time)
 
@@ -151,15 +219,16 @@ Two builds in fresh containers of the pinned images (at two different paths) giv
 
 - `dist/anon-rpc-worker.js`: a single IIFE built by esbuild (target es2022, not minified, so it can be read
   and audited). Every module is inlined: the worker source, the `@hisoka-io/nox-client` sources, the
-  `nox-wasm` WebAssembly module (base64), the pinned registry snapshot and the discovery bootstrap, each embedded
-  byte for byte as one string.
+  `nox-wasm` and `nox-tls` WebAssembly modules (base64), the pinned registry snapshot and the discovery bootstrap,
+  each embedded byte for byte as one string. The TLS module is compiled at boot, off the first call's path.
   The bundle has no imports and never loads code or WebAssembly by URL. The SDK's ambient `fetch` and
   `WebSocket` defaults are replaced at build time by a stand-in that fails closed, and the build checks the
   output for any other network API.
 - `dist/anon-rpc-worker.js.keccak256`: the Ethereum keccak-256 of those exact bytes, the value a worker
   specifier pins as `workerHash()`.
 - `dist/anon-rpc-worker.provenance.json`: source commit, toolchain versions, input digests (snapshot, bootstrap,
-  WASM, lockfile) and output digests.
+  both WASM modules, lockfile), the compiled-in root store (webpki-roots version and release date, and
+  `extraRoots`, 0 in every release) and output digests.
 
 ## Pinned registry snapshot
 
@@ -196,8 +265,9 @@ node packages/anon-rpc-worker/scripts/hash.mjs packages/anon-rpc-worker/dist/ano
 ```
 
 `scripts/toolchain.env` pins every tool that shapes the bytes: the Node and Rust container images by digest,
-rustc, wasm-pack, wasm-bindgen and binaryen (with sha256 digests of their release archives); pnpm comes from the
-repository's `packageManager` field and esbuild from the lockfile. `scripts/build-wasm.sh` follows the
+rustc, wasm-pack, wasm-bindgen and binaryen (with sha256 digests of their release archives), and clang with llvm-ar
+for ring's C sources in `nox-tls` (Debian bookworm packages at a snapshot.debian.org timestamp, the same on x86_64
+and aarch64); pnpm comes from the repository's `packageManager` field and esbuild from the lockfile. `scripts/build-wasm.sh` follows the
 tor-js recipe: path remapping, a `RUSTC_WRAPPER` that makes cargo's metadata host-independent, `--locked`, and
 a pinned `wasm-opt` on `PATH`.
 
@@ -208,7 +278,8 @@ container builds and requires all three to match; `--local --bwrap` runs the two
 namespaces at the container paths, for hosts without a container runtime.
 
 For a test bed, `node scripts/build.mjs --snapshot <file>` embeds another canonical snapshot (for example a
-local mesh); the provenance records which snapshot a bundle carries.
+local mesh) and `--extra-root <ca.der>` a test CA next to the Mozilla roots; the provenance records which snapshot a
+bundle carries and how many extra roots. The release build (`build-worker.sh --release`) never passes an extra root.
 
 ## Tests
 

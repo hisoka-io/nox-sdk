@@ -177,6 +177,29 @@ const body = await client.httpRequest(
 );
 ```
 
+### TLS tunnels
+
+Exits on nox rc.9 and later that advertise `tunnel_v1` relay TLS records over one TCP connection per tunnel, so a
+client that runs TLS itself keeps requests and responses end-to-end encrypted (the anon-rpc worker does this; see
+its README). `tunnelExits()` lists those exits; `tunnelSend` sends one copy of an exchange and hands each reply part
+(an encoded `TunnelReplyV1`) to `onReply`:
+
+```ts
+const exit = client.tunnelExits()[0];
+const copy = client.tunnelSend(exit, {
+  tunnelId, seq: 0, open: { host: "rpc.example", port: 443 },
+  ackOffset: 0n, data: clientHello, close: false, holdMs: 20_000,
+}, {
+  surbs: 2,
+  timeoutMs: 25_000,
+  onReply: (body) => handle(decodeTunnelReplyV1(body)),
+});
+await copy.done;
+```
+
+The caller owns the tunnel: sequence numbers, reordering by offset, acknowledgements and copies (every copy of one
+`seq` carries identical `data`; nox `docs/tunnel.md` has the rules).
+
 ### KPS mode
 
 For hosts that reach nodes over [KPS](https://github.com/ethereum/kps) (for example inside an anon-rpc worker),

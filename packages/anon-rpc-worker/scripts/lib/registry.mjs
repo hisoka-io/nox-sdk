@@ -146,7 +146,9 @@ export function validateNetwork(network) {
 }
 
 /**
- * Reviewed capability hints (snapshot/capabilities.json):
+ * Reviewed capability hints (snapshot/capabilities.json). The worker uses
+ * them to pick reply-block formats (`surb_v2`), paid exits (`paid_v2`) and TLS
+ * tunnel exits (`tunnel_v1`); they are untrusted, so a false hint costs time only.
  * { "format": "nox-capabilities/1", "source": "...", "members": { "<address>": ["..."] } }.
  * @param {URL | string} [path]
  * @returns {Map<string, string[]>} address -> sorted unique hints
