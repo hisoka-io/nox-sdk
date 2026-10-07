@@ -6,6 +6,7 @@ packages/nox-wasm/pkg/
 packages/nox-wasm/pkg-web/
 packages/nox-wasm/pkg-bundler/
 packages/nox-wasm/pkg-node/
+packages/nox-tls/pkg-web/
 
 # TypeScript build outputs
 packages/*/dist/

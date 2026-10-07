@@ -1,5 +1,5 @@
 [workspace]
-members = ["packages/nox-wasm"]
+members = ["packages/nox-wasm", "packages/nox-tls"]
 resolver = "2"
 
 [profile.release]
