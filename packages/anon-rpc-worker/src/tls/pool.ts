@@ -64,7 +64,7 @@ export interface PoolDeps extends TunnelDeps {
   readonly log: WorkerLogger;
 }
 
-/** No exit in the topology relays TLS tunnels (or every one is skipped). */
+/** No exit in the topology relays TLS tunnels, or every one is skipped. */
 export class NoTunnelExitError extends Error {
   constructor() {
     super("No exit offers TLS tunnels");
@@ -109,9 +109,12 @@ export class TlsPool {
     };
   }
 
-  /** True when at least one exit advertises `tunnel_v1` and is not skipped. */
-  hasTunnelExit(): boolean {
-    return this.candidates(new Set()).length > 0;
+  /**
+   * True when at least one exit advertises `tunnel_v1`, skipped or not, so
+   * exits that time out or refuse opens cause a `network-error`, never plaintext.
+   */
+  offersTunnels(): boolean {
+    return this.port.tunnelExits().length > 0;
   }
 
   /** The first wallet call settled: spares may open from now on. */
@@ -146,10 +149,14 @@ export class TlsPool {
     return channel;
   }
 
-  /** The call on `channel` finished; `ok` when it got a complete response. */
+  /**
+   * The call on `channel` finished; `ok` when it got a complete response. A
+   * per-call session is torn down at once, which also acknowledges the last
+   * bytes, so the exit releases the session's window.
+   */
   release(channel: TlsChannel, ok: boolean): void {
     if (this.settings.tlsSession === "per-call") {
-      channel.free();
+      this.teardown(channel);
       return;
     }
     const pooled = this.sessions.get(channel.host);

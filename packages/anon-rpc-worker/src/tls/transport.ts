@@ -2,8 +2,10 @@
  * The transport of each fetch hop (E2E TLS design §5): a TLS tunnel, the
  * exit's `HttpRequest` path, or a refusal. The choice is made before any
  * byte of the hop leaves the worker, from the URL and the capability data
- * only, and a call that started on a tunnel never continues in plaintext, so
- * an exit cannot force a downgrade by dropping tunnel traffic.
+ * only: exits skipped after failed opens still count, and a call that started
+ * on a tunnel never continues in plaintext, so dropping tunnel traffic gives
+ * a `network-error`, never a downgrade. Under `"preferred"`, a topology in
+ * which no exit advertises `tunnel_v1` sends calls in plaintext.
  */
 import { TUNNEL_PART_MAX_DATA, type DecodedHttpResponse, type TunnelRejectCodeV1 } from "@hisoka-io/nox-client";
 import type { TlsSetting } from "../config.js";
@@ -156,7 +158,7 @@ export class TlsTransport implements TunnelHop {
 
   /** `chooseTransport` with this worker's setting and exits; logs a fallback. */
   route(request: PreparedRequest, hop: number, startedOnTunnel: boolean): "tunnel" | "http" {
-    const choice = chooseTransport(this.settings.tls, new URL(request.url), this.pool.hasTunnelExit(), hop, startedOnTunnel);
+    const choice = chooseTransport(this.settings.tls, new URL(request.url), this.pool.offersTunnels(), hop, startedOnTunnel);
     if (choice.via === "http" && choice.reason !== undefined) this.log.info("tls.fallback", { reason: choice.reason });
     return choice.via;
   }
@@ -165,7 +167,8 @@ export class TlsTransport implements TunnelHop {
    * One hop through a TLS tunnel. A tunnel lost before the response (the
    * exit no longer knows the session, a silent exit, a spare the upstream
    * closed) is retried once on a new tunnel for a resendable read, or for
-   * any request whose only copy the exit refused before writing it.
+   * any request whose only copy the exit refused before writing it
+   * (`UnknownSession`, `Expired`, `UpstreamClosed`).
    */
   async exchange(request: PreparedRequest, budget: CallBudget): Promise<DecodedHttpResponse> {
     const target = tunnelTarget(new URL(request.url));
@@ -237,9 +240,9 @@ export class TlsTransport implements TunnelHop {
 /** Whether a failed tunnel hop may run again on a new tunnel. */
 function retriable(error: unknown, resendable: boolean): boolean {
   if (error instanceof TunnelRejectedError) {
-    const lost = error.code === "UnknownSession" || error.code === "Expired";
-    if (lost && error.soleCopy) return true;
-    return resendable && (lost || error.code === "UpstreamClosed");
+    const unwritten = error.code === "UnknownSession" || error.code === "Expired" || error.code === "UpstreamClosed";
+    if (unwritten && error.soleCopy) return true;
+    return resendable && unwritten;
   }
   if (!resendable) return false;
   if (error instanceof TunnelTimeoutError || error instanceof TunnelOpenTimeoutError) return true;

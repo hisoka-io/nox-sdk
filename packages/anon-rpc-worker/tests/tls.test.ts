@@ -191,12 +191,12 @@ describe("TLS pool", () => {
     expect((await opened).exit.id).toBe("exit-3");
     // exit-2 stays silent: one copy after tlsCopyAfterMs, then the open moves on.
     expect(port.sent.map((copy) => copy.exit.id)).toEqual(["exit-1", "exit-2", "exit-2", "exit-3"]);
-    expect(pool.hasTunnelExit()).toBe(true);
+    expect(pool.offersTunnels()).toBe(true);
     await pool.acquire("rpc.example", { deadlineAt: Date.now() + 25_000 });
     expect(port.sent.at(-1)!.exit.id).toBe("exit-3");
     vi.setSystemTime(Date.now() + EXIT_SKIP_MS);
     port.exits = [exitNode("exit-1")];
-    expect(pool.hasTunnelExit()).toBe(true);
+    expect(pool.offersTunnels()).toBe(true);
 
     const busy = new FakeTunnelPort();
     answerOpens(busy, (copy) =>
@@ -301,6 +301,11 @@ describe("tunnel transport", () => {
     expect(reply.truncated).toBe(false);
     expect(tls.requests[0]).toMatchObject({ target: "/v1?k=1", keepAlive: false, padJson: true });
     expect(tls.requests[0]!.headers).toContain(`Basic ${btoa("user:p@ss")}`);
+    // The per-call session closes at once and acknowledges every byte, so the exit drops it.
+    const close = port.sent.at(-1)!;
+    expect(close.request).toMatchObject({ seq: 2, close: true, ackOffset: BigInt("FLIGHT".length + '{"result":"0x1"}END'.length) });
+    expect(text.decode(close.request.data)).toBe("CLOSE");
+    expect(close.options.surbs).toBe(0);
     pool.close();
   });
 
@@ -321,12 +326,57 @@ describe("tunnel transport", () => {
     expect(text.decode((await transport.exchange(write, budget())).body)).toBe("ok");
     expect(port.sent.filter((copy) => copy.request.seq === 0)).toHaveLength(2);
 
+    // A spare whose upstream already closed: the exit refuses the request before writing it.
+    let closedUpstream = 0;
     port.onSend = (copy) => {
-      queueMicrotask(() => copy.reply(copy.request.seq === 0
-        ? data(0, 0, "FLIGHT")
-        : { kind: "Rejected", seq: 1, code: "UpstreamClosed", retryable: false, detail: "reset" }));
+      queueMicrotask(() => {
+        if (copy.request.seq === 0) copy.reply(data(0, 0, "FLIGHT"));
+        else if (copy.request.close) return;
+        else if (closedUpstream++ === 0) copy.reply({ kind: "Rejected", seq: 1, code: "UpstreamClosed", retryable: false, detail: "upstream closed" });
+        else copy.reply(data(1, 6, "sentEND"));
+      });
     };
-    await expect(transport.exchange(write, budget())).rejects.toMatchObject({ code: "network-error" });
+    expect(text.decode((await transport.exchange(write, budget())).body)).toBe("sent");
+
+    // Two copies went out before the refusal: one of them may have been written.
+    port.onSend = (copy) => {
+      if (copy.request.seq === 0) queueMicrotask(() => copy.reply(data(0, 0, "FLIGHT")));
+    };
+    const twice = transport.exchange(write, budget());
+    twice.catch(() => undefined);
+    await vi.advanceTimersByTimeAsync(POOL.tlsCopyAfterMs);
+    const copies = port.sent.filter((copy) => copy.request.seq === 1 && !copy.request.close);
+    copies.at(-1)!.reply({ kind: "Rejected", seq: 1, code: "UpstreamClosed", retryable: false, detail: "upstream closed" });
+    await expect(twice).rejects.toMatchObject({ code: "network-error" });
+    expect(port.sent.filter((copy) => copy.request.seq === 0)).toHaveLength(5);
+
+    // The stream ended before the response: a truncation, never resent for a write.
+    port.onSend = (copy) => {
+      queueMicrotask(() => {
+        if (copy.request.seq === 0) copy.reply(data(0, 0, "FLIGHT"));
+        else if (!copy.request.close) copy.reply(data(1, 6, "", "Eof"));
+      });
+    };
+    await expect(transport.exchange(write, budget())).rejects.toMatchObject({ code: "protocol-error" });
+    expect(port.sent.filter((copy) => copy.request.seq === 0)).toHaveLength(6);
+    pool.close();
+  });
+
+  it("keeps a call under \"preferred\" on tunnels while every tunnel exit is skipped", async () => {
+    const port = new FakeTunnelPort();
+    answerOpens(port, (copy) => copy.reply({ kind: "Rejected", seq: 0, code: "Disabled", retryable: false, detail: "" }));
+    const tls = fakeTls();
+    const pool = new TlsPool(port, tls, POOL, { ...deps, random: () => 0, log });
+    const transport = new TlsTransport(pool, tls, { ...CONFIG_DEFAULTS, tls: "preferred" }, log, deps.now);
+    const read = prepared("https://rpc.example/", '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}');
+    await expect(transport.exchange(read, budget())).rejects.toMatchObject({ code: "network-error" });
+    expect(port.sent.map((copy) => copy.exit.id)).toEqual(["exit-1", "exit-2", "exit-3"]);
+    expect(transport.route(read, 0, false)).toBe("tunnel");
+    await expect(transport.exchange(read, budget())).rejects.toMatchObject({ code: "network-error" });
+    expect(port.sent).toHaveLength(3);
+
+    port.exits = [];
+    expect(transport.route(read, 0, false)).toBe("http");
     pool.close();
   });
 });

@@ -128,20 +128,27 @@ export class TlsChannel {
     }
   }
 
-  /** Send close_notify and half-close the upstream; nothing waits for it. */
+  /**
+   * Close the tunnel: close_notify when the TLS session can still send one,
+   * and the acknowledgement of every byte received, so the exit drops the
+   * session at once. Nothing waits for it.
+   */
   teardown(deadlineAt: number): Promise<void> {
     if (this.freed) return Promise.resolve();
     this.keepAlive = false;
-    let data: Uint8Array;
+    const data = this.tunnel.eof ? new Uint8Array(0) : this.closeNotify();
+    this.free();
+    return this.tunnel.teardown(data, deadlineAt);
+  }
+
+  /** The close_notify record, or nothing when the session can no longer send one. */
+  private closeNotify(): Uint8Array {
     try {
       this.tls.close();
-      data = this.tls.takeOutgoing();
-    } catch (error) {
-      this.free();
-      return Promise.reject(error);
+      return this.tls.takeOutgoing();
+    } catch {
+      return new Uint8Array(0);
     }
-    this.free();
-    return this.tunnel.eof ? Promise.resolve() : this.tunnel.teardown(data, deadlineAt);
   }
 
   /** Release the TLS session's WebAssembly memory. */
