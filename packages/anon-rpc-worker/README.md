@@ -11,9 +11,9 @@ looked up at run time, so operators change IPs whenever they like and new nodes 
 boot needs no seed server and no public RPC; the bundle reaches the network only through the harness's KPS dialer.
 
 What each party sees: the entry node sees the wallet's IP address and encrypted packets. With end-to-end TLS (the
-default, `tls: "required"`), requests, responses and the sender's identity stay end-to-end encrypted between the
-worker and the RPC provider: the worker runs TLS itself and the exit relays TLS ciphertext over one TCP connection,
-seeing the provider's host name, timing and sizes (see [End-to-end TLS](#end-to-end-tls)).
+default, `tls: "required"`), requests and responses stay end-to-end encrypted between the worker and the RPC
+provider, and the mixnet keeps the sender anonymous: the worker runs TLS itself and the exit relays TLS ciphertext
+over one TCP connection, seeing the provider's host name, timing and sizes (see [End-to-end TLS](#end-to-end-tls)).
 
 ## Layout
 
@@ -79,16 +79,17 @@ Examples:
 
 The worker carries a TLS client (rustls with ring, compiled to WebAssembly, `packages/nox-tls`) and runs TLS with
 the RPC provider itself. A Nox exit that advertises `tunnel_v1` holds one TCP connection to the provider per tunnel
-and relays TLS records both ways (`ServiceRequest::TunnelV1`, nox `docs/tunnel.md`). Requests, responses and the
-sender's identity stay end-to-end encrypted between the worker and the provider; the exit relays ciphertext.
+and relays TLS records both ways (`ServiceRequest::TunnelV1`, nox `docs/tunnel.md`). Requests and responses stay
+end-to-end encrypted between the worker and the provider, and the mixnet keeps the sender anonymous; the exit relays
+ciphertext.
 
 What the exit learns: the provider's host name (from SNI, its own DNS lookup and the IP) and port 443; when a tunnel
-opens and closes; the number, size and timing of TLS records in both directions (JSON request bodies are padded to
-512 B, 1 KiB, 4 KiB, 16 KiB, then 16 KiB steps, so a transaction and a block-number read look alike; response sizes
-stay visible); the TLS client fingerprint, shared by every worker of one version; in keep-alive mode, which calls
-share a session. The URL path and query (API keys included), headers, JSON-RPC methods and parameters, signed
-transactions, response content and the sender stay hidden from it, and the worker detects any change or truncation
-of a response.
+opens and closes; the number, size and timing of TLS records in both directions (a whole JSON request is padded to
+512 B, 1 KiB, 4 KiB, 16 KiB, then 16 KiB steps, so calls of similar size share one record size; response sizes stay
+visible, and larger buckets are a later milestone); the TLS client fingerprint, shared by every worker of one
+version; in keep-alive mode, which calls share a session. The URL path and query (API keys included), headers,
+JSON-RPC methods and parameters, signed transactions, response content and the sender stay hidden from it, and the
+worker detects any change or truncation of a response.
 
 `tls`:
 
@@ -98,11 +99,14 @@ of a response.
 | `"preferred"` | tunnel | exit `HttpRequest` (logged `tls.fallback`) | exit `HttpRequest` (logged `tls.fallback`) |
 | `"off"` | exit `HttpRequest` | exit `HttpRequest` | exit `HttpRequest` |
 
-The transport is chosen before any byte of a call leaves the worker, and a call that started on a tunnel never
-continues on `HttpRequest`, redirects included. Capability data comes from the exits through the seed, both run by
-the operator, so only `"required"` keeps requests end-to-end encrypted against an operator that withholds
-`tunnel_v1`; `"preferred"` covers passive exits. An exit that answers `Disabled`, or no tunnel open within
-`tlsOpenTimeoutMs`, is skipped for 10 minutes and the open moves to another tunnel exit.
+The transport is chosen before any byte of a call leaves the worker, from the URL and the capability data, and a
+call that started on a tunnel never continues on `HttpRequest`, redirects included. The capabilities of pinned
+members are the hints in the bundle's snapshot (`snapshot/capabilities.json`), so tunnel exits change, and an exit
+stops counting as one, only with a new bundle; with discovery, other members' capabilities come from the seed's
+liveness data. `"preferred"` uses plaintext whenever no known exit advertises `tunnel_v1`; `"required"` keeps every
+call end-to-end encrypted. An exit that answers `Disabled`, or no tunnel open within `tlsOpenTimeoutMs`, is skipped
+for 10 minutes and the open moves to another tunnel exit; skipped exits still count as tunnel exits, so with every one
+skipped a call fails with `network-error` under both settings.
 
 Session modes:
 
@@ -127,8 +131,8 @@ run again on a new tunnel.
 `tls` governs the wallet's calls. The chain check's registry reads (discovery) use the exit `HttpRequest` path: public
 chain data, accepted only when a quorum of exit and provider pairs agrees byte for byte.
 
-Next milestones: registry reads through tunnels as well, Encrypted Client Hello for providers that publish it, and a hybrid post-quantum key exchange
-(X25519MLKEM768).
+Next milestones: registry reads through tunnels as well, Encrypted Client Hello for providers that publish it, and
+a hybrid post-quantum key exchange (X25519MLKEM768).
 
 Errors: `permission-denied` (the exit refuses the destination), `network-error` (no tunnel exit, a certificate
 failure, the exit cannot reach the provider), `protocol-error` (TLS or HTTP checks failed, a truncated response),
@@ -250,13 +254,15 @@ The committed release snapshot is of block 316207920 (finalized, read and re-ver
 providers of different organisations). It carries the KPS addresses nox-1, nox-2 and nox-8 publish, so the worker
 finds its entries from the snapshot alone, and the default anchors and the chain check add any later moves.
 The release gate names the seven mix and exit nodes, which serve the mixnet without a KPS listener, with
-`--allow-missing-kps`.
+`--allow-missing-kps`, and requires an exit whose capability hints carry `tunnel_v1`: the hints in
+`snapshot/capabilities.json` are regenerated from the seed once the exits relay tunnels, and the worker is rebuilt
+(a new `workerHash`) before the 0.4.0 release.
 
 ```bash
 pnpm --filter @hisoka-io/nox-client build
 node scripts/make-snapshot.mjs --rpc <arbitrum-sepolia-rpc> --rpc <second-rpc> [--block <n>]
 node scripts/verify-snapshot.mjs --offline                           # schema, hashes, SDK-derived fields
-node scripts/verify-snapshot.mjs --rpc <rpc> --rpc <rpc> --release   # chain re-read + every member publishes a KPS address
+node scripts/verify-snapshot.mjs --rpc <rpc> --rpc <rpc> --release   # chain re-read, KPS addresses, a tunnel exit
 ```
 
 ## Building and checking the hash
@@ -270,9 +276,9 @@ node packages/anon-rpc-worker/scripts/hash.mjs packages/anon-rpc-worker/dist/ano
 `scripts/toolchain.env` pins every tool that shapes the bytes: the Node and Rust container images by digest,
 rustc, wasm-pack, wasm-bindgen and binaryen (with sha256 digests of their release archives), and clang with llvm-ar
 for ring's C sources in `nox-tls` (Debian bookworm packages at a snapshot.debian.org timestamp, the same on x86_64
-and aarch64); pnpm comes from the repository's `packageManager` field and esbuild from the lockfile. `scripts/build-wasm.sh` follows the
-tor-js recipe: path remapping, a `RUSTC_WRAPPER` that makes cargo's metadata host-independent, `--locked`, and
-a pinned `wasm-opt` on `PATH`.
+and aarch64); pnpm comes from the repository's `packageManager` field and esbuild from the lockfile.
+`scripts/build-wasm.sh` follows the tor-js recipe: path remapping, a `RUSTC_WRAPPER` that makes cargo's metadata
+host-independent, `--locked`, and a pinned `wasm-opt` on `PATH`.
 
 `scripts/verify-reproducible.sh` builds a commit twice from clean `git archive` exports in fresh containers
 of the pinned images, at two different paths, and compares the WASM, bundle and provenance digests
@@ -282,7 +288,8 @@ namespaces at the container paths, for hosts without a container runtime.
 
 For a test bed, `node scripts/build.mjs --snapshot <file>` embeds another canonical snapshot (for example a
 local mesh) and `--extra-root <ca.der>` a test CA next to the Mozilla roots; the provenance records which snapshot a
-bundle carries and how many extra roots. The release build (`build-worker.sh --release`) never passes an extra root.
+bundle carries and how many extra roots. The release build (`build-worker.sh --release`) refuses a bundle with an
+extra root (`provenance.mjs --release`).
 
 ## Tests
 
