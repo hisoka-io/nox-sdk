@@ -346,17 +346,25 @@ describe("verify-snapshot.mjs", () => {
     expect(stdout()).toContain("publishes no KPS address");
     const all = committed.members.map((member) => member.address).join(",");
     output.length = 0;
-    expect(await verifySnapshot(["--offline", "--release", "--allow-missing-kps", all])).toBe(1);
+    expect(await verifySnapshot(["--offline", "--release", "--allow-missing-kps", all])).toBe(0);
     expect(stdout()).not.toContain("publishes no KPS address");
-    expect(stdout()).toContain("no exit carries tunnel_v1");
+    expect(stdout()).toContain("release gate (document only, the chain was not read): pass");
 
+    // The committed snapshot carries the tunnel exits; the same document without the hint fails the gate.
     const allowed = new Set(committed.members.map((member) => member.address));
-    expect(releaseGateProblems(committed, allowed)).toHaveLength(1);
-    const exit = committed.members.findIndex((member) => member.role === 2);
-    const relay = committed.members.findIndex((member) => member.role === 1);
-    const withCapability = (index: number): NoxAnonRpcSnapshot => ({
+    expect(releaseGateProblems(committed, allowed)).toEqual([]);
+    const withoutTunnels: NoxAnonRpcSnapshot = {
       ...committed,
-      members: committed.members.map((member, at) => (at === index ? { ...member, capabilities: [...member.capabilities, "tunnel_v1"] } : member)),
+      members: committed.members.map((member) => ({ ...member, capabilities: member.capabilities.filter((c) => c !== "tunnel_v1") })),
+    };
+    const problems = releaseGateProblems(withoutTunnels, allowed);
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("no exit carries tunnel_v1");
+    const exit = withoutTunnels.members.findIndex((member) => member.role === 2);
+    const relay = withoutTunnels.members.findIndex((member) => member.role === 1);
+    const withCapability = (index: number): NoxAnonRpcSnapshot => ({
+      ...withoutTunnels,
+      members: withoutTunnels.members.map((member, at) => (at === index ? { ...member, capabilities: [...member.capabilities, "tunnel_v1"] } : member)),
     });
     expect(releaseGateProblems(withCapability(exit), allowed)).toEqual([]);
     expect(releaseGateProblems(withCapability(relay), allowed)).toHaveLength(1);
@@ -370,8 +378,8 @@ describe("verify-snapshot.mjs", () => {
     expect(await verifySnapshot(["--rpc", a.url, "--release", "--allow-missing-kps", all])).toBe(1);
     expect(stdout()).toContain("read through 1 provider(s); a release snapshot needs 2");
     output.length = 0;
-    expect(await verifySnapshot(["--rpc", a.url, "--rpc", b.url, "--release", "--allow-missing-kps", all])).toBe(1);
+    expect(await verifySnapshot(["--rpc", a.url, "--rpc", b.url, "--release", "--allow-missing-kps", all])).toBe(0);
     expect(stdout()).not.toContain("provider(s); a release snapshot needs");
-    expect(stdout()).toContain("no exit carries tunnel_v1");
+    expect(stdout()).toContain("an exit carries tunnel_v1");
   });
 });
