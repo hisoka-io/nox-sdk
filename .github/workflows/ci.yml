@@ -108,10 +108,15 @@ jobs:
           version: v1.3.2
 
       - name: Typecheck and test (vitest)
-        run: pnpm --filter @hisoka-io/anon-rpc-worker --fail-if-no-match test
+        run: |
+          test -f packages/nox-wasm/pkg-web/nox_wasm.js -a -f packages/nox-wasm/pkg-web/nox_wasm_bg.wasm
+          anvil --version
+          pnpm --filter @hisoka-io/anon-rpc-worker --fail-if-no-match test
 
       - name: Test WASM injection (nox-client with the built nox-wasm)
-        run: pnpm --filter @hisoka-io/nox-client --fail-if-no-match exec vitest run tests/kps_wasm_inject.test.ts
+        run: |
+          test -f packages/nox-wasm/pkg-web/nox_wasm.js -a -f packages/nox-wasm/pkg-web/nox_wasm_bg.wasm
+          pnpm --filter @hisoka-io/nox-client --fail-if-no-match exec vitest run tests/kps_wasm_inject.test.ts
 
   # --------------------------------------------------------------------------
   # Worker specifier: typecheck, the Foundry suites and the harness-path
