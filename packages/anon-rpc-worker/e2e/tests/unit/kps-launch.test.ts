@@ -1,18 +1,15 @@
+import { spawnSync } from "node:child_process";
 import { createSocket } from "node:dgram";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { startSidecar, type SidecarVars } from "../../src/kps-server.js";
 import { assertUdpPortsFree, freeTcpPort } from "../../src/ports.js";
 
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+/** Whether any process still has `script` on its command line (true from spawn on, however slowly the child starts). */
+function isRunning(script: string): boolean {
+  return spawnSync("pgrep", ["-f", script], { stdio: "ignore" }).status === 0;
 }
 
 async function vars(dir: string): Promise<SidecarVars> {
@@ -37,9 +34,8 @@ async function vars(dir: string): Promise<SidecarVars> {
 describe("KPS server launch", () => {
   it("stops a sidecar that never prints its address", async () => {
     const dir = mkdtempSync(join(tmpdir(), "e2e-kps-launch-"));
-    const pidFile = join(dir, "pid");
     const script = join(dir, "silent.mjs");
-    writeFileSync(script, `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`);
+    writeFileSync(script, "setInterval(() => {}, 1000);\n");
     await expect(
       startSidecar({
         commandTemplate: `${process.execPath} ${script}`,
@@ -50,8 +46,7 @@ describe("KPS server launch", () => {
         addressTimeoutMs: 1_000,
       }),
     ).rejects.toThrow(/KPS address/u);
-    const pid = Number(readFileSync(pidFile, "utf8"));
-    expect(isAlive(pid)).toBe(false);
+    expect(isRunning(script)).toBe(false);
   });
 
   it("names a UDP port that is already bound", async () => {
