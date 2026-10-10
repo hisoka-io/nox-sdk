@@ -86,9 +86,9 @@ function startVirtualClock(): void {
   pump = setImmediate(step);
 }
 
-/** Resolves at the first idle point where `assertion` passes; fails with its error after 10 virtual seconds. */
+/** Resolves at the first idle point where `assertion` passes; fails with its error after 1 virtual second. */
 function until(assertion: () => void): Promise<void> {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + 1_000;
   return new Promise((resolve, reject) => {
     const check = (): void => {
       try {
