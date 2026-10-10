@@ -200,25 +200,31 @@ were read at, and when each member outside the snapshot was first seen. At most 
 days. A cache that fails any check (another registry, too many records, one malformed record) is ignored whole, and
 a learned address is used only after the node's `/metadata.json` names the same member.
 
-## Release 0.3.0
+## Release 0.4.0
 
 | | |
 |---|---|
-| `workerHash` (keccak-256 of `dist/anon-rpc-worker.js`) | `0x24604525d220bcc7e39f2dbc22966a814600a63ada51baafad5dd0bcc1d28549` |
-| Size | 961,799 bytes; 279,515 bytes with `gzip -9 -n` |
-| sha256 | `0458b19258dffcfb9ce23d584096f3df06532080390d34ee71b201b6b78dbbac` |
-| Specifier | Ethereum Sepolia `0x29B51ca9Ad80E9c0B0D111C8748E6a7908b82eDB` (`ImmutableWorkerSpecifier`, resolvers in [specifier/README.md](./specifier/README.md#deployments)) |
-| Snapshot | NoxRegistry at Arbitrum Sepolia block 316,207,920, keccak-256 `0xa351960e…94fbb2` |
+| `workerHash` (keccak-256 of `dist/anon-rpc-worker.js`) | `0xd8bef626ec8511d7a468bca5137880680ca2da20d2ea4d9c981a2a3d0c86ba1e` |
+| Size | 1,820,668 bytes; 649,310 bytes with `gzip -9 -n` |
+| sha256 | `4b7b69cd6f45c364cd87ff75f5f8cacdebea2cd852d5384c47215bb88d56f35a` |
+| Specifier | Ethereum Sepolia `0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d` (`ImmutableWorkerSpecifier`, resolvers in [specifier/README.md](./specifier/README.md#deployments)) |
+| Snapshot | NoxRegistry at Arbitrum Sepolia block 316,207,920, keccak-256 `0x1090f071…014681` (the 0.3.0 registry state with the exits' `tunnel_v1` hints) |
 | nox-wasm module | 188,708 bytes, sha256 `5171416972ea4499fd4b4ea8bcadf002f4c10f10ed42cafb0d5a426121da9c4f` |
-| Built from | `nox-sdk` commit `6bddd851c5b1f4e5508f4718e2ea9b4db626b17f`, rustc 1.95.0, wasm-pack 0.13.1, wasm-bindgen 0.2.114, binaryen 117, esbuild 0.27.3 |
+| nox-tls module | 593,738 bytes, sha256 `f74e8cfbed7be33ef1a9158b7b66e454b4ca0849bcb8956487fd13da47e4f4d2` |
+| Root store | webpki-roots 1.0.9 (released 2026-07-18), 121 Mozilla root certificates |
+| Built from | `nox-sdk` commit `fee8d69861a112c65f0cbb0b848a7726ec12f01a`, rustc 1.95.0, clang 19.1.7, wasm-pack 0.13.1, wasm-bindgen 0.2.114, binaryen 117, esbuild 0.27.3 |
 
 The npm package carries the bundle and provenance file of the first pinned container build.
 
-Release 0.2.0: `workerHash` `0x0a58f9915f686950072a4786249d396ecbf2194a39ac835effe8ea1a7c76f324` (924,847 bytes, commit
-`ef019a7`), specifier `0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6`.
+Release 0.3.0: `workerHash` `0x24604525d220bcc7e39f2dbc22966a814600a63ada51baafad5dd0bcc1d28549` (961,799 bytes, commit
+`6bddd85`), specifier `0x29B51ca9Ad80E9c0B0D111C8748E6a7908b82eDB`. Release 0.2.0: `workerHash`
+`0x0a58f9915f686950072a4786249d396ecbf2194a39ac835effe8ea1a7c76f324` (924,847 bytes, commit `ef019a7`), specifier
+`0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6`.
 
 Two builds in fresh containers of the pinned images (at two different paths) give these exact bytes
-(`scripts/verify-reproducible.sh --ref 6bddd85`). Run it from the repository root as
+(`scripts/verify-reproducible.sh --ref fee8d69`), on an x86_64 workstation and again on the x86_64 CI runner
+(job "Worker bundle (two container builds)"). The aarch64 reproduction is the next check: the toolchain pins carry
+aarch64 digests for it. Run the script from the repository root as
 `packages/anon-rpc-worker/scripts/verify-reproducible.sh` (or `pnpm verify:reproducible` inside the package); host builds (`--native`,
 `--local`) use rustc 1.95.0, so set `RUSTUP_TOOLCHAIN=1.95.0` when the host default differs.
 
