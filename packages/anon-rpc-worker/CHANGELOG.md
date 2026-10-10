@@ -2,7 +2,7 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
-## 0.4.0 (unreleased)
+## 0.4.0 (2026-10-10)
 
 Built on `@hisoka-io/nox-client` 0.8.0. Every 0.3.0 config stays valid; with the new defaults, https calls go
 through TLS tunnels and need exits on nox rc.9 or later with `[tunnel]` enabled.

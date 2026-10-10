@@ -3,21 +3,24 @@
   "members": {
     "0x03a42846c18b99c453a49d7fce69f336f865c48b": [
       "paid_v2",
-      "surb_v2"
+      "surb_v2",
+      "tunnel_v1"
     ],
     "0x074a13b271b73eb5c0c44e2037d035e7eef4a462": [
       "surb_v2"
     ],
     "0x1efa385556a6e8643df0033048ba1dd67ec43f93": [
       "paid_v2",
-      "surb_v2"
+      "surb_v2",
+      "tunnel_v1"
     ],
     "0x3e98ee4572741fd932e031ac60e79f7c012758be": [
       "surb_v2"
     ],
     "0x6774ca4baf6fff84f02898a3dee4299ed1f5ab4e": [
       "paid_v2",
-      "surb_v2"
+      "surb_v2",
+      "tunnel_v1"
     ],
     "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9": [
       "surb_v2"
@@ -35,5 +38,5 @@
       "surb_v2"
     ]
   },
-  "source": "Capability hints reviewed for the release snapshot. Taken from the liveness section of the public seed topology (https://api.hisoka.io/seed/topology, fleet build 0.4.0-rc.4+b30e46d3ab9d2d707de37011a10639a4c15232ce), re-read at block 315566145 on 2026-10-04 with identical hints for all 10 members. Hints are untrusted by design: they choose between reply-block formats and pick tunnel exits (tunnel_v1), where a false hint costs one open timeout and plaintext stays out of reach."
+  "source": "Capability hints reviewed for the release snapshot. Taken from the liveness section of the public seed topology (https://api.hisoka.io/seed/topology, fleet build 0.4.0-rc.9+3ef92f06f8265700b7b07e9e21e8f6dff0f47a09), read at block 317672566 on 2026-10-10 with all 10 members online; the three exits advertise tunnel_v1. Hints are untrusted by design: they choose between reply-block formats and pick tunnel exits (tunnel_v1), where a false hint costs one open timeout and plaintext stays out of reach."
 }
