@@ -51,7 +51,9 @@ jobs:
   # --------------------------------------------------------------------------
   # anon-rpc worker: nox-wasm and nox-tls built for wasm32 with the pinned
   # toolchain (scripts/toolchain.env: Rust image, clang, wasm-pack,
-  # wasm-bindgen, binaryen), then typecheck and the worker's vitest suite.
+  # wasm-bindgen, binaryen), then typecheck, the worker's vitest suite (with
+  # the e2e bed's unit tests and the bundle smoke) and the nox-client test
+  # that needs the built nox-wasm.
   # --------------------------------------------------------------------------
   worker:
     name: Worker (pinned WASM build + tests)
@@ -100,8 +102,56 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Install Foundry 1.3.2
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.3.2
+
       - name: Typecheck and test (vitest)
         run: pnpm --filter @hisoka-io/anon-rpc-worker --fail-if-no-match test
+
+      - name: Test WASM injection (nox-client with the built nox-wasm)
+        run: pnpm --filter @hisoka-io/nox-client --fail-if-no-match exec vitest run tests/kps_wasm_inject.test.ts
+
+  # --------------------------------------------------------------------------
+  # Worker specifier: typecheck, the Foundry suites and the harness-path
+  # vitest suites (forge build, anvil).
+  # --------------------------------------------------------------------------
+  specifier:
+    name: Specifier (forge + vitest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: nox-sdk
+
+    steps:
+      - name: Checkout nox-sdk
+        uses: actions/checkout@v4
+        with:
+          path: nox-sdk
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: "10"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: nox-sdk/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Foundry 1.3.2
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: v1.3.2
+
+      - name: Typecheck and test (forge, vitest)
+        run: pnpm --filter @hisoka-io/anon-rpc-specifier --fail-if-no-match test
 
   # --------------------------------------------------------------------------
   # Rust WASM build — wasm-pack build --target bundler
