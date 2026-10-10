@@ -539,6 +539,11 @@ describe("bincode error handling", () => {
       expect(e.code).toBe(NoxClientErrorCode.DecryptionFailed);
     }
   });
+
+  it("NoxClientErrorCode values are distinct", () => {
+    const codes = Object.values(NoxClientErrorCode);
+    expect(new Set(codes).size).toBe(codes.length);
+  });
 });
 
 // ---------------------------------------------------------------------------

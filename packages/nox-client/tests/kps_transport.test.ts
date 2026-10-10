@@ -42,6 +42,7 @@ async function expectTransportFailure(
     await promise;
   } catch (error) {
     expect(error).toBeInstanceOf(NoxClientError);
+    expect((error as NoxClientError).name).toBe("NoxClientError");
     expect((error as NoxClientError).code).toBe(NoxClientErrorCode.TransportFailed);
     const cause = (error as NoxClientError).cause as KpsFailureCause;
     expect(cause.phase).toBe(phase);
