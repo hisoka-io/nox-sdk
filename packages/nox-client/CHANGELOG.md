@@ -2,7 +2,7 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
-## 0.8.0 (unreleased)
+## 0.8.0 (2026-10-10)
 
 Additive; every 0.7.0 configuration behaves as before.
 

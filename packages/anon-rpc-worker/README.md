@@ -255,8 +255,9 @@ providers of different organisations). It carries the KPS addresses nox-1, nox-2
 finds its entries from the snapshot alone, and the default anchors and the chain check add any later moves.
 The release gate names the seven mix and exit nodes, which serve the mixnet without a KPS listener, with
 `--allow-missing-kps`, and requires an exit whose capability hints carry `tunnel_v1`: the hints in
-`snapshot/capabilities.json` are regenerated from the seed once the exits relay tunnels, and the worker is rebuilt
-(a new `workerHash`) before the 0.4.0 release.
+`snapshot/capabilities.json` come from the seed topology of 2026-10-10 (fleet on nox 0.4.0-rc.9), where the three
+exits advertise `tunnel_v1`. The registry state at that block is the same as in 0.3.0 (fingerprint
+`0x14ca3b69…7c75`); with the new hints the snapshot's keccak-256 is `0x1090f071…014681`.
 
 ```bash
 pnpm --filter @hisoka-io/nox-client build

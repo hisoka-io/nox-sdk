@@ -9,7 +9,8 @@
       "address": "0x03a42846c18b99c453a49d7fce69f336f865c48b",
       "capabilities": [
         "paid_v2",
-        "surb_v2"
+        "surb_v2",
+        "tunnel_v1"
       ],
       "frozen": false,
       "ingressUrl": "https://nox-7.hisoka.io",
@@ -40,7 +41,8 @@
       "address": "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
       "capabilities": [
         "paid_v2",
-        "surb_v2"
+        "surb_v2",
+        "tunnel_v1"
       ],
       "frozen": false,
       "ingressUrl": "https://nox-10.hisoka.io",
@@ -71,7 +73,8 @@
       "address": "0x6774ca4baf6fff84f02898a3dee4299ed1f5ab4e",
       "capabilities": [
         "paid_v2",
-        "surb_v2"
+        "surb_v2",
+        "tunnel_v1"
       ],
       "frozen": false,
       "ingressUrl": "https://nox-6.hisoka.io",
