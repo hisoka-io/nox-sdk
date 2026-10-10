@@ -108,11 +108,18 @@ cd "$HERE"
 step "typecheck"
 pnpm run typecheck
 step "unit tests"
-pnpm test
+pnpm exec vitest run --reporter=default --reporter=json --outputFile.json="$LOG_DIR/unit-report.json"
 step "Playwright e2e (reports: $HERE/.run/reports, run dirs: $HERE/.run)"
 if [ -n "${E2E_ONLY:-}" ]; then
     npx playwright test "$E2E_ONLY"
 else
     npx playwright test
 fi
+# Specs skip themselves when a prerequisite is missing, so a green run states how many did.
+skipped_unit="$(node -e '
+    const report = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+    console.log(report.testResults.flatMap((file) => file.assertionResults).filter((test) => test.status !== "passed").length);
+' "$LOG_DIR/unit-report.json")"
+skipped_e2e="$(node -e 'console.log(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).stats.skipped)' "$HERE/.run/playwright-report.json")"
+step "skipped: $skipped_unit unit, $skipped_e2e Playwright"
 step "done; latest run directory: $(cat "$HERE/.run/latest-run.txt" 2>/dev/null || echo none)"

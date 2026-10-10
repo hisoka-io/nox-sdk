@@ -70,7 +70,44 @@ function events(logs: LogEntry[], name: string): LogEntry[] {
   return logs.filter((entry) => entry.event === name);
 }
 
+// Virtual time: timers and Date are faked, and a real setImmediate loop jumps
+// to the next timer each time the client goes idle. Delays and elapsed bounds
+// are exact and do not depend on host load.
+let pump: NodeJS.Immediate | undefined;
+const idleChecks = new Set<() => void>();
+
+function startVirtualClock(): void {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+  const step = (): void => {
+    for (const check of [...idleChecks]) check();
+    vi.advanceTimersToNextTimer();
+    pump = setImmediate(step);
+  };
+  pump = setImmediate(step);
+}
+
+/** Resolves at the first idle point where `assertion` passes; fails with its error after 1 virtual second. */
+function until(assertion: () => void): Promise<void> {
+  const deadline = Date.now() + 1_000;
+  return new Promise((resolve, reject) => {
+    const check = (): void => {
+      try {
+        assertion();
+      } catch (error) {
+        if (Date.now() < deadline) return;
+        idleChecks.delete(check);
+        reject(error);
+        return;
+      }
+      idleChecks.delete(check);
+      resolve();
+    };
+    idleChecks.add(check);
+  });
+}
+
 beforeEach(() => {
+  startVirtualClock();
   vi.stubGlobal("fetch", vi.fn(() => {
     throw new Error("KPS mode must never call the global fetch");
   }));
@@ -84,6 +121,8 @@ beforeEach(() => {
 afterEach(() => {
   for (const client of clients.splice(0)) client.disconnect();
   vi.unstubAllGlobals();
+  clearImmediate(pump);
+  idleChecks.clear();
   vi.useRealTimers();
 });
 
@@ -204,7 +243,7 @@ describe("claims over KPS against v1 and v2 entries", () => {
     const client = await connect(t.config());
     for (let i = 0; i < 3; i++) expect(body(await get(client, `/${i}`))).toBe(OK_BODY);
     // Received replies and the unused parity blocks are acked, so the entry frees them.
-    await vi.waitFor(() => {
+    await until(() => {
       const acked = new Set(t.mixnet.claimLog.flatMap((claim) => claim.ack));
       expect(acked.size).toBeGreaterThanOrEqual(4);
     });
@@ -249,8 +288,8 @@ describe("claims over KPS against v1 and v2 entries", () => {
     await get(client, "/warm");
     const lost = [get(client, "/lost-1", { retry: "none" }), get(client, "/lost-2", { retry: "none" })];
     for (const call of lost) call.catch(() => undefined);
-    await vi.waitFor(() => expect(calls).toBe(3));
-    await vi.waitFor(() => {
+    await until(() => expect(calls).toBe(3));
+    await until(() => {
       expect(t.mixnet.claimLog.some((claim) => Number(claim.body["wait_ms"] ?? 0) > 0)).toBe(true);
     });
     const started = Date.now();
@@ -306,7 +345,7 @@ describe("first-arrival claims", () => {
     expect(first?.ids).toHaveLength(2);
     expect(Number(first?.body["wait_ms"])).toBeGreaterThan(0);
     // The block that was not needed is acked on a later claim.
-    await vi.waitFor(() => {
+    await until(() => {
       const acked = new Set(t.mixnet.claimLog.flatMap((claim) => claim.ack));
       expect(first!.ids.every((id) => acked.has(id))).toBe(true);
     });
@@ -361,7 +400,7 @@ describe("relay capability probe", () => {
     await get(client, "/3");
     expect(metadataRequests).toBe(2);
     expect(t.mixnet.claimLog.some((claim) => Number(claim.body["wait_ms"] ?? 0) > 0)).toBe(true);
-  }, 15_000);
+  });
 
   it("treats a relay without /metadata.json as one without claim-v2 (no retries)", async () => {
     const t = bed();
@@ -420,7 +459,7 @@ describe("concurrent calls", () => {
       return t.mixnet.handler(request);
     });
     const blocked = get(client, "/blocked", { retry: "none", timeoutMs: 600 });
-    await vi.waitFor(() => expect(hung).toBe(true));
+    await until(() => expect(hung).toBe(true));
     const replies = await Promise.all([1, 2, 3, 4, 5].map((i) => get(client, `/${i}`, { retry: "none" })));
     expect(replies.map(body)).toEqual(Array(5).fill(OK_BODY));
     await expect(blocked).rejects.toMatchObject({ code: NoxClientErrorCode.ResponseTimeout });
@@ -638,7 +677,7 @@ describe("connections", () => {
     const client = await connect(t.config({}, { claimLane: true }));
     const entryAddress = client.entryUrl.slice("kps:".length);
     expect(body(await get(client, "/1"))).toBe(OK_BODY);
-    await vi.waitFor(() => expect(t.network.dials.filter((address) => address === entryAddress)).toHaveLength(2));
+    await until(() => expect(t.network.dials.filter((address) => address === entryAddress)).toHaveLength(2));
     expect(body(await get(client, "/2"))).toBe(OK_BODY);
     const connections = t.network.connections.filter((conn) => conn.address === entryAddress);
     expect(connections).toHaveLength(2);
@@ -653,9 +692,9 @@ describe("connections", () => {
     );
     const first = client.entryUrl.slice("kps:".length);
     const other = first === kpsAddressFor(1) ? kpsAddressFor(2) : kpsAddressFor(1);
-    await vi.waitFor(() => expect(t.network.connections.some((conn) => conn.address === other && conn.open)).toBe(true));
+    await until(() => expect(t.network.connections.some((conn) => conn.address === other && conn.open)).toBe(true));
     for (const conn of t.network.connections) if (conn.address === first) conn.kill();
-    await vi.waitFor(() => expect(client.entryUrl).toBe(`kps:${other}`));
+    await until(() => expect(client.entryUrl).toBe(`kps:${other}`));
     expect(events(t.logs, "entry.failover")).toHaveLength(1);
     const dialsBefore = t.network.dials.filter((address) => address === other).length;
     expect(body(await get(client))).toBe(OK_BODY);
@@ -671,7 +710,7 @@ describe("spreading calls over warm entries", () => {
     const client = await connect(t.config({}, kps));
     const first = client.entryUrl.slice("kps:".length);
     const other = first === kpsAddressFor(1) ? kpsAddressFor(2) : kpsAddressFor(1);
-    await vi.waitFor(() => expect(t.network.connections.some((conn) => conn.address === other && conn.open)).toBe(true));
+    await until(() => expect(t.network.connections.some((conn) => conn.address === other && conn.open)).toBe(true));
     t.network.route(undefined, async (request) => {
       if (request.path === "/api/v1/packets") await new Promise((resolve) => setTimeout(resolve, 60));
       return t.mixnet.handler(request);

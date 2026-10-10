@@ -294,7 +294,7 @@ extra root (`provenance.mjs --release`).
 ## Tests
 
 ```bash
-pnpm --filter @hisoka-io/anon-rpc-worker test     # worker, SDK integration over an in-memory KPS network, build
+pnpm --filter @hisoka-io/anon-rpc-worker test     # worker, SDK integration over an in-memory KPS network, build, e2e bed unit tests
 pnpm --filter @hisoka-io/anon-rpc-specifier test        # Foundry and harness-path tests (forge, anvil)
 ```
 

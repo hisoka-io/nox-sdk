@@ -1,0 +1,22 @@
+name: Reproducible build
+
+# The worker bundle is built twice from clean exports of the pushed commit in
+# the pinned containers and the bytes are compared.
+on:
+  push:
+    branches: ["release/**"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: Worker bundle (two container builds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout nox-sdk
+        uses: actions/checkout@v4
+
+      - name: Build twice and compare
+        run: packages/anon-rpc-worker/scripts/verify-reproducible.sh
