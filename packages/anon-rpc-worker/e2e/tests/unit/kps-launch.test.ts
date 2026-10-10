@@ -7,11 +7,6 @@ import { describe, expect, it } from "vitest";
 import { startSidecar, type SidecarVars } from "../../src/kps-server.js";
 import { assertUdpPortsFree, freeTcpPort } from "../../src/ports.js";
 
-/** Whether any process still has `script` on its command line (true from spawn on, however slowly the child starts). */
-function isRunning(script: string): boolean {
-  return spawnSync("pgrep", ["-f", script], { stdio: "ignore" }).status === 0;
-}
-
 async function vars(dir: string): Promise<SidecarVars> {
   return {
     node: 0,
@@ -46,7 +41,8 @@ describe("KPS server launch", () => {
         addressTimeoutMs: 1_000,
       }),
     ).rejects.toThrow(/KPS address/u);
-    expect(isRunning(script)).toBe(false);
+    // pgrep exits 1 when it ran and no command line matches the script.
+    expect(spawnSync("pgrep", ["-f", script], { stdio: "ignore" }).status).toBe(1);
   });
 
   it("names a UDP port that is already bound", async () => {
