@@ -47,16 +47,18 @@ workers; `test/ReferenceBytecode.t.sol` keeps it that way.
 | Owner | [`0xb18ddF10a9F6a0b9143d05B294815a83d3fa69C5`](https://sepolia.etherscan.io/address/0xb18ddF10a9F6a0b9143d05B294815a83d3fa69C5) |
 | Publishes today | `@hisoka-io/anon-rpc-worker` 0.4.0, `workerHash` `0xd8bef626ec8511d7a468bca5137880680ca2da20d2ea4d9c981a2a3d0c86ba1e`, with the same six resolvers in the same order as the 0.4.0 immutable specifier below |
 
-Trust model. The owner can repoint this address at any worker bundle and resolver list with `setWorker`, and can
-hand ownership on with `transferOwnership`. A wallet that pins this address therefore runs the worker the owner
-last published: the owner key is part of that wallet's supply chain. Today the owner is a single testnet key held by
-the Hisoka team, the account that deployed every specifier on this page. Planned ahead of mainnet: ownership moves to a
-multisig behind a delay, so each update is visible on chain for a set time before wallets load it; a transfer of
-ownership keeps the address. Every update emits `WorkerUpdated(bytes32,string[])`, and `owner()` names who can
+Trust model. The owner can repoint this address at any worker bundle and resolver list with `setWorker`, hand
+ownership on with `transferOwnership`, and freeze the current contents for good with `renounceOwnership`. A wallet
+that pins this address therefore runs the worker the owner last published: the owner key is part of that wallet's
+supply chain. Today the owner is a single testnet key held by the Hisoka team, the account that deployed every
+specifier on this page, and an update reaches a wallet on its next boot. Planned ahead of mainnet: ownership moves
+to a multisig behind a delay, so each update is visible on chain for a set time before wallets load it; a transfer
+of ownership keeps the address. Every update emits `WorkerUpdated(bytes32,string[])`, and `owner()` names who can
 make the next one.
 
-A wallet that prefers to review each release itself pins an immutable per-release address from the next table: it has
-no owner and no setter, and keeps publishing the same worker for good.
+Wallets that want the current release use the stable address. A wallet that prefers to review each release itself
+pins an immutable per-release address from the next table: its contents are fixed at deployment, and it keeps
+publishing the same worker for good.
 
 ### Per-release pins (immutable)
 
@@ -131,7 +133,7 @@ pnpm --filter @hisoka-io/anon-rpc-specifier plan -- \
   [--resolver-order https-first|as-given] [--check-resolvers]
 ```
 
-### Resolver order for the next specifier
+### Resolver order for each release
 
 Harnesses try resolvers in list order, so the first entry that answers sets boot time. The planner publishes
 `https:` resolvers first by default (`--resolver-order https-first`, a stable reorder: entries of one kind keep the
@@ -141,12 +143,17 @@ planned `setWorker` uses the same order. `--resolver-order as-given` publishes t
 
 Measured from India on 2026-10-06 against the 0.2.0 specifier (`kps:` first): ready after 26.5-45.1 s, of which
 14-37 s was the ~0.9 MB bundle over one WebRTC data channel; with an `https:` resolver first, ready after
-7.8-8.5 s. The next specifier's resolvers, in the order the planner writes them:
+7.8-8.5 s. With worker 0.4.0 (1,820,668 bytes, 649,310 with gzip) and `https:` resolvers first, the anon-rpc
+reference bench of 2026-10-10 measured a cold boot of 1.3-1.7 s from the US and 2.7-3.2 s from India (four boots
+each). Each release's resolvers, in the order the planner writes them:
 
 1. `https://raw.githubusercontent.com/hisoka-io/anon-rpc/keccak/<hh>/<rest>`
 2. `https://cdn.jsdelivr.net/npm/@hisoka-io/anon-rpc-worker@<version>/dist/anon-rpc-worker.js`
 3. `https://unpkg.com/@hisoka-io/anon-rpc-worker@<version>/dist/anon-rpc-worker.js`
 4. `kps:<nox-1 address>/keccak/<hh>/<rest>`, then nox-2 and nox-8 the same way
+
+A release reaches the stable address as one `setWorker` call with the same list in the same order
+(see [Updating the stable address](#updating-the-stable-address-setworker)).
 
 The planner checks every resolver entry, reads fees and the latest block from the RPC (default
 `https://ethereum-rpc.publicnode.com`, or `MAINNET_RPC_URL`; the endpoint operator sees which specifier and deployer
@@ -225,10 +232,11 @@ simulates the call as the owner with `eth_call` and takes the gas limit from `et
 plus 20%. It prints the transaction (`from`, `to`, calldata, gas limit) and the signer command, and signs nothing.
 
 `--broadcast` is the one mode that signs and sends. It needs `--chain-id` and `--key-file` (a file holding the
-owner's key; the key is read in-process and never printed), and before signing it re-checks the chain id, that the
-key is the owner's, that the owner has no pending transaction, that the specifier still holds what the plan read,
-and that every `https:` resolver serves the new bytes. After the transaction it reads the specifier back through the
-harness and compares it with the plan. When the owner is a contract such as a Safe, the tool prints `to`, `value` and
+owner's key; the key is read in-process and never printed). Before signing it checks the chain id of the sending
+RPC, that the key is the owner's, that the owner has no pending transaction and that the specifier still holds what
+the plan read, and it sends only when every `https:` resolver served the new bytes in this run's download check.
+`--skip-resolver-fetch` belongs to dry runs: the tool refuses it together with `--broadcast`. After the transaction
+it reads the specifier back through the harness and compares it with the plan. When the owner is a contract such as a Safe, the tool prints `to`, `value` and
 calldata for that contract's own transaction flow.
 
 The same command repairs a resolver list for the current worker: give the current hash and the new list. To return
@@ -239,6 +247,8 @@ to an earlier release, give that release's hash and resolvers.
 ```sh
 pnpm --filter @hisoka-io/anon-rpc-specifier inspect -- --known            # passthrough, tor-js, Nym PoC
 pnpm --filter @hisoka-io/anon-rpc-specifier inspect -- 0x… [--fetch] [--json]
+pnpm --filter @hisoka-io/anon-rpc-specifier inspect -- \
+  --rpc-url https://ethereum-sepolia-rpc.publicnode.com 0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A --fetch   # the Nox stable address
 ```
 
 Read-only: shows what a harness reads, which contract the runtime code is, the owner and update policy, the
