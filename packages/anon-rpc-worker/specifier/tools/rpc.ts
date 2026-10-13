@@ -1,6 +1,7 @@
 // JSON-RPC clients with the trust boundary in the type: `readOnlyRpc` can only call methods that read chain
 // state, so nothing built on it can send a transaction; `localChainRpc` can send, but only to a loopback node
-// (the anvil instances these tools start themselves).
+// (the anvil instances these tools start themselves). The one path that sends to a public chain is the explicit
+// --broadcast mode of scripts/set-worker.ts (tools/update.ts), which uses neither client.
 
 export type HarnessRpcProvider = {
   request(args: { method: string; params?: unknown[] }): Promise<unknown>;
@@ -128,7 +129,7 @@ export function readOnlyRpc(url: string, options: RpcOptions = DEFAULT_RPC_OPTIO
           new RpcError(
             method,
             url,
-            "refused: not a read-only method, and these tools never send transactions to a public chain",
+            "refused: not a read-only method; this client never sends a transaction",
           ),
         );
       }

@@ -5,8 +5,13 @@ lists where to fetch it ([anon-rpc SPEC §4](https://github.com/ethereum/anon-rp
 A wallet's harness reads two views, `workerHash()` and `workerResolvers()`, fetches the bytes from a resolver and runs
 them only if their keccak256 equals the pinned hash.
 
-This package holds two specifier contracts, tests that read them through the reference harness's own code, and
-read-only tools for planning and checking a deployment.
+This package holds two specifier contracts, tests that read them through the reference harness's own code, read-only
+tools for planning and checking a deployment, and a dry-run-first tool for the `setWorker` update.
+
+**The address to pin:** [`0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A`](https://sepolia.etherscan.io/address/0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A)
+on Ethereum Sepolia. It follows the current worker release, so a wallet or a listing that pins it picks up each new
+Nox worker with nothing to change on its side. See [Deployments](#deployments) for its trust model and for the
+per-release immutable addresses.
 
 ## Contracts
 
@@ -32,14 +37,38 @@ workers; `test/ReferenceBytecode.t.sol` keeps it that way.
 
 ## Deployments
 
+### Stable address (follows the current release)
+
+| | |
+|---|---|
+| Specifier | [`0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A`](https://sepolia.etherscan.io/address/0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A), Ethereum Sepolia (11155111) |
+| Contract | `WorkerSpecifier`, the reference contract of ethereum/anon-rpc, unmodified; runtime codehash `0xc4c54384a9c1f1201ef3711a7ed7ba20e078a432e85ecc4f8b14927587cc7b5f`, the codehash of the reference deployments on Ethereum mainnet; source verified on Sourcify (exact match, creation and runtime) |
+| Deployment | tx [`0x2300d269…556f32`](https://sepolia.etherscan.io/tx/0x2300d269aa45043212ccba045407e0b806db211e48235904193597db29556f32), block 11,906,012 (2026-10-13), 9,678,303 gas |
+| Owner | [`0xb18ddF10a9F6a0b9143d05B294815a83d3fa69C5`](https://sepolia.etherscan.io/address/0xb18ddF10a9F6a0b9143d05B294815a83d3fa69C5) |
+| Publishes today | `@hisoka-io/anon-rpc-worker` 0.4.0, `workerHash` `0xd8bef626ec8511d7a468bca5137880680ca2da20d2ea4d9c981a2a3d0c86ba1e`, with the same six resolvers in the same order as the 0.4.0 immutable specifier below |
+
+Trust model. The owner can repoint this address at any worker bundle and resolver list with `setWorker`, and can
+hand ownership on with `transferOwnership`. A wallet that pins this address therefore runs the worker the owner
+last published: the owner key is part of that wallet's supply chain. Today the owner is a single testnet key held by
+the Hisoka team, the account that deployed every specifier on this page. Planned ahead of mainnet: ownership moves to a
+multisig behind a delay, so each update is visible on chain for a set time before wallets load it; a transfer of
+ownership keeps the address. Every update emits `WorkerUpdated(bytes32,string[])`, and `owner()` names who can
+make the next one.
+
+A wallet that prefers to review each release itself pins an immutable per-release address from the next table: it has
+no owner and no setter, and keeps publishing the same worker for good.
+
+### Per-release pins (immutable)
+
 | Worker | Chain | Specifier | Contract | Deployment |
 |---|---|---|---|---|
 | `@hisoka-io/anon-rpc-worker` 0.4.0, `workerHash` `0xd8bef626ec8511d7a468bca5137880680ca2da20d2ea4d9c981a2a3d0c86ba1e` | Ethereum Sepolia (11155111) | [`0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d`](https://sepolia.etherscan.io/address/0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d) | `ImmutableWorkerSpecifier`, source verified on Sourcify (exact match) | tx [`0xb645b0b8…a7e707`](https://sepolia.etherscan.io/tx/0xb645b0b8b1af1d99212f9345eaeac6c3f791c0afae55c2330433e2caa4a7e707), block 11,883,337, 5,188,850 gas |
 | `@hisoka-io/anon-rpc-worker` 0.3.0, `workerHash` `0x24604525d220bcc7e39f2dbc22966a814600a63ada51baafad5dd0bcc1d28549` | Ethereum Sepolia (11155111) | [`0x29B51ca9Ad80E9c0B0D111C8748E6a7908b82eDB`](https://sepolia.etherscan.io/address/0x29B51ca9Ad80E9c0B0D111C8748E6a7908b82eDB) | `ImmutableWorkerSpecifier`, source verified on Sourcify (exact match) | tx [`0x48b8cced…24a97d`](https://sepolia.etherscan.io/tx/0x48b8cced35edfcfc7d69769d3aed130412d27525029bd48aa4e37dcd7e24a97d), block 11,855,976, 1,032,240 gas |
 | `@hisoka-io/anon-rpc-worker` 0.2.0, `workerHash` `0x0a58f9915f686950072a4786249d396ecbf2194a39ac835effe8ea1a7c76f324` | Ethereum Sepolia (11155111) | [`0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6`](https://sepolia.etherscan.io/address/0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6) | `ImmutableWorkerSpecifier`, source verified on Sourcify (exact match) | tx [`0x5e5c7cb6…aa30e`](https://sepolia.etherscan.io/tx/0x5e5c7cb6ef38efc6ad5a0683f31036558ca7c8893f80bb1b0e0e985fd17aa30e), block 11,852,795, 1,032,240 gas |
 
-The specifier is immutable: a new worker version ships as a new specifier at a new address. The 0.4.0 resolvers, in
-order (https first, then `kps:`):
+Each of these is immutable: it publishes one worker version for good, and each new version gets its own immutable
+specifier next to the update of the stable address. The 0.4.0 resolvers, in order (https first, then `kps:`), which
+the stable address publishes too:
 
 1. `https://raw.githubusercontent.com/hisoka-io/anon-rpc/keccak/d8/bef6…ba1e` (orphan `keccak` branch)
 2. `https://cdn.jsdelivr.net/npm/@hisoka-io/anon-rpc-worker@0.4.0/dist/anon-rpc-worker.js`
@@ -57,7 +86,9 @@ for 0.3.0; the 0.2.0 specifier lists `kps:` first, then the three kinds of `http
 Gas on Ethereum Sepolia: the 0.4.0 deployment used 5,188,850 gas (live `eth_estimateGas` 5,231,199), where the
 0.3.0 deployment of the same contract used 1,032,240 on 2026-10-06. Sepolia's current gas schedule prices contract
 creation higher than the planner's anvil fork (Foundry 1.3.2) models, so take the gas limit for a deployment from
-`eth_estimateGas` on the target chain itself, plus 20%.
+`eth_estimateGas` on the target chain itself, plus 20%. The stable `WorkerSpecifier` used 9,678,303 gas on
+2026-10-13 (live `eth_estimateGas` 9,756,282; the planner's fork measured 1,671,783). The `setWorker` tool below
+reads its estimate from the target chain.
 
 ## Requirements
 
@@ -81,6 +112,10 @@ This runs `tsc --noEmit`, the Foundry tests (`forge test`) and the TypeScript te
   parser; the bundle then arrives, hash-verified, from the first `https:` resolver.
 - `itest/plan.test.ts`: plans a deployment against a local chain standing in for mainnet, checks the gas and cost
   arithmetic, checks the target chain is untouched, and deploys with the printed signer command.
+- `itest/set-worker.test.ts`: plans a `setWorker` update against a local chain and checks that planning sends
+  nothing, that the printed `cast` command performs exactly the planned update, that a wrong sender, a wrong key, a
+  frozen or immutable specifier, a stale plan and an unserved bundle are each refused before anything is signed, and
+  that the broadcast path updates the specifier and reads it back through the harness.
 - `itest/gas-calibration.test.ts`: replays the mainnet history of the passthrough and tor-js specifiers (two
   deployments, two `setWorker` updates) on a local chain and checks each one uses exactly the gas of its mainnet
   receipt (1,088,838; 1,113,503; 478,453; 152,782).
@@ -155,6 +190,49 @@ another.
 
 The same planner run with tor-js's first resolver list (two `https:` entries, 119 bytes) gives 1,113,503 gas for
 `WorkerSpecifier`, the gas of tor-js's own mainnet deployment.
+
+## Updating the stable address (`setWorker`)
+
+A worker release ends with one transaction from the owner: `setWorker(newHash, newResolvers)` on the stable address.
+Wallets and listings that pin it then read the new worker on their next boot. The release order:
+
+1. Publish the bundle everywhere the new resolver list points: the npm package (jsDelivr and unpkg serve it), the
+   `keccak` branch of `hisoka-io/anon-rpc`, and the KPS nodes.
+2. Deploy the release's `ImmutableWorkerSpecifier` (see [Planning a deployment](#planning-a-deployment-dry-run)) and
+   boot a wallet harness against it. This is the per-release pin, and the test of the exact hash and resolver list.
+3. Plan the update of the stable address with the same hash and resolver list, and read the printed transaction:
+
+   ```sh
+   pnpm --filter @hisoka-io/anon-rpc-specifier set-worker -- \
+     --specifier 0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A --chain-id 11155111 \
+     --rpc-url https://ethereum-sepolia-rpc.publicnode.com \
+     --bundle path/to/anon-rpc-worker.js \
+     --resolver "https://raw.githubusercontent.com/hisoka-io/anon-rpc/keccak/<hh>/<rest>" \
+     --resolver "https://cdn.jsdelivr.net/npm/@hisoka-io/anon-rpc-worker@<version>/dist/anon-rpc-worker.js" \
+     --resolver "https://unpkg.com/@hisoka-io/anon-rpc-worker@<version>/dist/anon-rpc-worker.js" \
+     --resolver "kps:<ip>:<udp-port>:<certhash>/keccak/<hh>/<rest>"
+   ```
+
+4. Send it: sign the printed `cast send` command with the owner's wallet, or run the same command again with
+   `--broadcast --key-file <file>`.
+5. Confirm what wallets read: `pnpm --filter @hisoka-io/anon-rpc-specifier inspect -- --rpc-url <rpc> 0x3513…7A9A --fetch`,
+   then boot a harness against the stable address.
+
+The tool is a dry run by default. It reads the specifier through the harness, checks that it is the owner-updatable
+contract and who its owner is, checks every new resolver entry (a content-addressed path must name the new hash),
+downloads each `https:` resolver through the harness's `fetchAndVerifyBundle` and compares it with the new hash,
+simulates the call as the owner with `eth_call` and takes the gas limit from `eth_estimateGas` on the target chain
+plus 20%. It prints the transaction (`from`, `to`, calldata, gas limit) and the signer command, and signs nothing.
+
+`--broadcast` is the one mode that signs and sends. It needs `--chain-id` and `--key-file` (a file holding the
+owner's key; the key is read in-process and never printed), and before signing it re-checks the chain id, that the
+key is the owner's, that the owner has no pending transaction, that the specifier still holds what the plan read,
+and that every `https:` resolver serves the new bytes. After the transaction it reads the specifier back through the
+harness and compares it with the plan. When the owner is a contract such as a Safe, the tool prints `to`, `value` and
+calldata for that contract's own transaction flow.
+
+The same command repairs a resolver list for the current worker: give the current hash and the new list. To return
+to an earlier release, give that release's hash and resolvers.
 
 ## Inspecting a deployed specifier
 

@@ -2,7 +2,7 @@
   "name": "@hisoka-io/anon-rpc-specifier",
   "version": "0.0.0",
   "private": true,
-  "description": "On-chain worker specifier contracts (anon-rpc SPEC §4) for the Nox anon-rpc worker, with harness-path tests and read-only deployment planning",
+  "description": "On-chain worker specifier contracts (anon-rpc SPEC §4) for the Nox anon-rpc worker, with harness-path tests, read-only deployment planning and a dry-run-first setWorker tool",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
@@ -12,7 +12,8 @@
     "test:sol": "forge test",
     "test:ts": "vitest run",
     "plan": "vite-node scripts/plan-deploy.ts --",
-    "inspect": "vite-node scripts/inspect-specifier.ts --"
+    "inspect": "vite-node scripts/inspect-specifier.ts --",
+    "set-worker": "vite-node scripts/set-worker.ts --"
   },
   "devDependencies": {
     "@anon-rpc/browser-harness": "0.3.2",
