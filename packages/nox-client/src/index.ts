@@ -217,6 +217,35 @@ export type { IssuedPaidQuoteV2, PaidQuoteResultV2 } from "./paid.js";
 export { hashExecutionQuoteV1 } from "./paid.js";
 
 export {
+  PAID_EXECUTE_DEFAULTS,
+  arbitrumDataFeeGas,
+  deriveClientIntentId,
+  encodeEntryPointExecute,
+  executePaid,
+  mixnetChainReader,
+  paidExecuteCalldata,
+  planPaidGas,
+  rpcChainReader,
+} from "./paid_execute.js";
+export type {
+  ExecutePaidOptions,
+  ExecutePaidResult,
+  PaidAction,
+  PaidCallRequest,
+  PaidChainReader,
+  PaidExecutionClient,
+  PaidGasOptions,
+  PaidGasPlan,
+  PaidGasPlanInput,
+  PaidNotPaidStage,
+  PaidPaymentSource,
+  PaidPreflightReader,
+  PaidRpcSend,
+  PaidSettlement,
+  PaidTimings,
+} from "./paid_execute.js";
+
+export {
   Reassembler,
   padToUniform,
   decodeShards,
