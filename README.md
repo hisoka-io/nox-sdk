@@ -15,19 +15,17 @@ npm install @hisoka-io/nox-client @hisoka-io/nox-wasm
 ```
 
 ```ts
-import { NoxClient } from "@hisoka-io/nox-client";
+import { NoxClient, executePaid } from "@hisoka-io/nox-client";
 
 const client = await NoxClient.connect({
   ethRpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
   registryAddress: "0xF7BFf88A1412054a001Dc4b8aCBddAd6F9b26cB6",
 });
 
-// Paid execution: quote from one exit, then submit through that same exit.
-const exit = client.selectPaidExit();
-const quote = await client.requestPaidQuote(quoteRequest, exit);
-if (quote.status === "issued") {
-  const outcome = await client.submitPaidTransaction(quote, entryPointCalldata);
-}
+// Paid execution: an exit submits the call and is paid on chain by your payment source.
+const result = await executePaid(client, {
+  chainId, entryPoint, action, payment, maxTotalFee, intentSalt, preflight,
+});
 
 // A transaction you signed and pay gas for yourself.
 await client.broadcastSignedTransaction(signedTxBytes);
@@ -63,9 +61,9 @@ const client = await NoxClient.connect({
 });
 ```
 
-`submitPaidTransaction` is the transaction path served by nox 0.4.0-rc.2 and later exits. The
-[client README](./packages/nox-client/README.md#paid-execution) shows how to build `quoteRequest` and
-`entryPointCalldata`.
+`executePaid` is the transaction path served by nox 0.4.0-rc.2 and later exits: one call for the quote, its
+checks, the payment proof, the simulation, the submission and the settlement evidence. The
+[client README](./packages/nox-client/README.md#paid-execution) describes its options and results.
 
 Every option is described in the [client README](./packages/nox-client/README.md#configuration-reference),
 and changes between versions are in the [changelog](./packages/nox-client/CHANGELOG.md).

@@ -464,7 +464,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function safeExternalError(error: unknown): string {
+/** Bounded, single-line text of an external error with URLs removed. */
+export function safeExternalError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   return message
     .replace(/https?:\/\/[^\s]+/gu, "[redacted URL]")

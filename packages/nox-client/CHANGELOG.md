@@ -2,6 +2,27 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
+## 0.9.0 (unreleased)
+
+Additive; every 0.8.0 call behaves as before.
+
+### Added
+
+- `executePaid(client, options)`: paid execution in one call. It requests the tightest `maximumTransactionGas` an
+  exit accepts for the declared limits (`planPaidGas`), enforces `maxTotalFee` on the signed quote, builds the
+  payment through a `PaidPaymentSource`, simulates the exact `NoxEntryPoint.execute` calldata as the exit through
+  the caller's `preflight` reader, submits through the quoting exit and returns `settled` or `paid-action-failed`
+  from the `PaidExecutionSettled` log of the quote's `executionId`. Other results: `not-paid` (with `stage` and
+  `code`), `dry-run` and `unknown`; an `unknown` result is passed back as `pending` on the next call.
+- `deriveClientIntentId`: the intent id, a function of chain, EntryPoint, target, calldata and the caller's
+  `intentSalt`, so a retry or a second call for the same action settles at most once and resumes from chain
+  evidence, and each caller's actions keep their own ids.
+- `encodeEntryPointExecute`, `paidExecuteCalldata`, `planPaidGas`, `PAID_EXECUTE_DEFAULTS`.
+- Chain readers: `mixnetChainReader(client)` (default for state and evidence reads), `rpcChainReader(send)` for
+  any JSON-RPC transport, and `arbitrumDataFeeGas(reader)` for the rollup data fee in the gas cap, applied
+  automatically on Arbitrum One and Arbitrum Sepolia.
+- `selectPaidExit({ exclude })`: skip exits already contacted for a payment.
+
 ## 0.8.0 (2026-10-10)
 
 Additive; every 0.7.0 configuration behaves as before.

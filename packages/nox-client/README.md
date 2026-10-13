@@ -62,76 +62,113 @@ const client = await NoxClient.connect({
 
 ### Paid execution
 
-`submitPaidTransaction` is the transaction path served by nox 0.4.0-rc.2 and later exits. The client selects
-one exit, requests its signed EIP-712 quote through the mixnet, and submits `NoxEntryPoint.execute` calldata
-through that same exit, which broadcasts it and pays the gas. The quoted exit and network fees are paid on
-chain through the payment adapter named in the quote.
+A paid execution sends one contract call through an exit that broadcasts it and pays the gas. The exit and
+network fees are paid on chain by a payment source, such as a private Howl note, through the payment adapter
+named in the exit's signed quote. `executePaid` runs the whole path in one call: quote, checks on the signed
+quote, payment proof, calldata, simulation, submission through the quoting exit, and the on-chain settlement
+evidence.
 
 ```ts
-import { AbiCoder, Interface, getBytes, hexlify, keccak256, randomBytes } from "ethers";
-import type { PaidQuoteRequestV2 } from "@hisoka-io/nox-client";
+import { executePaid, rpcChainReader } from "@hisoka-io/nox-client";
+import { JsonRpcProvider } from "ethers";
 
-const NOX_ENTRY_POINT = "0xad911Ca217C6dC779fCE6A6538bDda3071c38E7E"; // Arbitrum Sepolia
-const trackedAssets: string[] = [];
-
-const request: PaidQuoteRequestV2 = {
+const provider = new JsonRpcProvider(yourRpcUrl);
+const result = await executePaid(client, {
   chainId: 421614n,
-  entryPoint: getBytes(NOX_ENTRY_POINT),
-  clientIntentId: randomBytes(32),
-  paymentAdapter: getBytes(paymentAdapter), // e.g. the HowlPaymentAdapter
-  paymentId: getBytes(paymentId), // 32 bytes, defined by the payment adapter
-  feeAsset: getBytes(feeAsset),
-  paymentGasLimit: 4_000_000n,
-  actionTarget: getBytes(actionTarget),
-  actionCalldataHash: getBytes(keccak256(actionData)),
-  actionGasLimit: 4_000_000n,
-  trackedAssetsHash: getBytes(
-    keccak256(AbiCoder.defaultAbiCoder().encode(["address[]"], [trackedAssets])),
-  ),
-  maximumTransactionGas: 12_000_000n, // at least paymentGasLimit + actionGasLimit + 250000
-  returnDataLimit: 256, // up to 4096
-  validUntilUnix: BigInt(Math.floor(Date.now() / 1000) + 120),
-};
+  entryPoint: "0xad911Ca217C6dC779fCE6A6538bDda3071c38E7E", // NoxEntryPoint, Arbitrum Sepolia
+  action: { target, data: actionCalldata, gasLimit: actionGasLimit },
+  payment, // a PaidPaymentSource for your payment adapter, e.g. a private Howl note
+  maxTotalFee, // ceiling on exitFee + networkFee, in fee-asset units
+  intentSalt, // 32 random bytes you store with this action and reuse on every retry
+  preflight: rpcChainReader((method, params) => provider.send(method, params)),
+});
 
-const quote = await client.requestPaidQuote(request, client.selectPaidExit());
-if (quote.status === "rejected") {
-  throw new Error(`${quote.code}: ${quote.detail}`);
-}
-
-// ABI-encode NoxEntryPoint.execute with the signed quote.
-const entryPoint = new Interface([
-  "function execute((uint8 quoteVersion, uint256 chainId, address entryPoint, address exitAddress, bytes32 clientIntentId, address paymentAdapter, bytes32 paymentId, address feeAsset, uint256 exitFee, uint256 networkFee, uint256 paymentGasLimit, address actionTarget, bytes32 actionCalldataHash, uint256 actionGasLimit, bytes32 trackedAssetsHash, uint256 maximumTransactionGas, uint256 maximumFeePerGas, uint256 returnDataLimit, uint64 validAfterUnix, uint64 validUntilUnix, uint256 quoteNonce) quote, bytes exitSignature, bytes actionData, address[] trackedAssets, bytes paymentData)",
-]);
-const quoteTuple = Object.fromEntries(
-  Object.entries(quote.quote).map(([key, value]) => [
-    key,
-    value instanceof Uint8Array ? hexlify(value) : value,
-  ]),
-);
-const entryPointCalldata = getBytes(
-  entryPoint.encodeFunctionData("execute", [
-    quoteTuple,
-    quote.exitSignature,
-    actionData,
-    trackedAssets,
-    paymentData, // built by the payment adapter for quote.executionId
-  ]),
-);
-
-const outcome = await client.submitPaidTransaction(quote, entryPointCalldata);
-if (outcome.status === "submitted") {
-  console.log("tx", hexlify(outcome.transactionHash));
-} else {
-  console.log(outcome.code, outcome.retryable, outcome.detail);
+switch (result.status) {
+  case "settled": // fee paid, action succeeded
+    console.log(result.transactionHash, result.exitFee + result.networkFee);
+    break;
+  case "paid-action-failed": // fee paid, the action reverted inside its sandbox
+  case "not-paid": // final for this call: result.stage and result.code say where it stopped
+    break;
+  case "unknown": // submitted, chain evidence pending: see "After `unknown`" below
+    break;
 }
 ```
 
-The quote request and paid submission use the same exit: always submit with the quote returned by
+**Gas cap and fee.** The exit prices its fee on `maximumTransactionGas`, so the helper requests the smallest
+cap an exit accepts for the declared limits: `paymentGasLimit + actionGasLimit + 250000` (what
+`NoxEntryPoint` requires), plus the transaction envelope (base gas, calldata gas and, on rollups, the data
+fee from `dataFeeGas`), plus the exit's own 20% estimate buffer and 5% headroom. Declare tight limits to get
+a low fee: `payment.gasLimit` comes from the payment source and `action.gasLimit` from the caller.
+`planPaidGas` exposes the same arithmetic, and `gas` overrides each margin. On Arbitrum One and Arbitrum
+Sepolia the data fee is read from `NodeInterface` automatically (`arbitrumDataFeeGas`); a reader with its own
+`dataFeeGas` takes precedence.
+
+**Checks before anything is proven or submitted.**
+
+- `payment.checkAction` lets the payment source refuse an action it cannot be combined with, for example a
+  Howl action that spends the fee note itself.
+- `isPaymentConsumed` and `isClientIntentConsumed` are read before the quote.
+- The quote is verified by `requestPaidQuote` (exit membership, EIP-712 digest and signature, every field
+  against the request), then `exitFee + networkFee <= maxTotalFee`. A fee above the ceiling ends the call
+  with `not-paid` / `fee-cap`.
+- The quote must already be active (`validAfter` at or before chain time) and leave `minSubmitHeadroomSecs`
+  (default 12) before `validUntil`, measured on the later of chain time and the local clock, both before
+  proving and before submission.
+- The exact `execute` calldata is simulated through the `preflight` reader as the exit will send it
+  (`eth_estimateGas` and `eth_call` from the exit address at the quoted cap and gas price). The call is
+  submitted only when the estimate with the exit buffer fits the cap and the simulated action succeeds.
+
+**Preflight reader.** `preflight` is required. It receives the complete signed calldata, fee proof included,
+a few seconds before the quoting exit does, and the simulation needs `from`, `gas` and `gasPrice` applied.
+Use an endpoint you choose and trust with that calldata: `rpcChainReader(send)` over your own node or RPC
+provider. Only the quoting exit can broadcast the calldata, and only until the quote's `validUntil`.
+
+**One payment per action.** `NoxEntryPoint` consumes each `clientIntentId` once, across all callers. The
+helper derives it as `deriveClientIntentId(chainId, entryPoint, target, data, intentSalt)`: `intentSalt` is 32
+random bytes that you generate once per action, store, and pass again on every retry. The payment id is fixed
+by the payment source, so every retry reuses both ids and `NoxEntryPoint` settles at most one of them, on any
+exit, including after an app restart. Calling `executePaid` again with the same inputs resumes: a consumed
+intent and payment are answered from their settlement log alone. Use a fresh salt to run the
+same calldata again, or pass a `clientIntentId` of your own in place of the salt. Keep the fee note reserved
+until the result is `settled`, `paid-action-failed` or `not-paid`.
+
+**After `unknown`.** The result carries `executionId` and `validUntilUnix`. Pass them back as `pending` on
+the next call: while that quote can still settle the helper answers `unknown` again and requests nothing, and
+once chain time has passed `validUntilUnix` it reports the settlement or continues with a new quote.
+
+**Retries.** A quote or submission that an exit explicitly rejects moves the call to another exit, up to
+`maxExits` exits contacted (default 2). After a submission with no usable reply the helper waits for chain
+evidence and tries a second exit only once the first quote has expired unsettled. `fee-cap` and `expired`
+end the call. Once any submission has left the client, the payment id is read from the chain before each
+further exit and before a `not-paid` result: a consumed payment id is reported from its settlement log, and
+`not-paid` is returned only after every submitted quote has expired unconsumed on chain.
+
+**Evidence.** `settled` and `paid-action-failed` come from the `PaidExecutionSettled` log for the quote's
+`executionId`, matched against the quoted exit, payment id and fees; `transactionHash` is the hash that
+landed, which differs from the submission reply when the exit replaced the transaction.
+
+**Dry run.** `dryRun: true` stops after the simulation and returns the quoted fee, the gas estimate against
+the cap and per-stage timings. It builds a real fee proof and shows it to the `preflight` reader, and it
+uses one quote from one exit for that payment id; exits keep one quote per payment id until it leaves their
+retention window (10 to 20 minutes on the current fleet), so use a spare fee note for dry runs.
+
+**Chain reads.** State and evidence reads (consumed flags, block time, settlement logs) use `chain`, which
+defaults to `mixnetChainReader(client)`: every read goes through the mixnet and an exit's RPC endpoint
+answers it from its latest block. The amount at risk is fixed by local checks on the signed quote and by the
+payment proof. When `action.gasLimit` is given, the gas limits are local too. When it is omitted, the limit
+is estimated through the `preflight` reader (`eth_estimateGas` from the predicted sandbox, times
+`gas.actionMarginBps`) and so trusts that reader's answer; declare the limit for actions that move funds.
+For evidence that is independent of every exit, pass the same `rpcChainReader(send)` as `chain`.
+
+#### Lower-level methods
+
+`executePaid` is built from public methods that remain available: `client.selectPaidExit({ exclude })`,
+`client.requestPaidQuote(request, exit)`, `encodeEntryPointExecute(quote, actionData, trackedAssets,
+paymentData)` and `client.submitPaidTransaction(quote, calldata)`. Always submit with the quote returned by
 `requestPaidQuote`, whose `selectedExit` is the exit that signed it. If the chosen exit does not answer in
-time, the quote request is sent once more to a different exit. The client re-resolves that exit from a
-recently chain-verified topology, verifies the EIP-712 quote and execution ID, and returns a typed submission or
-rejection outcome. Applications provide opaque EntryPoint calldata; Nox does not parse Howl proofs. The
-payment must cover `exitFee + networkFee` from the quote and be bound to `quote.executionId`; the
+time, the quote request is sent once more to a different exit. The payment must cover `exitFee + networkFee`
+from the quote and be bound to `quote.executionId`; the
 [anonymous paymaster docs](https://docs.hisoka.io/docs/crypto/paymaster) describe the Howl payment path.
 
 When the seed publishes node capabilities, only exits that advertise `paid_v2` are used, and
