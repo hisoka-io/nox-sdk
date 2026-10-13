@@ -665,10 +665,15 @@ export class NoxClient {
    * When the seed publishes capability data, only exits that advertise
    * `paid_v2` qualify, and a topology without one fails fast with
    * `PaidExitUnavailable` instead of a quote that times out. Exits that
-   * recently timed out are skipped while another exit qualifies.
+   * recently timed out are skipped while another exit qualifies. Exits whose
+   * address is listed in `exclude` are never returned.
    */
-  selectPaidExit(): TopologyNode {
-    return cloneTopologyNode(this._pickPaidExit(new Set()));
+  selectPaidExit(options?: { readonly exclude?: readonly string[] }): TopologyNode {
+    const excluded = new Set((options?.exclude ?? []).map((id) => id.toLowerCase()));
+    const exclude = new Set(
+      this._nodes.filter((node) => excluded.has(node.id.toLowerCase())).map((node) => node.id),
+    );
+    return cloneTopologyNode(this._pickPaidExit(exclude));
   }
 
   /**
