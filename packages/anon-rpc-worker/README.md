@@ -3,9 +3,10 @@
 The Nox mixnet worker for the [anon-rpc](https://github.com/ethereum/anon-rpc) standard: one classic-script
 bundle that a wallet's anon-rpc harness loads and pins by its keccak-256 hash.
 
-The worker dials Nox entry nodes over KPS (`anonRpcWorker.kps`), sends each `fetch` call as a Sphinx packet
-through the mixnet, and an exit node performs the HTTP request; the reply returns over single-use reply blocks
-(SURBs). Who the nodes are comes from NoxRegistry: a snapshot pinned inside the bundle is the floor, and after
+The worker dials Nox entry nodes over KPS (`anonRpcWorker.kps`) and sends each `fetch` call as Sphinx packets
+through the mixnet. It runs TLS with the RPC provider itself, and an exit relays the encrypted records (the exit
+performs the HTTP request with `tls: "off"`, or as the `"preferred"` fallback); replies return over single-use
+reply blocks (SURBs). Who the nodes are comes from NoxRegistry: a snapshot pinned inside the bundle is the floor, and after
 ready the worker reads the registry through the mixnet itself. Where the nodes are (IP, port, KPS certhash) is
 looked up at run time, so operators change IPs whenever they like and new nodes join without a new bundle. A cold
 boot needs no seed server and no public RPC; the bundle reaches the network only through the harness's KPS dialer.
@@ -22,7 +23,7 @@ over one TCP connection, seeing the provider's host name, timing and sizes (see 
 | `src/` | The worker: `worker.ts` (bundle entry), `core.ts` (boot, readiness, accept loop, deadlines), `config.ts`, `fetch-map.ts` (`fetch` to Nox `HttpRequest`, redirects, gzip), `tls/` (end-to-end TLS: `tunnel.ts` one exit tunnel, `channel.ts` TLS and HTTP/1.1 over it, `pool.ts` sessions, spares and exit choice, `transport.ts` the per-hop transport and error mapping, `module.ts` the TLS module bindings), `jsonrpc.ts`, `errors.ts`, `log.ts`, `storage.ts`, `spec-types.ts` (anon-rpc SPEC 0.3.2 worker types) |
 | `snapshot/` | The pinned registry snapshot, its keccak-256, JSON Schema and reviewed capability hints, and the discovery bootstrap (`nox-bootstrap.json`) |
 | `scripts/` | Snapshot generator and verifier, reproducible WASM and bundle build, hashing, provenance |
-| `specifier/` | Worker specifier contracts (Foundry) and a read-only deploy planner and inspector |
+| `specifier/` | Worker specifier contracts (Foundry), a read-only deploy planner and inspector, and the `setWorker` update tool for the stable address |
 | `e2e/` | End-to-end test bed: a local Nox mesh with `nox-kps` sidecars, the reference harness in headless Chromium |
 
 ## Configuration
@@ -121,6 +122,12 @@ Session modes:
 Latency: a call on a ready session (a spare, or a warm keep-alive session) costs what the exit `HttpRequest` path
 costs. The first call to a host, and calls beyond the ready spares, add one mixnet round trip for the handshake.
 
+Measured on 2026-10-10 with the anon-rpc reference bench (ethereum/anon-rpc `impl/site/bench`; worker 0.4.0 with
+its defaults, `eth_getBalance` against a public Ethereum RPC, 39 warm calls per vantage, 40 of 40 calls answered):
+warm median 381 ms from the US (p90 795 ms) and 636 ms from India (p90 1,294 ms); cold boot, median of four,
+1.5 s from the US and 2.8 s from India. The testnet fleet runs a mix delay of 40 ms per hop, and the worker claims
+replies with claim protocol v2.
+
 Certificates are checked against the Mozilla root store compiled into the bundle (webpki-roots; the version and its
 release date are in the provenance, refreshed with every worker release), with the host name and the device clock;
 a wrong clock fails with a message that names it. Each worker release ships its root store, so wallets keep their
@@ -165,9 +172,9 @@ worker first saw it, and a route holds at most one such member. Checks repeat ev
 served fingerprint differs or every entry failed. Log events: `discovery.verified`, `discovery.disagreement`,
 `discovery.incomplete`, `discovery.rejected`, `discovery.probation`, `discovery.floor`, `discovery.failed`.
 
-What each party learns: RPC providers see exit IPs and public registry reads, never the wallet's address. Until
-TLS runs inside the worker, the exits terminate HTTPS, so the two-exit quorum is attested by the exits; probation
-and the snapshot floor bound what a forged answer can change. If every chain path fails, the worker keeps working
+What each party learns: RPC providers see exit IPs and public registry reads, never the wallet's address. Registry
+reads use the exit `HttpRequest` path, so the two-exit quorum is attested by the exits; registry reads through
+tunnels are the next milestone. Probation and the snapshot floor bound what a forged answer can change. If every chain path fails, the worker keeps working
 on the snapshot floor.
 
 Operators move by sending `updateUrl` / `updateMetadataUrl` from the node key (self-service, about 0.00002 ETH);
@@ -207,7 +214,8 @@ a learned address is used only after the node's `/metadata.json` names the same 
 | `workerHash` (keccak-256 of `dist/anon-rpc-worker.js`) | `0xd8bef626ec8511d7a468bca5137880680ca2da20d2ea4d9c981a2a3d0c86ba1e` |
 | Size | 1,820,668 bytes; 649,310 bytes with `gzip -9 -n` |
 | sha256 | `4b7b69cd6f45c364cd87ff75f5f8cacdebea2cd852d5384c47215bb88d56f35a` |
-| Specifier | Ethereum Sepolia `0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d` (`ImmutableWorkerSpecifier`, resolvers in [specifier/README.md](./specifier/README.md#deployments)) |
+| Specifier, stable address | Ethereum Sepolia `0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A` (`WorkerSpecifier`, owner-updatable: it follows the current release; trust model in [specifier/README.md](./specifier/README.md#deployments)) |
+| Specifier, 0.4.0 pin | Ethereum Sepolia `0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d` (`ImmutableWorkerSpecifier`, resolvers in [specifier/README.md](./specifier/README.md#deployments)) |
 | Snapshot | NoxRegistry at Arbitrum Sepolia block 316,207,920, keccak-256 `0x1090f071…014681` (the 0.3.0 registry state with the exits' `tunnel_v1` hints) |
 | nox-wasm module | 188,708 bytes, sha256 `5171416972ea4499fd4b4ea8bcadf002f4c10f10ed42cafb0d5a426121da9c4f` |
 | nox-tls module | 593,738 bytes, sha256 `f74e8cfbed7be33ef1a9158b7b66e454b4ca0849bcb8956487fd13da47e4f4d2` |
@@ -215,6 +223,10 @@ a learned address is used only after the node's `/metadata.json` names the same 
 | Built from | `nox-sdk` commit `fee8d69861a112c65f0cbb0b848a7726ec12f01a`, rustc 1.95.0, clang 19.1.7, wasm-pack 0.13.1, wasm-bindgen 0.2.114, binaryen 117, esbuild 0.27.3 |
 
 The npm package carries the bundle and provenance file of the first pinned container build.
+
+Each release publishes its own immutable specifier and then repoints the stable address with one `setWorker`
+transaction from its owner ([specifier/README.md](./specifier/README.md#updating-the-stable-address-setworker)), so
+wallets and listings that pin the stable address move to the new worker with nothing to change on their side.
 
 Release 0.3.0: `workerHash` `0x24604525d220bcc7e39f2dbc22966a814600a63ada51baafad5dd0bcc1d28549` (961,799 bytes, commit
 `6bddd85`), specifier `0x29B51ca9Ad80E9c0B0D111C8748E6a7908b82eDB`. Release 0.2.0: `workerHash`

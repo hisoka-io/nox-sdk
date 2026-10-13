@@ -161,7 +161,7 @@ function median(values: readonly bigint[]): bigint {
   return sorted[Math.floor(sorted.length / 2)] ?? 0n;
 }
 
-async function readFees(rpc: RpcClient, settings: PlanSettings): Promise<FeeSnapshot> {
+export async function readFees(rpc: RpcClient, settings: PlanSettings): Promise<FeeSnapshot> {
   const chainId = hexToBigInt(await rpc.request("eth_chainId"), "eth_chainId");
   const block = await rpc.request("eth_getBlockByNumber", ["latest", false]);
   if (!isRecord(block)) throw new PlanError("eth_getBlockByNumber(latest) returned no block");

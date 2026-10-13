@@ -216,7 +216,8 @@ const body = await client.httpRequest(
 
 ### TLS tunnels
 
-Exits on nox rc.9 and later that advertise `tunnel_v1` relay TLS records over one TCP connection per tunnel, so a
+Exits on nox 0.4.0-rc.9 and later that advertise `tunnel_v1` relay TLS records over one TCP connection per tunnel
+(the testnet fleet runs 0.4.0-rc.10 with `[tunnel]` enabled on its three exits), so a
 client that runs TLS itself keeps requests and responses end-to-end encrypted (the anon-rpc worker does this; see
 its README). `tunnelExits()` lists those exits; `tunnelSend` sends one copy of an exchange and hands each reply part
 (an encoded `TunnelReplyV1`) to `onReply`:
@@ -296,8 +297,8 @@ kps: {
   membership source and no RPC provider is ever involved.
 
 Trust: RPC providers are data sources reached anonymously through exits; they see exit IPs and public registry
-reads. Until TLS runs inside the client, the exits terminate HTTPS, so the quorum is attested by the exits;
-probation and the snapshot floor bound what a forged answer can change.
+reads. Registry reads use the exit `HttpRequest` path, so the quorum is attested by the exits; registry reads
+through tunnels are the next milestone. Probation and the snapshot floor bound what a forged answer can change.
 
 #### Send path (`kps.writeChunkBytes`, `kps.warmupBytes`, `kps.spreadCalls`)
 
