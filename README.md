@@ -2,9 +2,11 @@
 
 SDK for routing Ethereum transactions, RPC calls, and arbitrary HTTP through the [NOX mixnet](https://github.com/hisoka-io/nox).
 
-Two packages:
+Packages in this repo:
 - [`@hisoka-io/nox-wasm`](./packages/nox-wasm) - the Rust/WASM core (Sphinx, SURBs, proof-of-work)
 - [`@hisoka-io/nox-client`](./packages/nox-client) - TypeScript client that handles topology, routing, fragmentation, FEC, cover traffic
+- [`@hisoka-io/anon-rpc-worker`](./packages/anon-rpc-worker) - the Nox worker for the [anon-rpc](https://github.com/ethereum/anon-rpc) standard: one hash-pinned bundle a wallet's harness loads, with end-to-end TLS to the RPC provider by default. Release 0.4.0 is published by the stable specifier [`0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A`](https://sepolia.etherscan.io/address/0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A) on Ethereum Sepolia, which follows each worker release ([deployments and trust model](./packages/anon-rpc-worker/specifier/README.md#deployments)); it runs in the browser at [demo.nox.hisoka.io/anon-rpc](https://demo.nox.hisoka.io/anon-rpc)
+- [`nox-tls`](./packages/nox-tls) - the rustls TLS client compiled to WebAssembly and bundled in the worker (a Rust crate in this repo)
 
 ## Quickstart
 

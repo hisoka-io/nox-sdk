@@ -3,9 +3,10 @@
 The Nox mixnet worker for the [anon-rpc](https://github.com/ethereum/anon-rpc) standard: one classic-script
 bundle that a wallet's anon-rpc harness loads and pins by its keccak-256 hash.
 
-The worker dials Nox entry nodes over KPS (`anonRpcWorker.kps`), sends each `fetch` call as a Sphinx packet
-through the mixnet, and an exit node performs the HTTP request; the reply returns over single-use reply blocks
-(SURBs). Who the nodes are comes from NoxRegistry: a snapshot pinned inside the bundle is the floor, and after
+The worker dials Nox entry nodes over KPS (`anonRpcWorker.kps`) and sends each `fetch` call as Sphinx packets
+through the mixnet. It runs TLS with the RPC provider itself, and an exit relays the encrypted records (the exit
+performs the HTTP request with `tls: "off"`, or as the `"preferred"` fallback); replies return over single-use
+reply blocks (SURBs). Who the nodes are comes from NoxRegistry: a snapshot pinned inside the bundle is the floor, and after
 ready the worker reads the registry through the mixnet itself. Where the nodes are (IP, port, KPS certhash) is
 looked up at run time, so operators change IPs whenever they like and new nodes join without a new bundle. A cold
 boot needs no seed server and no public RPC; the bundle reaches the network only through the harness's KPS dialer.
@@ -121,6 +122,12 @@ Session modes:
 Latency: a call on a ready session (a spare, or a warm keep-alive session) costs what the exit `HttpRequest` path
 costs. The first call to a host, and calls beyond the ready spares, add one mixnet round trip for the handshake.
 
+Measured on 2026-10-10 with the anon-rpc reference bench (ethereum/anon-rpc `impl/site/bench`; worker 0.4.0 with
+its defaults, `eth_getBalance` against a public Ethereum RPC, 39 warm calls per vantage, 40 of 40 calls answered):
+warm median 381 ms from the US (p90 795 ms) and 636 ms from India (p90 1,294 ms); cold boot, median of four,
+1.5 s from the US and 2.8 s from India. The testnet fleet runs a mix delay of 40 ms per hop, and the worker claims
+replies with claim protocol v2.
+
 Certificates are checked against the Mozilla root store compiled into the bundle (webpki-roots; the version and its
 release date are in the provenance, refreshed with every worker release), with the host name and the device clock;
 a wrong clock fails with a message that names it. Each worker release ships its root store, so wallets keep their
@@ -165,9 +172,9 @@ worker first saw it, and a route holds at most one such member. Checks repeat ev
 served fingerprint differs or every entry failed. Log events: `discovery.verified`, `discovery.disagreement`,
 `discovery.incomplete`, `discovery.rejected`, `discovery.probation`, `discovery.floor`, `discovery.failed`.
 
-What each party learns: RPC providers see exit IPs and public registry reads, never the wallet's address. Until
-TLS runs inside the worker, the exits terminate HTTPS, so the two-exit quorum is attested by the exits; probation
-and the snapshot floor bound what a forged answer can change. If every chain path fails, the worker keeps working
+What each party learns: RPC providers see exit IPs and public registry reads, never the wallet's address. Registry
+reads use the exit `HttpRequest` path, so the two-exit quorum is attested by the exits; registry reads through
+tunnels are the next milestone. Probation and the snapshot floor bound what a forged answer can change. If every chain path fails, the worker keeps working
 on the snapshot floor.
 
 Operators move by sending `updateUrl` / `updateMetadataUrl` from the node key (self-service, about 0.00002 ETH);

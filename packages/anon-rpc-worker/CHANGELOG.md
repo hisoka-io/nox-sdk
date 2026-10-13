@@ -2,6 +2,15 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
+## Stable specifier (2026-10-13)
+
+Deployment record and tooling; the published package stays 0.4.0.
+
+- Stable specifier `0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A` deployed on Ethereum Sepolia on 2026-10-13,
+  pointing at 0.4.0: the reference `WorkerSpecifier` of ethereum/anon-rpc, which follows each worker release
+  through `setWorker`. The per-release immutable specifiers stay as pins (`specifier/README.md`).
+- `specifier`: `pnpm set-worker`, a dry-run-first tool for the `setWorker` update.
+
 ## 0.4.0 (2026-10-10)
 
 Built on `@hisoka-io/nox-client` 0.8.0. Every 0.3.0 config stays valid; with the new defaults, https calls go
