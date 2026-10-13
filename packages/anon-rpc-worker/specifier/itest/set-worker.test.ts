@@ -291,6 +291,9 @@ describe("scripts/set-worker.ts", () => {
     const noKey = await script([...base(), "--broadcast", "--chain-id", "31337"]);
     expect(noKey.code).toBe(1);
     expect(noKey.err).toContain("--broadcast needs --key-file");
+    const skipped = await script([...base(), "--broadcast", "--chain-id", "31337", "--key-file", "owner.key"]);
+    expect(skipped.code).toBe(1);
+    expect(skipped.err).toContain("--skip-resolver-fetch is for dry runs");
     expect(await blockNumber()).toBe(before);
     expect((await read()).workerHash).toBe(SAMPLE_HASH);
   });

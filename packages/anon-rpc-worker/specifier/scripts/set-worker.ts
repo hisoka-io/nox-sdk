@@ -7,7 +7,8 @@
 //
 // Dry run by default: it reads the specifier, checks the new resolver list, downloads every https: resolver through
 // the harness and compares it with the new hash, simulates the call as the owner on the target chain, and prints the
-// transaction. Nothing is signed or sent unless --broadcast is given together with --chain-id and --key-file.
+// transaction. Nothing is signed or sent unless --broadcast is given together with --chain-id and --key-file;
+// --broadcast always runs the resolver download check, so it refuses --skip-resolver-fetch.
 
 import { readFile } from "node:fs/promises";
 import { parseArgs } from "node:util";
@@ -27,7 +28,8 @@ const USAGE = `usage: pnpm set-worker -- --specifier 0x… --rpc-url <RPC> (--ha
                           [--skip-resolver-fetch] [--allow-unknown-kinds] [--json]
                           [--broadcast --key-file <file>]
 Dry run by default: prints the setWorker transaction; nothing is signed or sent.
---broadcast signs with the owner key in --key-file and sends; it needs --chain-id.`;
+--broadcast signs with the owner key in --key-file and sends; it needs --chain-id and runs the resolver fetch
+(--skip-resolver-fetch is for dry runs).`;
 
 /** Blocks waited for after the transaction is mined before the read-back. */
 const BROADCAST_CONFIRMATIONS = 2;
@@ -77,6 +79,11 @@ async function main(): Promise<void> {
   }
   if (!values.broadcast && values["key-file"] !== undefined) {
     throw new UsageError("--key-file is read only with --broadcast");
+  }
+  if (values.broadcast && values["skip-resolver-fetch"]) {
+    throw new UsageError(
+      "--broadcast sends only after every https: resolver served the new bytes; --skip-resolver-fetch is for dry runs",
+    );
   }
 
   let workerHash: string;
