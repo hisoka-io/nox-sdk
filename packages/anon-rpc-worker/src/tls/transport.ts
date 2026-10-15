@@ -18,7 +18,7 @@ import {
   type TunnelHop,
 } from "../fetch-map.js";
 import { describeError, type WorkerLogger } from "../log.js";
-import { TLS_PORT } from "./channel.js";
+import { TLS_PORT, type TlsChannel } from "./channel.js";
 import { tlsErrorCode, type NoxTlsBindings } from "./module.js";
 import { NoTunnelExitError, type TlsPool } from "./pool.js";
 import {
@@ -184,6 +184,7 @@ export class TlsTransport implements TunnelHop {
         if (budget.signal.aborted) throw budget.signal.reason;
         throw mapTlsError(error);
       }
+      const sentAt = this.now();
       try {
         const reply = await channel.request({
           http,
@@ -196,6 +197,7 @@ export class TlsTransport implements TunnelHop {
           background: false,
         });
         this.pool.release(channel, true);
+        this.logCall(channel, attempt, sentAt, true);
         return {
           status: reply.status,
           headers: reply.headers.filter(([name]) => !CONNECTION_HEADERS.has(name.toLowerCase())),
@@ -205,10 +207,30 @@ export class TlsTransport implements TunnelHop {
       } catch (error) {
         this.pool.release(channel, false);
         if (budget.signal.aborted) throw budget.signal.reason;
-        if (attempt > 0 || budget.remainingMs() <= 0 || !retriable(error, resendable)) throw mapTlsError(error);
+        if (attempt > 0 || budget.remainingMs() <= 0 || !retriable(error, resendable)) {
+          this.logCall(channel, attempt, sentAt, false);
+          throw mapTlsError(error);
+        }
         this.log.info("tls.retry", { reason: error instanceof Error ? error.name : "error" });
       }
     }
+  }
+
+  /**
+   * `tls.call`: how the last attempt of a tunnel hop got its session (`path`,
+   * `"retry"` after a retry), the handshake wait, the spare's age, and the
+   * request exchange time.
+   */
+  private logCall(channel: TlsChannel, retries: number, sentAt: number, ok: boolean): void {
+    const info = this.pool.acquireInfo(channel);
+    this.log.info("tls.call", {
+      path: retries > 0 ? "retry" : info?.path ?? "inline",
+      openMs: info?.openMs ?? 0,
+      ...(info?.spareAgeMs === undefined ? {} : { spareAgeMs: info.spareAgeMs }),
+      exchangeMs: this.now() - sentAt,
+      retries,
+      ok,
+    });
   }
 
   private encode(request: PreparedRequest, target: TunnelTarget): Uint8Array {

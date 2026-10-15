@@ -111,8 +111,12 @@ export const CONFIG_DEFAULTS: NoxWorkerConfig = Object.freeze({
   // Founder decisions D1/D2 (E2E TLS design §8): the most private settings until decided.
   tls: "required",
   tlsSession: "per-call",
-  tlsSpares: 1,
-  tlsSpareTtlMs: 20_000,
+  // Spare policy measured from India on 2026-10-15: the upstream RPC hosts close an idle TLS connection 15.0 s
+  // after the handshake, and spares used 14.2 s or more after their handshake had been closed (one wasted exchange,
+  // then a retry on a new session). A 12 s TTL kept every spare live (0 retries in 70 calls); a second spare per
+  // host raised spare use at a 1 s gap from 16/30 to 23/30 calls.
+  tlsSpares: 2,
+  tlsSpareTtlMs: 12_000,
   tlsKeepAliveMs: 30_000,
   tlsMaxCallsPerSession: 100,
   tlsOpenTimeoutMs: 5_000,

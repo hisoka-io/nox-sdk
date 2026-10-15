@@ -86,7 +86,7 @@ describe("config", () => {
   });
 
   it("defaults to the most private TLS settings: tunnels required, one session per call", () => {
-    expect(CONFIG_DEFAULTS).toMatchObject({ tls: "required", tlsSession: "per-call", tlsSpares: 1, tlsSpareTtlMs: 20_000 });
+    expect(CONFIG_DEFAULTS).toMatchObject({ tls: "required", tlsSession: "per-call", tlsSpares: 2, tlsSpareTtlMs: 12_000 });
   });
 
   it("accepts gateways that no pinned member publishes: they are addresses, not identities", () => {

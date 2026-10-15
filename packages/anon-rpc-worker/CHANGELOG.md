@@ -2,6 +2,25 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
+## Unreleased
+
+### Changed
+
+- TLS spares: defaults `tlsSpares` 2 (was 1) and `tlsSpareTtlMs` 12,000 (was 20,000). The upstream RPC hosts close
+  an idle TLS connection 15.0 s after the handshake, so a 20 s spare could be dead when used: one wasted exchange
+  and a `tls.retry` on a new session. Measured from India on 2026-10-15 at a 15 s call gap: 13 of 30 calls retried
+  with a 20 s TTL, none of 70 with 12 s.
+- A spare is refreshed before its TTL while its host was called within the last 2 minutes: the replacement opens at
+  once 1.5-2 s before the TTL, and a host holds at most `tlsSpares` spares plus the one being replaced. Past that
+  window an expired spare is not replaced, as before.
+- A call that finds no spare while a spare's handshake for its host has run for half the handshake median waits for
+  that handshake instead of opening another session; if that handshake fails, the call opens its own.
+
+### Added
+
+- Log event `tls.call` (info), one per tunnel hop: `path` (`spare`, `inline`, `waited`, `reused` or `retry`),
+  `openMs`, `spareAgeMs` (spares only), `exchangeMs`, `retries`, `ok`.
+
 ## Stable specifier (2026-10-13)
 
 Deployment record and tooling; the published package stays 0.4.0.
