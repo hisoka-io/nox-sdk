@@ -12,8 +12,16 @@
  * - Per-call spares: after a call to a host (once the first wallet call has
  *   settled), a replacement spare opens on a random exit after an
  *   exponential delay with mean `SPARE_DELAY_MEAN_MS`, up to `tlsSpares` per
- *   host. A spare serves one call; unused, it is torn down after
- *   `tlsSpareTtlMs` and not replaced. Hosts live in memory only.
+ *   host. A spare serves one call; unused, it is torn down `tlsSpareTtlMs`
+ *   after its handshake. While the host was called within
+ *   `SPARE_REFILL_WINDOW_MS`, a replacement opens at once
+ *   `SPARE_REFILL_LEAD_MS` plus up to `SPARE_REFILL_JITTER_MS` before that
+ *   teardown (one replacement per host at a time, so a host holds at most
+ *   `tlsSpares` spares plus the one being replaced); after the window an
+ *   expired spare is not replaced. Hosts live in memory only.
+ * - A call that finds no spare while a spare's open for its host has run for
+ *   at least half the handshake median waits for that open instead of
+ *   starting another, and opens its own session when that open fails.
  * - Keep-alive: up to `MAX_KEEP_ALIVE_SESSIONS` sessions per host, each
  *   reused for `tlsKeepAliveMs` from its open or `tlsMaxCallsPerSession`
  *   calls; a call beyond that runs on a session of its own.
@@ -39,6 +47,16 @@ export const SPARE_DELAY_MEAN_MS = 2_000;
 export const MAX_KEEP_ALIVE_SESSIONS = 4;
 /** Hosts with spares kept at once; the least recently used host loses its spares. */
 export const MAX_SPARE_HOSTS = 8;
+/** A spare is refreshed before its TTL only while its host was called within this long. */
+export const SPARE_REFILL_WINDOW_MS = 120_000;
+/**
+ * How long before a spare's TTL its replacement opens: about the handshake
+ * p95 measured from India on 2026-10-15 (1.45 s), so the replacement is ready
+ * before the old spare goes.
+ */
+export const SPARE_REFILL_LEAD_MS = 1_500;
+/** Uniform jitter added to `SPARE_REFILL_LEAD_MS`, so refreshes do not tick at a fixed period. */
+export const SPARE_REFILL_JITTER_MS = 500;
 /** Exits tried for one open. */
 export const MAX_OPEN_ATTEMPTS = 3;
 /** Handshake times kept for the copy timer's p95. */
@@ -74,7 +92,35 @@ export class NoTunnelExitError extends Error {
 
 interface Spare {
   readonly channel: TlsChannel;
-  readonly timer: ReturnType<typeof setTimeout>;
+  /** When the handshake finished: the TTL and the logged age count from here. */
+  readonly readyAt: number;
+  readonly timers: ReturnType<typeof setTimeout>[];
+  /** A replacement is opening; this spare still serves a call until its TTL. */
+  superseded: boolean;
+  /** The TTL leaves room for a refresh (longer than LEAD plus jitter). */
+  refreshable: boolean;
+}
+
+/** A background spare open in flight, which a call may wait for. */
+interface PendingOpen {
+  readonly startedAt: number;
+  /** A call waits for this open: it is handed to the call, not kept as a spare. */
+  claimed: boolean;
+  /** Set once the open succeeded. */
+  channel: TlsChannel | undefined;
+  readyAt: number;
+  readonly promise: Promise<TlsChannel>;
+}
+
+/** How `acquire` obtained a session, for the `tls.call` log line. */
+export type AcquirePath = "spare" | "inline" | "waited" | "reused";
+
+export interface AcquireInfo {
+  readonly path: AcquirePath;
+  /** Time `acquire` spent waiting for a handshake (0 for a spare or a reused session). */
+  readonly openMs: number;
+  /** Age of the spare since its handshake, for `path: "spare"`. */
+  readonly spareAgeMs: number | undefined;
 }
 
 interface Pooled {
@@ -86,7 +132,13 @@ export class TlsPool {
   readonly policy: CopyPolicy;
   private readonly skipped = new Map<string, number>();
   private readonly spares = new Map<string, Spare[]>();
+  /** Spare opens per host, scheduled or in flight. */
   private readonly opening = new Map<string, number>();
+  /** Spare opens per host that have started their handshake. */
+  private readonly pending = new Map<string, PendingOpen[]>();
+  /** When each host was last called (per-call mode), least recent first. */
+  private readonly lastCallAt = new Map<string, number>();
+  private readonly acquired = new WeakMap<TlsChannel, AcquireInfo>();
   private readonly sessions = new Map<string, Pooled[]>();
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
   private readonly samples: number[] = [];
@@ -127,9 +179,23 @@ export class TlsPool {
 
   /** A session ready for a request to `host`: a spare, an idle shared session, or a new one. */
   async acquire(host: string, timing: Omit<ExchangeTiming, "background">): Promise<TlsChannel> {
+    const startedAt = this.deps.now();
     if (this.settings.tlsSession === "per-call") {
+      this.noteCall(host, startedAt);
       const spare = this.takeSpare(host);
-      const channel = spare ?? (await this.open(host, { ...timing, background: false }));
+      if (spare !== undefined) {
+        this.acquired.set(spare.channel, { path: "spare", openMs: 0, spareAgeMs: startedAt - spare.readyAt });
+        this.replenish(host);
+        return spare.channel;
+      }
+      const inFlight = this.waitableOpen(host, startedAt);
+      const waited = inFlight === undefined ? undefined : await this.waitFor(host, inFlight, timing);
+      const channel = waited ?? (await this.open(host, { ...timing, background: false }));
+      this.acquired.set(channel, {
+        path: waited === undefined ? "inline" : "waited",
+        openMs: this.deps.now() - startedAt,
+        spareAgeMs: undefined,
+      });
       this.replenish(host);
       return channel;
     }
@@ -138,9 +204,11 @@ export class TlsPool {
     const ready = pooled.find((entry) => entry.idle && this.keepAliveUsable(entry.channel, now));
     if (ready !== undefined) {
       ready.idle = false;
+      this.acquired.set(ready.channel, { path: "reused", openMs: 0, spareAgeMs: undefined });
       return ready.channel;
     }
     const channel = await this.open(host, { ...timing, background: false });
+    this.acquired.set(channel, { path: "inline", openMs: this.deps.now() - startedAt, spareAgeMs: undefined });
     const live = this.sessions.get(host) ?? [];
     if (live.length < MAX_KEEP_ALIVE_SESSIONS) {
       live.push({ channel, idle: false });
@@ -170,6 +238,11 @@ export class TlsPool {
       return;
     }
     this.retire(channel);
+  }
+
+  /** How the last `acquire` that returned `channel` obtained it. */
+  acquireInfo(channel: TlsChannel): AcquireInfo | undefined {
+    return this.acquired.get(channel);
   }
 
   /** Drop every session; spares and shared sessions are torn down. */
@@ -264,16 +337,52 @@ export class TlsPool {
     this.deps.log.info("tls.exit.skipped", { reason, minutes: EXIT_SKIP_MS / 60_000 });
   }
 
-  private takeSpare(host: string): TlsChannel | undefined {
+  private takeSpare(host: string): Spare | undefined {
     const list = this.spares.get(host);
     const spare = list?.shift();
     if (spare === undefined) return undefined;
-    clearTimeout(spare.timer);
-    this.timers.delete(spare.timer);
+    this.clearSpareTimers(spare);
     // Most recently used host last (see MAX_SPARE_HOSTS).
     this.spares.delete(host);
     this.spares.set(host, list ?? []);
-    return spare.channel;
+    return spare;
+  }
+
+  private noteCall(host: string, at: number): void {
+    this.lastCallAt.delete(host);
+    this.lastCallAt.set(host, at);
+    while (this.lastCallAt.size > MAX_SPARE_HOSTS) {
+      const oldest = this.lastCallAt.keys().next().value as string;
+      this.lastCallAt.delete(oldest);
+    }
+  }
+
+  /** `host` was called within `SPARE_REFILL_WINDOW_MS`. */
+  private recentlyCalled(host: string): boolean {
+    const at = this.lastCallAt.get(host);
+    return at !== undefined && this.deps.now() - at < SPARE_REFILL_WINDOW_MS;
+  }
+
+  /** The oldest unclaimed spare open for `host` that started at least half the handshake median ago. */
+  private waitableOpen(host: string, now: number): PendingOpen | undefined {
+    const minAgeMs = percentile(this.samples, 0.5, 1) / 2;
+    return this.pending.get(host)?.find((entry) => !entry.claimed && now - entry.startedAt >= minAgeMs);
+  }
+
+  /**
+   * Wait for the spare open `entry` and take its session. Undefined when that
+   * open fails or the call's deadline passes first (the call then opens its
+   * own); the call's abort rejects. A session the call gave up on stays a spare.
+   */
+  private async waitFor(host: string, entry: PendingOpen, timing: Omit<ExchangeTiming, "background">): Promise<TlsChannel | undefined> {
+    entry.claimed = true;
+    const outcome = await settleFirst(entry.promise, timing.signal, timing.deadlineAt - this.deps.now());
+    if (outcome.kind === "opened") return outcome.channel;
+    if (outcome.kind === "failed") return undefined;
+    entry.claimed = false;
+    if (entry.channel !== undefined) this.keepSpare(host, entry.channel, entry.readyAt);
+    if (outcome.kind === "aborted") throw outcome.reason;
+    return undefined;
   }
 
   /** Per-call mode: open a replacement spare for `host` after an exponential delay. */
@@ -283,48 +392,114 @@ export class TlsPool {
       if (this.deferredHosts.size < MAX_SPARE_HOSTS) this.deferredHosts.add(host);
       return;
     }
-    const have = (this.spares.get(host)?.length ?? 0) + (this.opening.get(host) ?? 0);
-    if (have >= this.settings.tlsSpares) return;
+    if (this.spareCount(host) >= this.settings.tlsSpares) return;
+    this.openSpare(host, Math.round(-Math.log(1 - this.deps.random()) * SPARE_DELAY_MEAN_MS));
+  }
+
+  /** Spares of `host` that count against `tlsSpares`: those not being replaced, and opens scheduled or in flight. */
+  private spareCount(host: string): number {
+    const live = (this.spares.get(host) ?? []).filter((spare) => !spare.superseded).length;
+    return live + (this.opening.get(host) ?? 0);
+  }
+
+  /** Open a spare for `host` after `delayMs` (at once for 0); it becomes a spare unless a call claims it first. */
+  private openSpare(host: string, delayMs: number): void {
     this.opening.set(host, (this.opening.get(host) ?? 0) + 1);
-    const delayMs = Math.round(-Math.log(1 - this.deps.random()) * SPARE_DELAY_MEAN_MS);
-    this.later(delayMs, () => {
-      const deadlineAt = this.deps.now() + this.settings.tlsOpenTimeoutMs * MAX_OPEN_ATTEMPTS;
-      this.open(host, { deadlineAt, background: true }).then(
-        (channel) => this.keepSpare(host, channel),
-        (error: unknown) => this.deps.log.debug("tls.spare.failed", { reason: error instanceof Error ? error.name : "error" }),
-      ).finally(() => {
+    const start = (): void => {
+      const settled = (entry: PendingOpen): void => {
         const left = (this.opening.get(host) ?? 1) - 1;
         if (left <= 0) this.opening.delete(host);
         else this.opening.set(host, left);
-      });
-    });
+        const rest = (this.pending.get(host) ?? []).filter((candidate) => candidate !== entry);
+        if (rest.length === 0) this.pending.delete(host);
+        else this.pending.set(host, rest);
+      };
+      const startedAt = this.deps.now();
+      const deadlineAt = startedAt + this.settings.tlsOpenTimeoutMs * MAX_OPEN_ATTEMPTS;
+      // The handlers run after `entry` below is assigned: `open` settles asynchronously.
+      const promise: Promise<TlsChannel> = this.open(host, { deadlineAt, background: true }).then(
+        (channel) => {
+          settled(entry);
+          entry.channel = channel;
+          entry.readyAt = this.deps.now();
+          if (!entry.claimed) this.keepSpare(host, channel, entry.readyAt);
+          return channel;
+        },
+        (error: unknown) => {
+          settled(entry);
+          this.deps.log.debug("tls.spare.failed", { reason: error instanceof Error ? error.name : "error" });
+          throw error;
+        },
+      );
+      promise.catch(() => undefined);
+      const entry: PendingOpen = { startedAt, claimed: false, channel: undefined, readyAt: 0, promise };
+      const list = this.pending.get(host) ?? [];
+      list.push(entry);
+      this.pending.set(host, list);
+    };
+    if (delayMs <= 0) start();
+    else this.later(delayMs, start);
   }
 
-  private keepSpare(host: string, channel: TlsChannel): void {
+  private keepSpare(host: string, channel: TlsChannel, readyAt: number): void {
     if (this.closed) {
       this.teardown(channel);
       return;
     }
     const list = this.spares.get(host) ?? [];
-    const timer = this.later(this.settings.tlsSpareTtlMs, () => {
-      const current = this.spares.get(host);
-      const index = current?.findIndex((spare) => spare.channel === channel) ?? -1;
-      if (current === undefined || index < 0) return;
-      current.splice(index, 1);
-      if (current.length === 0) this.spares.delete(host);
-      this.teardown(channel);
-    });
-    list.push({ channel, timer });
+    const spare: Spare = { channel, readyAt, timers: [], superseded: false, refreshable: false };
+    const ttlMs = this.settings.tlsSpareTtlMs;
+    const ageMs = this.deps.now() - readyAt;
+    spare.timers.push(this.later(ttlMs - ageMs, () => this.expire(host, spare)));
+    const refreshMs = ttlMs - SPARE_REFILL_LEAD_MS - this.deps.random() * SPARE_REFILL_JITTER_MS - ageMs;
+    if (refreshMs > 0) {
+      spare.refreshable = true;
+      spare.timers.push(this.later(refreshMs, () => this.refresh(host, spare)));
+    }
+    list.push(spare);
     this.spares.delete(host);
     this.spares.set(host, list);
     while (this.spares.size > MAX_SPARE_HOSTS) {
       const [oldest, spares] = this.spares.entries().next().value as [string, Spare[]];
       this.spares.delete(oldest);
-      for (const spare of spares) {
-        clearTimeout(spare.timer);
-        this.timers.delete(spare.timer);
-        this.teardown(spare.channel);
+      for (const evicted of spares) {
+        this.clearSpareTimers(evicted);
+        this.teardown(evicted.channel);
       }
+    }
+  }
+
+  /** Before a spare's TTL: open its replacement at once while the host is recent. */
+  private refresh(host: string, spare: Spare): void {
+    if (this.closed || !this.background || !this.recentlyCalled(host)) return;
+    const list = this.spares.get(host);
+    if (list === undefined || !list.includes(spare)) return;
+    if (list.some((other) => other.superseded)) return;
+    spare.superseded = true;
+    this.openSpare(host, 0);
+  }
+
+  /**
+   * A spare's TTL: tear it down. A spare whose refresh could not run (another
+   * spare of the host was being replaced, or the replacement failed) is
+   * replaced at once while the host is recent, up to `tlsSpares`.
+   */
+  private expire(host: string, spare: Spare): void {
+    const current = this.spares.get(host);
+    const index = current?.indexOf(spare) ?? -1;
+    if (current === undefined || index < 0) return;
+    current.splice(index, 1);
+    if (current.length === 0) this.spares.delete(host);
+    this.clearSpareTimers(spare);
+    this.teardown(spare.channel);
+    if (!spare.refreshable || this.closed || !this.background || !this.recentlyCalled(host)) return;
+    if (this.spareCount(host) < this.settings.tlsSpares) this.openSpare(host, 0);
+  }
+
+  private clearSpareTimers(spare: Spare): void {
+    for (const timer of spare.timers) {
+      clearTimeout(timer);
+      this.timers.delete(timer);
     }
   }
 
@@ -352,7 +527,41 @@ export class TlsPool {
 
 /** p95 of `samples`, or 0 below `LATENCY_MIN_SAMPLES`. */
 function percentile95(samples: readonly number[]): number {
-  if (samples.length < LATENCY_MIN_SAMPLES) return 0;
+  return percentile(samples, 0.95, LATENCY_MIN_SAMPLES);
+}
+
+/** The `q` quantile (nearest rank) of `samples`, or 0 below `minSamples`. */
+function percentile(samples: readonly number[], q: number, minSamples: number): number {
+  if (samples.length < Math.max(1, minSamples)) return 0;
   const sorted = [...samples].sort((left, right) => left - right);
-  return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * 0.95) - 1)] ?? 0;
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * q) - 1))] ?? 0;
+}
+
+type Settled =
+  | { readonly kind: "opened"; readonly channel: TlsChannel }
+  | { readonly kind: "failed" }
+  | { readonly kind: "aborted"; readonly reason: unknown }
+  | { readonly kind: "deadline" };
+
+/** Whichever comes first: `open` settling, `signal` aborting, or `withinMs` passing. */
+function settleFirst(open: Promise<TlsChannel>, signal: AbortSignal | undefined, withinMs: number): Promise<Settled> {
+  return new Promise<Settled>((resolve) => {
+    if (signal?.aborted === true) {
+      resolve({ kind: "aborted", reason: signal.reason });
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => finish({ kind: "aborted", reason: signal?.reason });
+    const finish = (outcome: Settled): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(outcome);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(() => finish({ kind: "deadline" }), Math.max(0, withinMs));
+    open.then(
+      (channel) => finish({ kind: "opened", channel }),
+      () => finish({ kind: "failed" }),
+    );
+  });
 }

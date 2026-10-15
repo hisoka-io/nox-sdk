@@ -5,7 +5,16 @@ import type { PreparedRequest } from "../src/fetch-map.js";
 import { profileRequest } from "../src/jsonrpc.js";
 import { createLogger } from "../src/log.js";
 import { TlsChannel } from "../src/tls/channel.js";
-import { EXIT_SKIP_MS, NoTunnelExitError, SPARE_DELAY_MEAN_MS, TlsPool, type PoolSettings } from "../src/tls/pool.js";
+import {
+  EXIT_SKIP_MS,
+  NoTunnelExitError,
+  SPARE_DELAY_MEAN_MS,
+  SPARE_REFILL_JITTER_MS,
+  SPARE_REFILL_LEAD_MS,
+  SPARE_REFILL_WINDOW_MS,
+  TlsPool,
+  type PoolSettings,
+} from "../src/tls/pool.js";
 import { chooseTransport, mapTlsError, requestSurbs, TlsTransport } from "../src/tls/transport.js";
 import {
   Tunnel,
@@ -148,7 +157,7 @@ function answerOpens(port: FakeTunnelPort, answer: (copy: SentCopy) => void = (c
 }
 
 describe("TLS pool", () => {
-  it("opens spares only after the first call settled, after an exponential delay; a spare serves one call and expires unused", async () => {
+  it("opens spares only after the first call settled, after an exponential delay; a spare serves one call and is replaced before its TTL", async () => {
     const port = new FakeTunnelPort();
     answerOpens(port);
     const pool = new TlsPool(port, fakeTls(), POOL, { ...deps, random: () => 0.5, log });
@@ -170,11 +179,18 @@ describe("TLS pool", () => {
 
     await vi.advanceTimersByTimeAsync(delay);
     expect(port.sent).toHaveLength(3);
-    await vi.advanceTimersByTimeAsync(POOL.tlsSpareTtlMs);
-    const teardown = port.sent[3]!;
-    expect(teardown.request).toMatchObject({ seq: 1, close: true });
+    // The host is recent: the replacement opens at once, LEAD plus jitter before the TTL.
+    const refreshAt = POOL.tlsSpareTtlMs - SPARE_REFILL_LEAD_MS - 0.5 * SPARE_REFILL_JITTER_MS;
+    await vi.advanceTimersByTimeAsync(refreshAt - 1);
+    expect(port.sent).toHaveLength(3);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(port.sent[3]!.request).toMatchObject({ seq: 0, close: false });
+    expect(port.sent[3]!.options.background).toBe(true);
+    await vi.advanceTimersByTimeAsync(POOL.tlsSpareTtlMs - refreshAt);
+    const teardown = port.sent[4]!;
+    expect(teardown.request).toMatchObject({ seq: 1, close: true, tunnelId: port.sent[2]!.request.tunnelId });
     expect(teardown.options.surbs).toBe(0);
-    expect(port.sent).toHaveLength(4);
+    expect(port.sent).toHaveLength(5);
     pool.close();
   });
 
@@ -209,6 +225,182 @@ describe("TLS pool", () => {
 
     busy.exits = [];
     await expect(refused.acquire("rpc.example", { deadlineAt: Date.now() + 25_000 })).rejects.toBeInstanceOf(NoTunnelExitError);
+  });
+});
+
+/** Live sessions the pool holds: tunnels opened and not closed (every acquired session is released at once). */
+function liveTunnels(port: FakeTunnelPort): number {
+  const opened = new Set(port.sent.filter((copy) => copy.request.seq === 0 && !copy.request.close).map((copy) => copy.request.tunnelId));
+  for (const copy of port.sent) if (copy.request.close) opened.delete(copy.request.tunnelId);
+  return opened.size;
+}
+
+function opens(port: FakeTunnelPort): number {
+  return port.sent.filter((copy) => copy.request.seq === 0 && !copy.request.close).length;
+}
+
+describe("TLS spare refill", () => {
+  const SPARES: PoolSettings = { ...POOL, tlsSpares: CONFIG_DEFAULTS.tlsSpares, tlsSpareTtlMs: CONFIG_DEFAULTS.tlsSpareTtlMs };
+  const timing = () => ({ deadlineAt: Date.now() + 25_000 });
+
+  async function call(pool: TlsPool) {
+    const channel = await pool.acquire("rpc.example", timing());
+    const info = pool.acquireInfo(channel);
+    pool.release(channel, true);
+    return info;
+  }
+
+  it("never hands out a spare older than its TTL and never holds more than tlsSpares plus the one being replaced", async () => {
+    expect(SPARES).toMatchObject({ tlsSpares: 2, tlsSpareTtlMs: 12_000 });
+    const port = new FakeTunnelPort();
+    answerOpens(port);
+    let seed = 7;
+    const random = () => {
+      seed = (seed * 48_271) % 2_147_483_647;
+      return seed / 2_147_483_647;
+    };
+    const pool = new TlsPool(port, fakeTls(), SPARES, { ...deps, random, log });
+    await call(pool);
+    pool.enableBackground();
+    const gaps = [1_000, 300, 5_000, 11_000, 11_900, 12_100, 13_000, 15_000, 25_000, 30_000, 60_000, 130_000, 2_000, 15_000, 140_000, 900];
+    const paths: [number, string][] = [];
+    let maxLive = 0;
+    for (const gap of [...gaps, ...gaps]) {
+      for (let step = 0; step < gap; step += 100) {
+        await vi.advanceTimersByTimeAsync(Math.min(100, gap - step));
+        maxLive = Math.max(maxLive, liveTunnels(port));
+      }
+      const info = await call(pool);
+      paths.push([gap, info!.path]);
+      if (info!.path === "spare") expect(info!.spareAgeMs!).toBeLessThan(SPARES.tlsSpareTtlMs);
+    }
+    expect(maxLive).toBeLessThanOrEqual(SPARES.tlsSpares + 1);
+    // A recent host keeps a live spare across gaps longer than the TTL; past the window it has none.
+    for (const [gap, path] of paths) {
+      if (gap >= 5_000 && gap < SPARE_REFILL_WINDOW_MS) expect(path).toBe("spare");
+      if (gap > SPARE_REFILL_WINDOW_MS) expect(path).toBe("inline");
+    }
+    pool.close();
+  });
+
+  it("refills before expiry while the host was called within the window, then lets the spare expire unreplaced", async () => {
+    const port = new FakeTunnelPort();
+    answerOpens(port);
+    const pool = new TlsPool(port, fakeTls(), { ...SPARES, tlsSpares: 1 }, { ...deps, random: () => 0.5, log });
+    await call(pool);
+    pool.enableBackground();
+    const delay = Math.round(-Math.log(0.5) * SPARE_DELAY_MEAN_MS);
+    await vi.advanceTimersByTimeAsync(delay);
+    expect(opens(port)).toBe(2);
+    const lastCallAt = Date.now() - delay;
+    // About one refresh per (TTL - LEAD - jitter) while the host is recent, each before the old spare's TTL.
+    const period = SPARES.tlsSpareTtlMs - SPARE_REFILL_LEAD_MS - 0.5 * SPARE_REFILL_JITTER_MS;
+    for (let step = 0; Date.now() < lastCallAt + SPARE_REFILL_WINDOW_MS - 2 * period; step++) {
+      await vi.advanceTimersByTimeAsync(period);
+      expect(opens(port)).toBe(3 + step);
+      expect(liveTunnels(port)).toBeLessThanOrEqual(2);
+    }
+    await vi.advanceTimersByTimeAsync(2 * period + SPARE_REFILL_WINDOW_MS);
+    const settled = opens(port);
+    expect(liveTunnels(port)).toBe(0);
+    await vi.advanceTimersByTimeAsync(5 * SPARE_REFILL_WINDOW_MS);
+    expect(opens(port)).toBe(settled);
+    // The window passed: the next call opens inline, as before the refill existed.
+    expect(await call(pool)).toMatchObject({ path: "inline", spareAgeMs: undefined });
+    pool.close();
+  });
+
+  it("does not refill a spare whose TTL is too short for a refresh", async () => {
+    const port = new FakeTunnelPort();
+    answerOpens(port);
+    const pool = new TlsPool(port, fakeTls(), { ...SPARES, tlsSpares: 1, tlsSpareTtlMs: 1_000 }, { ...deps, random: () => 0.5, log });
+    await call(pool);
+    pool.enableBackground();
+    await vi.advanceTimersByTimeAsync(SPARE_REFILL_WINDOW_MS / 2);
+    expect(opens(port)).toBe(2);
+    expect(liveTunnels(port)).toBe(0);
+    pool.close();
+  });
+
+  it("waits for a spare open already halfway through its handshake, and opens its own when that open fails", async () => {
+    const port = new FakeTunnelPort();
+    const HANDSHAKE_MS = 800;
+    let refuse = false;
+    port.onSend = (copy) => {
+      if (copy.request.seq !== 0 || copy.request.close) return;
+      const refused = refuse && copy.options.background === true;
+      setTimeout(() => copy.reply(refused
+        ? { kind: "Rejected", seq: 0, code: "HostNotAllowed", retryable: false, detail: "" }
+        : data(0, 0, "FLIGHT")), HANDSHAKE_MS);
+    };
+    const pool = new TlsPool(port, fakeTls(), { ...SPARES, tlsSpares: 1 }, { ...deps, random: () => 0.5, log });
+    const first = pool.acquire("rpc.example", timing());
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_MS);
+    pool.release(await first, true);
+    pool.enableBackground();
+    const delay = Math.round(-Math.log(0.5) * SPARE_DELAY_MEAN_MS);
+
+    // 500 ms into an 800 ms median handshake: the call takes that open.
+    await vi.advanceTimersByTimeAsync(delay + 500);
+    expect(opens(port)).toBe(2);
+    const waited = pool.acquire("rpc.example", timing());
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_MS - 500);
+    const channel = await waited;
+    expect(channel.tunnel.id).toBe(port.sent.filter((copy) => copy.request.seq === 0).at(-1)!.request.tunnelId);
+    expect(pool.acquireInfo(channel)).toMatchObject({ path: "waited", openMs: HANDSHAKE_MS - 500 });
+    expect(opens(port)).toBe(2);
+    pool.release(channel, true);
+
+    // 100 ms in is too early: the call opens its own session.
+    await vi.advanceTimersByTimeAsync(delay + 100);
+    expect(opens(port)).toBe(3);
+    const early = pool.acquire("rpc.example", timing());
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_MS);
+    const own = await early;
+    expect(pool.acquireInfo(own)).toMatchObject({ path: "inline" });
+    expect(opens(port)).toBe(4);
+    pool.release(own, true);
+    pool.close();
+
+    // The awaited open fails: the call opens inline.
+    const failing = new TlsPool(port, fakeTls(), { ...SPARES, tlsSpares: 1 }, { ...deps, random: () => 0.5, log });
+    const seedCall = failing.acquire("rpc.example", timing());
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_MS);
+    failing.release(await seedCall, true);
+    refuse = true;
+    failing.enableBackground();
+    await vi.advanceTimersByTimeAsync(delay + 500);
+    const before = opens(port);
+    const fallback = failing.acquire("rpc.example", timing());
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_MS - 500 + HANDSHAKE_MS);
+    const inline = await fallback;
+    expect(failing.acquireInfo(inline)).toMatchObject({ path: "inline" });
+    expect(opens(port)).toBe(before + 1);
+    failing.release(inline, true);
+    failing.close();
+  });
+
+  it("keeps a waited open as a spare when the waiting call aborts", async () => {
+    const port = new FakeTunnelPort();
+    port.onSend = (copy) => {
+      if (copy.request.seq === 0 && !copy.request.close) setTimeout(() => copy.reply(data(0, 0, "FLIGHT")), 800);
+    };
+    const pool = new TlsPool(port, fakeTls(), { ...SPARES, tlsSpares: 1 }, { ...deps, random: () => 0.5, log });
+    const first = pool.acquire("rpc.example", timing());
+    await vi.advanceTimersByTimeAsync(800);
+    pool.release(await first, true);
+    pool.enableBackground();
+    await vi.advanceTimersByTimeAsync(Math.round(-Math.log(0.5) * SPARE_DELAY_MEAN_MS) + 500);
+    const controller = new AbortController();
+    const aborted = pool.acquire("rpc.example", { ...timing(), signal: controller.signal });
+    const rejection = expect(aborted).rejects.toBe("caller gave up");
+    controller.abort("caller gave up");
+    await rejection;
+    await vi.advanceTimersByTimeAsync(300);
+    const next = await pool.acquire("rpc.example", timing());
+    expect(pool.acquireInfo(next)).toMatchObject({ path: "spare" });
+    expect(opens(port)).toBe(2);
+    pool.close();
   });
 });
 
@@ -359,6 +551,44 @@ describe("tunnel transport", () => {
     };
     await expect(transport.exchange(write, budget())).rejects.toMatchObject({ code: "protocol-error" });
     expect(port.sent.filter((copy) => copy.request.seq === 0)).toHaveLength(6);
+    pool.close();
+  });
+
+  it("logs one tls.call line per hop with the session path, handshake wait and exchange time", async () => {
+    const lines: { event: string; fields: Record<string, unknown> }[] = [];
+    const api = {
+      debug: () => undefined,
+      info: (_source: unknown, event: unknown, fields: unknown) => lines.push({ event: String(event), fields: fields as Record<string, unknown> }),
+      warn: () => undefined,
+      error: () => undefined,
+    };
+    const traced = createLogger(api, "info");
+    const port = new FakeTunnelPort();
+    let refusals = 1;
+    port.onSend = (copy) => {
+      setTimeout(() => {
+        if (copy.request.seq === 0) copy.reply(data(0, 0, "FLIGHT"));
+        else if (copy.request.close) return;
+        else if (refusals-- > 0) copy.reply({ kind: "Rejected", seq: 1, code: "UpstreamClosed", retryable: false, detail: "upstream closed" });
+        else copy.reply(data(1, 6, "okEND"));
+      }, 300);
+    };
+    const tls = fakeTls();
+    const pool = new TlsPool(port, tls, POOL, { ...deps, random: () => 0, log: traced });
+    const transport = new TlsTransport(pool, tls, CONFIG_DEFAULTS, traced, deps.now);
+    const read = prepared("https://rpc.example/", '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}');
+    const retried = transport.exchange(read, budget());
+    await vi.advanceTimersByTimeAsync(4 * 300);
+    await retried;
+    const pending = transport.exchange(read, budget());
+    await vi.advanceTimersByTimeAsync(2 * 300);
+    await pending;
+    const calls = lines.filter((line) => line.event === "tls.call").map((line) => line.fields);
+    expect(lines.filter((line) => line.event === "tls.retry")).toHaveLength(1);
+    expect(calls).toEqual([
+      { path: "retry", openMs: 300, exchangeMs: 300, retries: 1, ok: true },
+      { path: "inline", openMs: 300, exchangeMs: 300, retries: 0, ok: true },
+    ]);
     pool.close();
   });
 

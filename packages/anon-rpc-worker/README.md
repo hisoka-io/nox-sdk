@@ -55,8 +55,8 @@ optional, and every config valid for 0.1.0 stays valid:
 | `warmup` | boolean | false | one echo through a full route before ready |
 | `tls` | `"required"`, `"preferred"`, `"off"` | `"required"` | end-to-end TLS, see [End-to-end TLS](#end-to-end-tls) |
 | `tlsSession` | `"per-call"`, `"keep-alive"` | `"per-call"` | one TLS session per call, or sessions shared by the calls to one host |
-| `tlsSpares` | integer | 1 | 0-4 handshaken spare sessions per recently used host (per-call mode) |
-| `tlsSpareTtlMs` | integer | 20,000 | 1,000-50,000; an unused spare is closed after this long |
+| `tlsSpares` | integer | 2 | 0-4 handshaken spare sessions per recently used host (per-call mode; 1 in 0.4.0) |
+| `tlsSpareTtlMs` | integer | 12,000 | 1,000-50,000; an unused spare is closed this long after its handshake (20,000 in 0.4.0) |
 | `tlsKeepAliveMs` | integer | 30,000 | 1,000-50,000; how long a keep-alive session serves calls after it opened |
 | `tlsMaxCallsPerSession` | integer | 100 | 1-1,000 calls per keep-alive session |
 | `tlsOpenTimeoutMs` | integer | 5,000 | 1,000-30,000; an exit that does not answer a tunnel open in this long is skipped for 10 minutes |
@@ -114,7 +114,9 @@ Session modes:
 - `"per-call"` (default): every call has its own TLS session and `Connection: close`; no resumption, no 0-RTT, a
   fresh key share each time. `tlsSpares` keeps handshaken, unused sessions for hosts the wallet called, opened in
   the background (only after the first wallet call settled) on a random tunnel exit after an exponential delay
-  (mean 2 s), each serving one call. Each call travels in its own session; at low traffic the timing of a spare's
+  (mean 2 s), each serving one call. While a host was called in the last 2 minutes, a spare's replacement opens at
+  once 1.5-2 s before its TTL, so a spare is ready across idle gaps; after that an expired spare is not replaced. A
+  call that finds no spare while a spare's handshake is halfway done waits for it. Each call travels in its own session; at low traffic the timing of a spare's
   open can still chain sequential calls of one wallet to one host, which weakens as traffic grows.
 - `"keep-alive"`: calls to one host share a session on one exit for `tlsKeepAliveMs`, up to 4 sessions per host.
   The exit links the calls of a session, and the provider sees them on one TLS connection.
@@ -144,7 +146,8 @@ a hybrid post-quantum key exchange (X25519MLKEM768).
 Errors: `permission-denied` (the exit refuses the destination), `network-error` (no tunnel exit, a certificate
 failure, the exit cannot reach the provider), `protocol-error` (TLS or HTTP checks failed, a truncated response),
 `too-large`, `timeout`. Log events: `boot.tls`, `tls.open` (debug: handshake time and CPU), `tls.fallback{reason}`,
-`tls.reject{code}`, `tls.exit.skipped`, `tls.retry`; none carries bytes or a host name.
+`tls.reject{code}`, `tls.exit.skipped`, `tls.retry`, `tls.call{path, openMs, spareAgeMs, exchangeMs, retries, ok}`; none
+carries bytes or a host name.
 
 ## Discovery (identity from chain, location at run time)
 
