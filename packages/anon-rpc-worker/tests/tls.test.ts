@@ -7,6 +7,7 @@ import { createLogger } from "../src/log.js";
 import { TlsChannel } from "../src/tls/channel.js";
 import {
   EXIT_SKIP_MS,
+  LATENCY_MIN_SAMPLES,
   NoTunnelExitError,
   SPARE_DELAY_MEAN_MS,
   SPARE_REFILL_JITTER_MS,
@@ -400,6 +401,38 @@ describe("TLS spare refill", () => {
     const next = await pool.acquire("rpc.example", timing());
     expect(pool.acquireInfo(next)).toMatchObject({ path: "spare" });
     expect(opens(port)).toBe(2);
+    pool.close();
+  });
+
+  it("does not wait for a spare open that has run past the handshake p95; that open stays a spare", async () => {
+    const port = new FakeTunnelPort();
+    const HANDSHAKE_MS = 800;
+    const STUCK_MS = 4_000;
+    port.onSend = (copy) => {
+      if (copy.request.seq !== 0 || copy.request.close) return;
+      setTimeout(() => copy.reply(data(0, 0, "FLIGHT")), copy.options.background === true ? STUCK_MS : HANDSHAKE_MS);
+    };
+    const pool = new TlsPool(port, fakeTls(), { ...SPARES, tlsSpares: 1 }, { ...deps, random: () => 0.5, log });
+    // Enough inline handshakes for a p95 (800 ms) before background work starts.
+    for (let index = 0; index < LATENCY_MIN_SAMPLES; index++) {
+      const pending = pool.acquire("rpc.example", timing());
+      await vi.advanceTimersByTimeAsync(HANDSHAKE_MS);
+      pool.release(await pending, true);
+    }
+    pool.enableBackground();
+    const delay = Math.round(-Math.log(0.5) * SPARE_DELAY_MEAN_MS);
+    await vi.advanceTimersByTimeAsync(delay + 2 * HANDSHAKE_MS);
+    const before = opens(port);
+    const call = pool.acquire("rpc.example", timing());
+    await vi.advanceTimersByTimeAsync(HANDSHAKE_MS);
+    const own = await call;
+    expect(pool.acquireInfo(own)).toMatchObject({ path: "inline", openMs: HANDSHAKE_MS });
+    expect(opens(port)).toBe(before + 1);
+    pool.release(own, true);
+    // The slow open lands and serves the next call as a spare.
+    await vi.advanceTimersByTimeAsync(STUCK_MS - 3 * HANDSHAKE_MS);
+    const next = await pool.acquire("rpc.example", timing());
+    expect(pool.acquireInfo(next)).toMatchObject({ path: "spare" });
     pool.close();
   });
 });

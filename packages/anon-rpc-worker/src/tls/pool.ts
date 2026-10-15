@@ -20,8 +20,9 @@
  *   `tlsSpares` spares plus the one being replaced); after the window an
  *   expired spare is not replaced. Hosts live in memory only.
  * - A call that finds no spare while a spare's open for its host has run for
- *   at least half the handshake median waits for that open instead of
- *   starting another, and opens its own session when that open fails.
+ *   at least half the handshake median (and at most its p95) waits for that
+ *   open instead of starting another, and opens its own session when that
+ *   open fails.
  * - Keep-alive: up to `MAX_KEEP_ALIVE_SESSIONS` sessions per host, each
  *   reused for `tlsKeepAliveMs` from its open or `tlsMaxCallsPerSession`
  *   calls; a call beyond that runs on a session of its own.
@@ -363,10 +364,19 @@ export class TlsPool {
     return at !== undefined && this.deps.now() - at < SPARE_REFILL_WINDOW_MS;
   }
 
-  /** The oldest unclaimed spare open for `host` that started at least half the handshake median ago. */
+  /**
+   * The oldest unclaimed spare open for `host` that started at least half the
+   * handshake median ago and no longer ago than the handshake p95 (once there
+   * are `LATENCY_MIN_SAMPLES`): an open past the p95 is likely stuck on a slow
+   * exit, so the call opens its own and that open stays a spare if it lands.
+   */
   private waitableOpen(host: string, now: number): PendingOpen | undefined {
     const minAgeMs = percentile(this.samples, 0.5, 1) / 2;
-    return this.pending.get(host)?.find((entry) => !entry.claimed && now - entry.startedAt >= minAgeMs);
+    const maxAgeMs = percentile95(this.samples) || Number.POSITIVE_INFINITY;
+    return this.pending.get(host)?.find((entry) => {
+      const ageMs = now - entry.startedAt;
+      return !entry.claimed && ageMs >= minAgeMs && ageMs <= maxAgeMs;
+    });
   }
 
   /**

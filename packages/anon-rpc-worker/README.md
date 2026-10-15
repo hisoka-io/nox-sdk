@@ -116,8 +116,10 @@ Session modes:
   the background (only after the first wallet call settled) on a random tunnel exit after an exponential delay
   (mean 2 s), each serving one call. While a host was called in the last 2 minutes, a spare's replacement opens at
   once 1.5-2 s before its TTL, so a spare is ready across idle gaps; after that an expired spare is not replaced. A
-  call that finds no spare while a spare's handshake is halfway done waits for it. Each call travels in its own session; at low traffic the timing of a spare's
-  open can still chain sequential calls of one wallet to one host, which weakens as traffic grows.
+  call that finds no spare while a spare's handshake is halfway done waits for it. Each call travels in its own
+  session; at low traffic the timing of a spare's open can still chain sequential calls of one wallet to one host,
+  which weakens as traffic grows. The refresh opens each replacement about 10-10.5 s after the spare it replaces,
+  so that chain can span calls up to 2 minutes apart; `tlsSpares: 0` turns spares and refreshes off.
 - `"keep-alive"`: calls to one host share a session on one exit for `tlsKeepAliveMs`, up to 4 sessions per host.
   The exit links the calls of a session, and the provider sees them on one TLS connection.
 
