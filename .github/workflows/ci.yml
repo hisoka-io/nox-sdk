@@ -159,7 +159,10 @@ jobs:
         run: pnpm --filter @hisoka-io/anon-rpc-specifier --fail-if-no-match test
 
   # --------------------------------------------------------------------------
-  # Rust WASM build — wasm-pack build --target bundler
+  # nox-wasm (bundler and web targets, wasm tests in Node, native tests) and
+  # nox-tls, built with the pinned toolchain of scripts/toolchain.env: the
+  # Rust release, and wasm-pack, wasm-bindgen and binaryen checked against
+  # their recorded digests.
   # --------------------------------------------------------------------------
   wasm:
     name: WASM build
@@ -171,18 +174,34 @@ jobs:
         with:
           path: nox-sdk
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Install the pinned Rust toolchain and WASM tools
+        working-directory: nox-sdk
+        run: |
+          source packages/anon-rpc-worker/scripts/toolchain.env
+          source packages/anon-rpc-worker/scripts/lib/pinned-tools.sh
+          fail() { echo "$*" >&2; exit 1; }
+          arch=x86_64
+          tools="$RUNNER_TEMP/nox-tools"
+          fetch_tools "$tools"
+          install -m 0755 "$tools/wasm-bindgen-${WASM_BINDGEN_VERSION}-${arch}-unknown-linux-musl/wasm-bindgen-test-runner" "$tools/bin/wasm-bindgen-test-runner"
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_TOOLCHAIN"
+          echo "$tools/bin" >> "$GITHUB_PATH"
+          echo "$tools/binaryen/bin" >> "$GITHUB_PATH"
+
+      - name: Check tool versions
+        working-directory: nox-sdk
+        run: |
+          source packages/anon-rpc-worker/scripts/toolchain.env
+          test "$(rustc --version | awk '{print $2}')" = "$RUST_TOOLCHAIN"
+          test "$(wasm-pack --version | awk '{print $2}')" = "$WASM_PACK_VERSION"
+          test "$(wasm-bindgen --version | awk '{print $2}')" = "$WASM_BINDGEN_VERSION"
+          test "$(wasm-opt --version | awk '{print $3}')" = "$BINARYEN_VERSION"
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: nox-sdk
-
-      - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
 
       - name: Build WASM (bundler target)
         working-directory: nox-sdk/packages/nox-wasm
@@ -195,6 +214,10 @@ jobs:
       - name: Run WASM tests (Node)
         working-directory: nox-sdk/packages/nox-wasm
         run: wasm-pack test --node -- --release --locked
+
+      - name: Run nox-wasm native tests
+        working-directory: nox-sdk
+        run: cargo test -p nox-wasm --locked
 
       - name: Test nox-tls (TLS client, native loopback against rustls)
         working-directory: nox-sdk
