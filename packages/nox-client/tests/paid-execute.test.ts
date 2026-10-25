@@ -11,13 +11,19 @@ import {
   zeroPadValue,
 } from "ethers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  decodeServiceRequest,
+  encodePaidQuoteOutcomeV2,
+  encodePaidTransactionOutcomeV2,
+} from "../src/bincode.js";
 import type {
   ExecutionQuoteV1,
   PaidQuoteRequestV2,
   PaidTransactionOutcomeV2,
   PaidTransactionRejectionCodeV2,
+  RelayerPayload,
 } from "../src/bincode.js";
-import { NoxClient } from "../src/client.js";
+import { AdaptiveSurbBudget, NoxClient } from "../src/client.js";
 import { hashExecutionQuoteV1, quoteTypedData } from "../src/paid.js";
 import type { IssuedPaidQuoteV2, PaidQuoteResultV2 } from "../src/paid.js";
 import {
@@ -420,11 +426,35 @@ describe("paid gas plan", () => {
     });
     expect(plan).toEqual({
       boundedGas: 3_250_000n,
-      envelopeGas: 621_000n,
-      // ceil(3,871,000 * 1.2 * 1.05)
-      maximumTransactionGas: 4_877_460n,
+      // 21,000 + 480,000 + 120,000 * 1.5
+      envelopeGas: 681_000n,
+      // ceil(3,931,000 * 1.2 * 1.05)
+      maximumTransactionGas: 4_953_060n,
     });
     expect(plan.maximumTransactionGas).toBeLessThan(12_000_000n);
+  });
+
+  it("puts the data fee headroom on the data fee alone", () => {
+    const input = { paymentGasLimit: 1_000_000n, actionGasLimit: 1_000_000n, calldataGas: 100_000n };
+    const noFee = planPaidGas(input);
+    expect(planPaidGas({ ...input, dataFeeGas: 0n, dataFeeHeadroomBps: 9_000 })).toEqual(noFee);
+    expect(planPaidGas({ ...input, dataFeeGas: 200_000n }).envelopeGas).toBe(noFee.envelopeGas + 300_000n);
+    expect(planPaidGas({ ...input, dataFeeGas: 200_000n, dataFeeHeadroomBps: 0 }).envelopeGas).toBe(
+      noFee.envelopeGas + 200_000n,
+    );
+    expect(() => planPaidGas({ ...input, dataFeeHeadroomBps: -1 })).toThrow("dataFeeHeadroomBps");
+  });
+
+  it("keeps the exit's live estimate of 2026-10-13 under the default cap", () => {
+    // Arbitrum Sepolia dry run on exit nox-7: limits 1,955,800 + 1,914,000, data fee 0,
+    // cap 5,593,014, exit eth_estimateGas 4,456,946.
+    const live = { paymentGasLimit: 1_955_800n, actionGasLimit: 1_914_000n, calldataGas: 298_100n };
+    const cap = planPaidGas(live).maximumTransactionGas;
+    expect(cap).toBe(5_593_014n);
+    const exitLimit = (4_456_946n * 12_000n + 9_999n) / 10_000n;
+    expect(exitLimit).toBe(5_348_336n);
+    // At least 3% of the cap stays unused.
+    expect((cap - exitLimit) * 10_000n).toBeGreaterThan(cap * 300n);
   });
 
   it("rounds up and honours explicit buffers", () => {
@@ -1192,5 +1222,192 @@ describe("selectPaidExit exclusion", () => {
     expect(() =>
       detached.selectPaidExit({ exclude: [`0x${"0".repeat(39)}a`, kept] }),
     ).toThrow(expect.objectContaining({ code: NoxClientErrorCode.PaidExitUnavailable }));
+  });
+});
+
+describe("executePaid through NoxClient with two paid exits", () => {
+  /** What the first exit contacted does; the other exit always quotes and settles. */
+  type FirstExit = { quote: "reject" | "issue"; submit?: "settle" | "GasCapExceeded" };
+
+  /**
+   * A verified NoxClient over a topology with one entry, one mix and two paid
+   * exits. The mixnet send is replaced by the two exits: each decodes the
+   * bincode service request it receives, answers in bincode, signs its quotes
+   * with its own key and settles on `chain`. Exit selection (random between the
+   * two), exclusion, quote signature and route checks, and the request
+   * encodings are the client's own.
+   */
+  function twoExitMesh(chain: FakeChain, firstExit: FirstExit) {
+    const wallets = EXIT_KEYS.slice(0, 2).map((key) => new Wallet(key));
+    const node = (id: string, layer: number, role: number, capabilities: string[]): TopologyNode => ({
+      id,
+      address: layer === 0 ? "https://entry.test" : "",
+      routingAddress: `/n/${id}`,
+      publicKey: new Uint8Array(32),
+      layer,
+      role,
+      capabilities,
+    });
+    const exits = wallets.map((wallet) => node(wallet.address.toLowerCase(), 2, 2, ["paid_v2"]));
+    const client = Object.create(NoxClient.prototype) as NoxClient;
+    Reflect.set(client, "_nodes", [
+      node(`0x${"e1".repeat(20)}`, 0, 1, []),
+      node(`0x${"e2".repeat(20)}`, 1, 1, []),
+      ...exits,
+    ]);
+    Reflect.set(client, "_entryUrl", "https://entry.test");
+    Reflect.set(client, "_avoidUntil", new Map());
+    Reflect.set(client, "_topologyVerifiedAtMs", nowMs);
+    Reflect.set(client, "_config", { dangerouslySkipFingerprintCheck: false, topologyRefreshMs: 60_000 });
+    Reflect.set(client, "adaptive", new AdaptiveSurbBudget());
+    Reflect.set(client, "_paidChainTimestamp", async () => chain.timestamp);
+
+    const sent: { exit: string; tag: string }[] = [];
+    const quotedCaps: bigint[] = [];
+    let nonce = 0n;
+    Reflect.set(
+      client,
+      "_sendWithRetry",
+      async (payload: RelayerPayload, _surbs: number, _timeout: unknown, selectedExit?: TopologyNode) => {
+        if (payload.tag !== "AnonymousRequest" || selectedExit === undefined) {
+          throw new Error("paid requests go to a selected exit");
+        }
+        const index = exits.findIndex((exit) => exit.id === selectedExit.id);
+        const wallet = wallets[index]!;
+        const isFirst = sent.length === 0 || sent[0]!.exit === selectedExit.id;
+        const script: FirstExit = isFirst ? firstExit : { quote: "issue" };
+        const request = decodeServiceRequest(payload.inner);
+        sent.push({ exit: selectedExit.id, tag: request.tag });
+        if (request.tag === "PaidQuoteRequestV2") {
+          quotedCaps.push(request.maximumTransactionGas);
+          if (script.quote === "reject") {
+            const response = encodePaidQuoteOutcomeV2({
+              status: "rejected",
+              code: "Unprofitable",
+              retryable: true,
+              detail: "fee below the exit's floor",
+            });
+            return { response, exit: selectedExit };
+          }
+          nonce += 1n;
+          const validUntil = chain.timestamp + QUOTE_TTL;
+          const quote: ExecutionQuoteV1 = {
+            quoteVersion: 1,
+            chainId: word(request.chainId),
+            entryPoint: request.entryPoint,
+            exitAddress: getBytes(wallet.address),
+            clientIntentId: request.clientIntentId,
+            paymentAdapter: request.paymentAdapter,
+            paymentId: request.paymentId,
+            feeAsset: request.feeAsset,
+            exitFee: word(EXIT_FEE),
+            networkFee: word(NETWORK_FEE),
+            paymentGasLimit: word(request.paymentGasLimit),
+            actionTarget: request.actionTarget,
+            actionCalldataHash: request.actionCalldataHash,
+            actionGasLimit: word(request.actionGasLimit),
+            trackedAssetsHash: request.trackedAssetsHash,
+            maximumTransactionGas: word(request.maximumTransactionGas),
+            maximumFeePerGas: word(100_000_000n),
+            returnDataLimit: word(BigInt(request.returnDataLimit)),
+            validAfterUnix: chain.timestamp,
+            validUntilUnix: validUntil < request.validUntilUnix ? validUntil : request.validUntilUnix,
+            quoteNonce: word(nonce),
+          };
+          const typed = quoteTypedData(quote);
+          const response = encodePaidQuoteOutcomeV2({
+            status: "issued",
+            quote,
+            executionId: getBytes(hashExecutionQuoteV1(quote)),
+            exitSignature: getBytes(await wallet.signTypedData(typed.domain, typed.types, typed.value)),
+          });
+          return { response, exit: selectedExit };
+        }
+        if (request.tag === "PaidTransactionV2") {
+          if (script.submit === "GasCapExceeded") {
+            const response = encodePaidTransactionOutcomeV2({
+              status: "rejected",
+              executionId: request.executionId,
+              code: "GasCapExceeded",
+              retryable: true,
+              detail: "estimate above the quoted cap",
+            });
+            return { response, exit: selectedExit };
+          }
+          const hash = keccak256(request.calldata);
+          chain.settle(request.calldata, true, hash);
+          const response = encodePaidTransactionOutcomeV2({
+            status: "submitted",
+            executionId: request.executionId,
+            transactionHash: getBytes(hash),
+          });
+          return { response, exit: selectedExit };
+        }
+        throw new Error(`unexpected service request ${request.tag}`);
+      },
+    );
+    return { client, wallets, exits, sent, quotedCaps };
+  }
+
+  function meshOptions(chain: FakeChain): ExecutePaidOptions {
+    return {
+      chainId: CHAIN_ID,
+      entryPoint: ENTRY_POINT,
+      action: ACTION,
+      payment: paymentSource().source,
+      maxTotalFee: 1_000n,
+      intentSalt: SALT,
+      chain,
+      preflight: chain,
+      pollIntervalMs: 0,
+    };
+  }
+
+  it("settles through the second exit after the first refuses the quote", async () => {
+    // selectPaidExit draws at random; repeat so both exits take each part.
+    const firstSeen = new Set<string>();
+    for (let run = 0; run < 12; run++) {
+      const chain = new FakeChain();
+      const { client, wallets, exits, sent } = twoExitMesh(chain, { quote: "reject" });
+      const result = await executePaid(client, meshOptions(chain));
+      const first = exits.findIndex((exit) => exit.id === sent[0]!.exit);
+      const paying = 1 - first;
+      firstSeen.add(sent[0]!.exit);
+      expect(result).toMatchObject({ status: "settled", exit: wallets[paying]!.address });
+      expect(sent).toEqual([
+        { exit: exits[first]!.id, tag: "PaidQuoteRequestV2" },
+        { exit: exits[paying]!.id, tag: "PaidQuoteRequestV2" },
+        { exit: exits[paying]!.id, tag: "PaidTransactionV2" },
+      ]);
+      expect(chain.logs).toHaveLength(1);
+      expect(chain.logs[0]!.exit.toLowerCase()).toBe(exits[paying]!.id);
+    }
+    expect(firstSeen.size).toBe(2);
+  });
+
+  it("re-quotes on the second exit with a raised buffer after GasCapExceeded, under the same intent", async () => {
+    const chain = new FakeChain();
+    const { client, wallets, exits, sent, quotedCaps } = twoExitMesh(chain, {
+      quote: "issue",
+      submit: "GasCapExceeded",
+    });
+    const result = await executePaid(client, meshOptions(chain));
+    const first = exits.findIndex((exit) => exit.id === sent[0]!.exit);
+    const second = 1 - first;
+    expect(result).toMatchObject({ status: "settled", exit: wallets[second]!.address });
+    expect(sent.map(({ exit, tag }) => [exits.findIndex((e) => e.id === exit), tag])).toEqual([
+      [first, "PaidQuoteRequestV2"],
+      [first, "PaidTransactionV2"],
+      [second, "PaidQuoteRequestV2"],
+      [second, "PaidTransactionV2"],
+    ]);
+    const calldataGas = paidExecuteCalldata(ACTION_DATA, 0, 64).gas;
+    const limits = { paymentGasLimit: 1_400_000n, actionGasLimit: 1_600_000n, calldataGas };
+    expect(quotedCaps).toEqual([
+      planPaidGas(limits).maximumTransactionGas,
+      planPaidGas({ ...limits, exitGasBufferBps: 3_000 }).maximumTransactionGas,
+    ]);
+    expect(chain.logs).toHaveLength(1);
+    expect(chain.intents.size).toBe(1);
   });
 });

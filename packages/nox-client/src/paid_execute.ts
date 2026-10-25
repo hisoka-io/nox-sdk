@@ -87,8 +87,19 @@ const SIGNATURE_BYTES = 65;
 export const PAID_EXECUTE_DEFAULTS = {
   /** Buffer the exit adds to its own gas estimate (`gas_limit_buffer_bps` in the exit config). */
   exitGasBufferBps: 2_000,
-  /** Room on top of the planned cap for data-fee movement between the plan and the exit's estimate. */
+  /**
+   * Room on top of the planned cap for the gap between the plan and the exit's
+   * `eth_estimateGas`. Live on Arbitrum Sepolia (2026-10-13) the estimate came
+   * 0.41% above the plan (0.16% below on a fork), which left 4.4% of the cap
+   * unused, above the 3% floor the live runs stop at.
+   */
   capHeadroomBps: 500,
+  /**
+   * Extra room on the data fee alone, for its movement between the plan and the
+   * exit's estimate (5000 lets it rise by half). Adds nothing where the chain
+   * reports no data fee.
+   */
+  dataFeeHeadroomBps: 5_000,
   /** Multiplier, in basis points, applied to an estimated action gas limit (15000 is 1.5x). */
   actionMarginBps: 15_000,
   /** Added to `exitGasBufferBps` after an exit answers a submission with `GasCapExceeded`. */
@@ -199,6 +210,7 @@ export type PaidPreflightReader = Pick<PaidChainReader, "call" | "estimateGas">;
 export interface PaidGasOptions {
   readonly exitGasBufferBps?: number;
   readonly capHeadroomBps?: number;
+  readonly dataFeeHeadroomBps?: number;
   readonly actionMarginBps?: number;
   /** Upper clamp on the planned `maximumTransactionGas`. */
   readonly maximumTransactionGas?: bigint;
@@ -310,13 +322,14 @@ export interface PaidGasPlanInput {
   readonly dataFeeGas?: bigint;
   readonly exitGasBufferBps?: number;
   readonly capHeadroomBps?: number;
+  readonly dataFeeHeadroomBps?: number;
   readonly maximumTransactionGas?: bigint;
 }
 
 export interface PaidGasPlan {
   /** `paymentGasLimit + actionGasLimit + 250000`, the gas the EntryPoint requires at validation. */
   readonly boundedGas: bigint;
-  /** Base transaction gas, calldata gas and the data fee. */
+  /** Base transaction gas, calldata gas and the data fee with its headroom. */
   readonly envelopeGas: bigint;
   readonly maximumTransactionGas: bigint;
 }
@@ -377,8 +390,9 @@ export function paidExecuteCalldata(
 
 /**
  * The tightest `maximumTransactionGas` an exit accepts for the given limits:
- * what the EntryPoint requires, plus the transaction envelope, plus the exit's
- * own estimate buffer and a small headroom.
+ * what the EntryPoint requires, plus the transaction envelope (the data fee
+ * with `dataFeeHeadroomBps`), plus the exit's own estimate buffer and
+ * `capHeadroomBps`.
  */
 export function planPaidGas(input: PaidGasPlanInput): PaidGasPlan {
   const exitGasBufferBps = bps(
@@ -388,6 +402,10 @@ export function planPaidGas(input: PaidGasPlanInput): PaidGasPlan {
   const capHeadroomBps = bps(
     input.capHeadroomBps ?? PAID_EXECUTE_DEFAULTS.capHeadroomBps,
     "capHeadroomBps",
+  );
+  const dataFeeHeadroomBps = bps(
+    input.dataFeeHeadroomBps ?? PAID_EXECUTE_DEFAULTS.dataFeeHeadroomBps,
+    "dataFeeHeadroomBps",
   );
   for (const [value, field] of [
     [input.paymentGasLimit, "paymentGasLimit"],
@@ -400,7 +418,8 @@ export function planPaidGas(input: PaidGasPlanInput): PaidGasPlan {
     throw invalid("calldataGas and dataFeeGas must not be negative");
   }
   const boundedGas = input.paymentGasLimit + input.actionGasLimit + ENTRY_POINT_GAS_RESERVE;
-  const envelopeGas = TRANSACTION_BASE_GAS + input.calldataGas + dataFeeGas;
+  const envelopeGas =
+    TRANSACTION_BASE_GAS + input.calldataGas + ceilDiv(dataFeeGas * (BPS + dataFeeHeadroomBps), BPS);
   let maximumTransactionGas = ceilDiv(
     (boundedGas + envelopeGas) * (BPS + exitGasBufferBps) * (BPS + capHeadroomBps),
     BPS * BPS,
@@ -658,6 +677,7 @@ async function attemptPaid(
         dataFeeGas,
         exitGasBufferBps,
         capHeadroomBps: settings.capHeadroomBps,
+        dataFeeHeadroomBps: settings.dataFeeHeadroomBps,
         ...(settings.maximumTransactionGas === undefined
           ? {}
           : { maximumTransactionGas: settings.maximumTransactionGas }),
@@ -921,6 +941,7 @@ interface Settings {
   readonly returnDataLimit: number;
   readonly exitGasBufferBps: number;
   readonly capHeadroomBps: number;
+  readonly dataFeeHeadroomBps: number;
   readonly actionMarginBps: number;
   readonly maximumTransactionGas: bigint | undefined;
   readonly minSubmitHeadroomSecs: number;
@@ -988,8 +1009,10 @@ function resolveSettings(options: ExecutePaidOptions): Settings {
   }
   const exitGasBufferBps = gas?.exitGasBufferBps ?? PAID_EXECUTE_DEFAULTS.exitGasBufferBps;
   const capHeadroomBps = gas?.capHeadroomBps ?? PAID_EXECUTE_DEFAULTS.capHeadroomBps;
+  const dataFeeHeadroomBps = gas?.dataFeeHeadroomBps ?? PAID_EXECUTE_DEFAULTS.dataFeeHeadroomBps;
   bps(exitGasBufferBps, "gas.exitGasBufferBps");
   bps(capHeadroomBps, "gas.capHeadroomBps");
+  bps(dataFeeHeadroomBps, "gas.dataFeeHeadroomBps");
   return {
     entryPoint,
     target,
@@ -1004,6 +1027,7 @@ function resolveSettings(options: ExecutePaidOptions): Settings {
     returnDataLimit: action.returnDataLimit ?? PAID_EXECUTE_DEFAULTS.returnDataLimit,
     exitGasBufferBps,
     capHeadroomBps,
+    dataFeeHeadroomBps,
     actionMarginBps,
     maximumTransactionGas: gas?.maximumTransactionGas,
     minSubmitHeadroomSecs: nonNegativeInteger(

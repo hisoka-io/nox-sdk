@@ -98,8 +98,9 @@ switch (result.status) {
 **Gas cap and fee.** The exit prices its fee on `maximumTransactionGas`, so the helper requests the smallest
 cap an exit accepts for the declared limits: `paymentGasLimit + actionGasLimit + 250000` (what
 `NoxEntryPoint` requires), plus the transaction envelope (base gas, calldata gas and, on rollups, the data
-fee from `dataFeeGas`), plus the exit's own 20% estimate buffer and 5% headroom. Declare tight limits to get
-a low fee: `payment.gasLimit` comes from the payment source and `action.gasLimit` from the caller.
+fee from `dataFeeGas` with 50% headroom for its movement before the exit estimates), plus the exit's own 20%
+estimate buffer and 5% headroom. Declare tight limits to get a low fee: `payment.gasLimit` comes from the
+payment source and `action.gasLimit` from the caller.
 `planPaidGas` exposes the same arithmetic, and `gas` overrides each margin. On Arbitrum One and Arbitrum
 Sepolia the data fee is read from `NodeInterface` automatically (`arbitrumDataFeeGas`); a reader with its own
 `dataFeeGas` takes precedence.

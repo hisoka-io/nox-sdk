@@ -24,6 +24,7 @@ Operations included:
 | `decrypt_surb_response` | Decrypt a SURB encrypted response body |
 | `verify_pow` | Verify proof of work on incoming packets |
 | `compute_pow` | Compute proof of work for outgoing packets |
+| `topology_fingerprint` | XOR of keccak256 over node addresses, equal to NoxRegistry `topologyFingerprint()` |
 
 All X25519 key exchange, Lioness wide block cipher, HMAC SHA256, and ChaCha20 operations happen inside WASM for performance and correctness (the Rust implementation is shared with the NOX relay nodes).
 

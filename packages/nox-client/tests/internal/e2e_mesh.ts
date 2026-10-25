@@ -165,16 +165,6 @@ function responseContains(response: Uint8Array, needle: string): boolean {
 async function runEchoTests(client: NoxClient): Promise<void> {
   log("\n=== Category 1: Echo Tests ===");
 
-  // NOTE: Echo tests reveal a known SURB layer peeling issue (response bytes
-  // are bit-shifted, suggesting an extra Lioness layer is applied but not stripped).
-  // This is a real protocol issue to investigate separately — skipping for now.
-  // The HTTP handler works correctly because it goes through a different response path.
-  const SKIP_ECHO = false; // Re-enabled after /claim fix
-  if (SKIP_ECHO) {
-    log("  SKIPPED: Echo tests disabled (known SURB layer peeling issue — see TODO)");
-    return;
-  }
-
   for (const [name, size] of [
     ["echo_32b", 32],
     ["echo_1kb", 1024],
