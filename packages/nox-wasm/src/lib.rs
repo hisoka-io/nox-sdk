@@ -214,20 +214,39 @@ pub fn check_difficulty(hash: &[u8], difficulty: u32) -> bool {
     meets_difficulty(hash, difficulty)
 }
 
-/// XOR topology fingerprint over node addresses (40-char hex, no 0x prefix).
+/// Topology fingerprint: XOR of `keccak256(address)` over the 20-byte node
+/// addresses, as the NoxRegistry contract (`topologyFingerprint()`), the node
+/// (`nox_core::utils::compute_topology_fingerprint`) and nox-client
+/// (`computeTopologyFingerprint`) compute it. Addresses are 40 hex characters,
+/// with or without a `0x` prefix; the result is 64 hex characters, no prefix.
 #[wasm_bindgen]
 pub fn topology_fingerprint(addresses_hex: Vec<String>) -> Result<String, JsValue> {
-    use sha2::{Digest, Sha256};
+    compute_topology_fingerprint(&addresses_hex)
+        .map(hex::encode)
+        .map_err(|e| JsValue::from_str(&e))
+}
+
+fn compute_topology_fingerprint(addresses_hex: &[String]) -> Result<[u8; 32], String> {
+    use tiny_keccak::{Hasher, Keccak};
     let mut xor = [0u8; 32];
-    for addr_hex in &addresses_hex {
+    for addr_hex in addresses_hex {
         let addr_bytes = hex::decode(addr_hex.trim_start_matches("0x"))
-            .map_err(|e| JsValue::from_str(&format!("Invalid address hex '{addr_hex}': {e}")))?;
-        let hash: [u8; 32] = Sha256::digest(&addr_bytes).into();
+            .map_err(|e| format!("Invalid address hex '{addr_hex}': {e}"))?;
+        if addr_bytes.len() != 20 {
+            return Err(format!(
+                "Invalid address '{addr_hex}': {} bytes, expected 20",
+                addr_bytes.len()
+            ));
+        }
+        let mut hasher = Keccak::v256();
+        hasher.update(&addr_bytes);
+        let mut hash = [0u8; 32];
+        hasher.finalize(&mut hash);
         for (x, h) in xor.iter_mut().zip(hash.iter()) {
             *x ^= h;
         }
     }
-    Ok(hex::encode(xor))
+    Ok(xor)
 }
 
 fn parse_hops(hops: &[JsPathHop]) -> Result<Vec<PathHop>, JsValue> {
@@ -271,8 +290,6 @@ mod tests {
     use super::*;
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
-
     #[wasm_bindgen_test]
     fn test_pow_trivial() {
         let header = [0u8; 32];
@@ -295,6 +312,22 @@ mod tests {
         let payload = b"hello mixnet";
         let packet = build_sphinx_packet(vec![hop1, hop2], payload, 0).unwrap();
         assert_eq!(packet.len(), 32_768);
+    }
+
+    #[wasm_bindgen_test]
+    fn test_short_reply_body_is_an_error() {
+        // A reply shorter than the Lioness minimum is refused with an error
+        // (nox-crypto BodyTooShort) instead of trapping the module.
+        let hops = vec![
+            JsPathHop::new(hex::encode([9u8; 32]), "/ip4/1.1.1.1/tcp/9000".to_string()),
+            JsPathHop::new(hex::encode([7u8; 32]), "/ip4/2.2.2.2/tcp/9000".to_string()),
+        ];
+        let recovery = create_surb_v2(hops, 0).unwrap().recovery();
+        for len in [0usize, 1, 16, 31, 32] {
+            let err = decrypt_surb_response(&recovery, &vec![0x42u8; len]).unwrap_err();
+            let msg = err.as_string().unwrap_or_default();
+            assert!(msg.contains("too short"), "{len} bytes: {msg}");
+        }
     }
 
     #[test]
@@ -340,7 +373,10 @@ mod tests {
             inner,
             id_hex: recovery.id_hex(),
         };
-        assert_eq!(decrypt_surb_response(&no_layers, body).unwrap(), b"\x01reply");
+        assert_eq!(
+            decrypt_surb_response(&no_layers, body).unwrap(),
+            b"\x01reply"
+        );
         let mut tampered = body.to_vec();
         tampered[3] ^= 1;
         // Error paths build a JsValue, which only exists on wasm targets.
@@ -351,14 +387,69 @@ mod tests {
         assert!(no_layers.inner.decrypt(untagged_body).is_err());
     }
 
-    #[wasm_bindgen_test]
-    fn test_topology_fingerprint_deterministic() {
-        let addrs = vec![
-            "abcdef1234567890abcdef1234567890abcdef12".to_string(),
-            "1234567890abcdef1234567890abcdef12345678".to_string(),
+    /// Live NoxRegistry members at Arbitrum Sepolia block 316,207,920 and the
+    /// registry's `topologyFingerprint()` at that block (the worker snapshot,
+    /// packages/anon-rpc-worker/snapshot/nox-snapshot.json). nox-client checks
+    /// the same vector in tests/topology_fingerprint.test.ts.
+    const LIVE_MEMBERS: [&str; 10] = [
+        "0x03a42846c18b99c453a49d7fce69f336f865c48b",
+        "0x074a13b271b73eb5c0c44e2037d035e7eef4a462",
+        "0x1efa385556a6e8643df0033048ba1dd67ec43f93",
+        "0x3e98ee4572741fd932e031ac60e79f7c012758be",
+        "0x6774ca4baf6fff84f02898a3dee4299ed1f5ab4e",
+        "0x74486dc1ac551e5cd3f4eef80727cc9d50d3abe9",
+        "0x862d6b1105bde9d64dc5182fe3cd9d09f6f37463",
+        "0x8c9fb3e9fe537067c8430480f80a4a5b9a12be1a",
+        "0xbeb31ac0c57b3765cb855fa02081eadb9edb2426",
+        "0xf8681a0acb60effcd9c169226e6f9c1ae9dd7894",
+    ];
+    const LIVE_FINGERPRINT: &str =
+        "14ca3b69d6defe50fe55b6d332e6c9734db74f460ce5a8ac280c651724147c75";
+
+    fn strings(addrs: &[&str]) -> Vec<String> {
+        addrs.iter().map(|a| (*a).to_string()).collect()
+    }
+
+    #[test]
+    fn test_topology_fingerprint_matches_registry_golden_vector() {
+        let fp = compute_topology_fingerprint(&strings(&LIVE_MEMBERS)).unwrap();
+        assert_eq!(hex::encode(fp), LIVE_FINGERPRINT);
+        // Prefix and case do not change the bytes hashed.
+        let bare: Vec<String> = LIVE_MEMBERS
+            .iter()
+            .map(|a| a.trim_start_matches("0x").to_uppercase())
+            .collect();
+        assert_eq!(
+            hex::encode(compute_topology_fingerprint(&bare).unwrap()),
+            LIVE_FINGERPRINT
+        );
+    }
+
+    #[test]
+    fn test_topology_fingerprint_two_addresses() {
+        // keccak256(0x1234…5678) ^ keccak256(0xabcd…abcd), checked with `cast keccak`.
+        let addrs = [
+            "0x1234567890abcdef1234567890abcdef12345678",
+            "0xabcdefabcdefabcdefabcdefabcdefabcdefabcd",
         ];
-        let fp1 = topology_fingerprint(addrs.clone()).unwrap();
-        let fp2 = topology_fingerprint(addrs).unwrap();
-        assert_eq!(fp1, fp2);
+        let fp = compute_topology_fingerprint(&strings(&addrs)).unwrap();
+        assert_eq!(
+            hex::encode(fp),
+            "4ef26622b39ecd0690c95f5f4c4041c6b3abd01f375c52ae08f3036b798cd11b"
+        );
+        let reversed = compute_topology_fingerprint(&strings(&[addrs[1], addrs[0]])).unwrap();
+        assert_eq!(fp, reversed);
+        let twice = compute_topology_fingerprint(&strings(&[addrs[0], addrs[0]])).unwrap();
+        assert_eq!(twice, [0u8; 32]);
+    }
+
+    #[test]
+    fn test_topology_fingerprint_rejects_bad_addresses() {
+        assert!(compute_topology_fingerprint(&strings(&["not_hex"])).is_err());
+        assert!(compute_topology_fingerprint(&strings(&["0x1234"])).is_err());
+        assert!(compute_topology_fingerprint(&strings(&[
+            "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        ]))
+        .is_err());
     }
 }

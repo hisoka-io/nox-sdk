@@ -101,7 +101,10 @@ export function solve_pow(
 ): Uint8Array;
 
 /**
- * Compute the XOR topology fingerprint over a list of node Ethereum addresses.
+ * Topology fingerprint: XOR of keccak256 over each 20-byte node address, the
+ * value NoxRegistry `topologyFingerprint()` returns. Addresses are 40 hex
+ * characters with or without `0x`; returns 64 hex characters without `0x`.
+ * Throws on an address that is not 20 bytes of hex.
  */
 export function topology_fingerprint(addresses_hex: string[]): string;
 

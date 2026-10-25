@@ -153,6 +153,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
+name = "crunchy"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -351,8 +357,8 @@ dependencies = [
 
 [[package]]
 name = "nox-crypto"
-version = "0.4.0-rc.2"
-source = "git+https://github.com/hisoka-io/nox.git?rev=c8aef77bc2f7143b9b7e51c44fe124d68ce21e07#c8aef77bc2f7143b9b7e51c44fe124d68ce21e07"
+version = "0.4.0-rc.10"
+source = "git+https://github.com/hisoka-io/nox.git?rev=dff8ebebfc45d5efe6cf97b56d2a44e1abed3053#dff8ebebfc45d5efe6cf97b56d2a44e1abed3053"
 dependencies = [
  "blake3",
  "chacha20",
@@ -388,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "nox-wasm"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bincode",
  "getrandom",
@@ -398,8 +404,8 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "serde_json",
- "sha2",
  "thiserror 1.0.69",
+ "tiny-keccak",
  "wasm-bindgen",
  "wasm-bindgen-test",
  "zeroize",
@@ -749,6 +755,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tiny-keccak"
+version = "2.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c9d3793400a45f954c52e73d068316d76b6f4e36977e3fcebb13a2721e80237"
+dependencies = [
+ "crunchy",
 ]
 
 [[package]]
