@@ -2,9 +2,9 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
-## 0.9.0 (unreleased)
+## 0.9.0 (2026-10-25)
 
-Additive; every 0.8.0 call behaves as before.
+Additive; every 0.8.0 call behaves as before. Depends on `@hisoka-io/nox-wasm` 0.3.0.
 
 ### Added
 
@@ -22,6 +22,18 @@ Additive; every 0.8.0 call behaves as before.
   any JSON-RPC transport, and `arbitrumDataFeeGas(reader)` for the rollup data fee in the gas cap, applied
   automatically on Arbitrum One and Arbitrum Sepolia.
 - `selectPaidExit({ exclude })`: skip exits already contacted for a payment.
+- `gas.dataFeeHeadroomBps` (default 5000) and `planPaidGas({ dataFeeHeadroomBps })`: headroom on the rollup data
+  fee alone, for its movement between the plan and the exit's estimate. Adds nothing where the chain reports no data
+  fee. `capHeadroomBps` stays 500: on the live paid runs of 2026-10-13 on Arbitrum Sepolia the exit's estimate came
+  0.41% above the plan, leaving 4.4% of the cap unused.
+
+### Tested
+
+- Golden vector for `computeTopologyFingerprint`: the registry fingerprint of the 10 live members at Arbitrum Sepolia
+  block 316,207,920, shared with nox-wasm.
+- `executePaid` over a `NoxClient` with two paid exits: a refused quote moves to the other exit, and a
+  `GasCapExceeded` submission re-quotes there with a raised buffer under the same intent; requests and replies go
+  through the bincode encodings and the exits sign their own quotes.
 
 ## 0.8.0 (2026-10-10)
 
