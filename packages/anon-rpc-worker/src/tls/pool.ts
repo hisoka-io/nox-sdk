@@ -48,8 +48,12 @@ export const SPARE_DELAY_MEAN_MS = 2_000;
 export const MAX_KEEP_ALIVE_SESSIONS = 4;
 /** Hosts with spares kept at once; the least recently used host loses its spares. */
 export const MAX_SPARE_HOSTS = 8;
-/** A spare is refreshed before its TTL only while its host was called within this long. */
-export const SPARE_REFILL_WINDOW_MS = 120_000;
+/**
+ * A spare is refreshed before its TTL only while its host was called within
+ * this long. Bounds how far apart the refresh chain can link a wallet's calls
+ * to one host at low traffic.
+ */
+export const SPARE_REFILL_WINDOW_MS = 60_000;
 /**
  * How long before a spare's TTL its replacement opens: about the handshake
  * p95 measured from India on 2026-10-15 (1.45 s), so the replacement is ready

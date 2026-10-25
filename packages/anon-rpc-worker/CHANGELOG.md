@@ -2,7 +2,9 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
-## Unreleased
+## 0.4.1 (2026-10-25)
+
+Built on `@hisoka-io/nox-client` 0.9.0 and `@hisoka-io/nox-wasm` 0.3.0. Every 0.4.0 config stays valid.
 
 ### Changed
 
@@ -10,11 +12,15 @@ All notable changes to `@hisoka-io/anon-rpc-worker`.
   an idle TLS connection 15.0 s after the handshake, so a 20 s spare could be dead when used: one wasted exchange
   and a `tls.retry` on a new session. Measured from India on 2026-10-15 at a 15 s call gap: 13 of 30 calls retried
   with a 20 s TTL, none of 70 with 12 s.
-- A spare is refreshed before its TTL while its host was called within the last 2 minutes: the replacement opens at
+- A spare is refreshed before its TTL while its host was called within the last minute: the replacement opens at
   once 1.5-2 s before the TTL, and a host holds at most `tlsSpares` spares plus the one being replaced. Past that
-  window an expired spare is not replaced, as before.
+  window an expired spare is not replaced, as before. The one-minute window bounds how far apart the refresh chain
+  can link a wallet's calls to one host at low traffic (about 20 s in 0.4.0).
 - A call that finds no spare while a spare's handshake for its host has run for half the handshake median waits for
   that handshake instead of opening another session; if that handshake fails, the call opens its own.
+
+- Embedded nox-wasm 0.3.0: nox-crypto at nox `dff8ebe`, which refuses a reply body shorter than 33 bytes with an
+  error instead of trapping the module.
 
 ### Added
 
