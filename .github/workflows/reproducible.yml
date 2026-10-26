@@ -1,7 +1,9 @@
 name: Reproducible build
 
 # The worker bundle is built twice from clean exports of the pushed commit in
-# the pinned containers and the bytes are compared.
+# the pinned containers and the bytes are compared. The first build's dist
+# (bundle, keccak256, provenance, build record) is kept as a workflow artifact,
+# the file set a release publishes.
 on:
   push:
     branches: ["release/**"]
@@ -19,4 +21,27 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build twice and compare
-        run: packages/anon-rpc-worker/scripts/verify-reproducible.sh
+        env:
+          TMPDIR: ${{ runner.temp }}/repro
+        run: |
+          mkdir -p "$TMPDIR"
+          packages/anon-rpc-worker/scripts/verify-reproducible.sh --keep
+
+      - name: Collect the first build's dist
+        run: |
+          shopt -s nullglob
+          dists=("$RUNNER_TEMP"/repro/nox-worker-repro.*/build-1/src/packages/anon-rpc-worker/dist)
+          [[ ${#dists[@]} -eq 1 ]] || { echo "expected one build-1 dist, found ${#dists[@]}" >&2; exit 1; }
+          mkdir -p "$RUNNER_TEMP/worker-dist"
+          cp "${dists[0]}"/anon-rpc-worker.js "${dists[0]}"/anon-rpc-worker.js.keccak256 \
+            "${dists[0]}"/anon-rpc-worker.provenance.json "$RUNNER_TEMP/worker-dist/"
+          [[ -f "${dists[0]}/build-record.json" ]] && cp "${dists[0]}/build-record.json" "$RUNNER_TEMP/worker-dist/"
+          (cd "$RUNNER_TEMP/worker-dist" && sha256sum * | tee SHA256SUMS)
+
+      - name: Upload the worker dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: anon-rpc-worker-dist-${{ github.sha }}
+          path: ${{ runner.temp }}/worker-dist/
+          if-no-files-found: error
+          retention-days: 90
