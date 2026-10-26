@@ -55,7 +55,7 @@ if [ "${E2E_SKIP_BUILD:-0}" != "1" ]; then
         need cargo "Rust toolchain"
         step "building nox and nox_mesh_server in $NOX_REPO (log: $LOG_DIR/nox-build.log)"
         (cd "$NOX_REPO" \
-            && cargo build --release --locked --bin nox \
+            && cargo build --release --locked --features dev-node --bin nox \
             && cargo build --release --locked -p nox-sim --bin nox_mesh_server --features dev-node) \
             >"$LOG_DIR/nox-build.log" 2>&1
     fi
