@@ -213,22 +213,28 @@ were read at, and when each member outside the snapshot was first seen. At most 
 days. A cache that fails any check (another registry, too many records, one malformed record) is ignored whole, and
 a learned address is used only after the node's `/metadata.json` names the same member.
 
-## Release 0.4.0
+## Release 0.4.1
 
 | | |
 |---|---|
-| `workerHash` (keccak-256 of `dist/anon-rpc-worker.js`) | `0xd8bef626ec8511d7a468bca5137880680ca2da20d2ea4d9c981a2a3d0c86ba1e` |
-| Size | 1,820,668 bytes; 649,310 bytes with `gzip -9 -n` |
-| sha256 | `4b7b69cd6f45c364cd87ff75f5f8cacdebea2cd852d5384c47215bb88d56f35a` |
-| Specifier, stable address | Ethereum Sepolia `0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A` (`WorkerSpecifier`, owner-updatable: it follows the current release; trust model in [specifier/README.md](./specifier/README.md#deployments)) |
-| Specifier, 0.4.0 pin | Ethereum Sepolia `0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d` (`ImmutableWorkerSpecifier`, resolvers in [specifier/README.md](./specifier/README.md#deployments)) |
-| Snapshot | NoxRegistry at Arbitrum Sepolia block 316,207,920, keccak-256 `0x1090f071…014681` (the 0.3.0 registry state with the exits' `tunnel_v1` hints) |
-| nox-wasm module | 188,708 bytes, sha256 `5171416972ea4499fd4b4ea8bcadf002f4c10f10ed42cafb0d5a426121da9c4f` |
-| nox-tls module | 593,738 bytes, sha256 `f74e8cfbed7be33ef1a9158b7b66e454b4ca0849bcb8956487fd13da47e4f4d2` |
+| `workerHash` (keccak-256 of `dist/anon-rpc-worker.js`) | `0xd9fa04b080a33062680a27cad828196bfb04615a0ebc76bcbffedb6dcbe838d4` |
+| Size | 1,831,246 bytes; 652,831 bytes with `gzip -9 -n` |
+| sha256 | `9544fb10390eb135d4f6b9a32de674ea859e4977514afed4772cb4642d62ed19` |
+| Specifier, stable address | Ethereum Sepolia `0x35133267A8F7EC35046a83DCA0f4Ca8A6e1b7A9A` (`WorkerSpecifier`, owner-updatable: it follows the current release and publishes 0.4.1 since 2026-10-26; trust model in [specifier/README.md](./specifier/README.md#deployments)) |
+| Specifier, 0.4.1 pin | Ethereum Sepolia `0x0597fA1f70eD00799f41e0C9BC9dEFE92C92850F` (`ImmutableWorkerSpecifier`, resolvers in [specifier/README.md](./specifier/README.md#deployments)) |
+| Snapshot | NoxRegistry at Arbitrum Sepolia block 316,207,920, keccak-256 `0x1090f071…014681` (same snapshot as 0.4.0) |
+| nox-wasm module | 190,291 bytes, sha256 `6db306a34ef50e9198f4ad6f31c6ffd9feafe459c24b8a29895824c7138241c8` (nox-wasm 0.3.0, nox-crypto at nox v0.4.0-rc.11) |
+| nox-tls module | 593,738 bytes, sha256 `f74e8cfbed7be33ef1a9158b7b66e454b4ca0849bcb8956487fd13da47e4f4d2` (same as 0.4.0) |
 | Root store | webpki-roots 1.0.9 (released 2026-07-18), 121 Mozilla root certificates |
-| Built from | `nox-sdk` commit `fee8d69861a112c65f0cbb0b848a7726ec12f01a`, rustc 1.95.0, clang 19.1.7, wasm-pack 0.13.1, wasm-bindgen 0.2.114, binaryen 117, esbuild 0.27.3 |
+| Built from | `nox-sdk` commit `66bce4af274b4be457ef11336ba9cb6d9200efd1`, rustc 1.95.0, clang 19.1.7, wasm-pack 0.13.1, wasm-bindgen 0.2.114, binaryen 117, esbuild 0.27.3 |
+| Provenance | sha256 `17e9ba1b0f76f075eabc52fdcd9b5dccd65481ca525a901d66c97d766e6386e6` |
 
-The npm package carries the bundle and provenance file of the first pinned container build.
+The npm package carries the bundle and provenance file of the first pinned container build of the
+"Reproducible build" workflow (run 40304322372, artifact `anon-rpc-worker-dist-66bce4a…`); its second container
+build, at another path, gave the same bytes.
+
+Release 0.4.0: `workerHash` `0xd8bef626ec8511d7a468bca5137880680ca2da20d2ea4d9c981a2a3d0c86ba1e` (1,820,668 bytes, commit
+`fee8d69`), specifier `0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d`.
 
 Each release publishes its own immutable specifier and then repoints the stable address with one `setWorker`
 transaction from its owner ([specifier/README.md](./specifier/README.md#updating-the-stable-address-setworker)), so
@@ -240,8 +246,8 @@ Release 0.3.0: `workerHash` `0x24604525d220bcc7e39f2dbc22966a814600a63ada51baafa
 `0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6`.
 
 Two builds in fresh containers of the pinned images (at two different paths) give these exact bytes
-(`scripts/verify-reproducible.sh --ref fee8d69`), on an x86_64 workstation and again on the x86_64 CI runner
-(job "Worker bundle (two container builds)"). The aarch64 reproduction is the next check: the toolchain pins carry
+(`scripts/verify-reproducible.sh --ref 66bce4a`) on the x86_64 CI runner (job "Worker bundle (two container builds)");
+for 0.4.0 the same check also ran on an x86_64 workstation. The aarch64 reproduction is the next check: the toolchain pins carry
 aarch64 digests for it. Run the script from the repository root as
 `packages/anon-rpc-worker/scripts/verify-reproducible.sh` (or `pnpm verify:reproducible` inside the package); host builds (`--native`,
 `--local`) use rustc 1.95.0, so set `RUSTUP_TOOLCHAIN=1.95.0` when the host default differs.

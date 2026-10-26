@@ -45,7 +45,7 @@ workers; `test/ReferenceBytecode.t.sol` keeps it that way.
 | Contract | `WorkerSpecifier`, the reference contract of ethereum/anon-rpc, unmodified; runtime codehash `0xc4c54384a9c1f1201ef3711a7ed7ba20e078a432e85ecc4f8b14927587cc7b5f`, the codehash of the reference deployments on Ethereum mainnet; source verified on Sourcify (exact match, creation and runtime) |
 | Deployment | tx [`0x2300d269…556f32`](https://sepolia.etherscan.io/tx/0x2300d269aa45043212ccba045407e0b806db211e48235904193597db29556f32), block 11,906,012 (2026-10-13), 9,678,303 gas |
 | Owner | [`0xb18ddF10a9F6a0b9143d05B294815a83d3fa69C5`](https://sepolia.etherscan.io/address/0xb18ddF10a9F6a0b9143d05B294815a83d3fa69C5) |
-| Publishes today | `@hisoka-io/anon-rpc-worker` 0.4.0, `workerHash` `0xd8bef626ec8511d7a468bca5137880680ca2da20d2ea4d9c981a2a3d0c86ba1e`, with the same six resolvers in the same order as the 0.4.0 immutable specifier below |
+| Publishes today | `@hisoka-io/anon-rpc-worker` 0.4.1, `workerHash` `0xd9fa04b080a33062680a27cad828196bfb04615a0ebc76bcbffedb6dcbe838d4`, with the same six resolvers in the same order as the 0.4.1 immutable specifier below (`setWorker` tx [`0xed1ca1b3…c69ba4`](https://sepolia.etherscan.io/tx/0xed1ca1b3ed3c9f6b075bb7557a4dc933f14bf2e3f8159f0b37214f3c99c69ba4), block 11,997,524, 2026-10-26, 280,430 gas). From 2026-10-13 to 2026-10-26 it published 0.4.0 |
 
 Trust model. The owner can repoint this address at any worker bundle and resolver list with `setWorker`, hand
 ownership on with `transferOwnership`, and freeze the current contents for good with `renounceOwnership`. A wallet
@@ -64,33 +64,36 @@ publishing the same worker for good.
 
 | Worker | Chain | Specifier | Contract | Deployment |
 |---|---|---|---|---|
+| `@hisoka-io/anon-rpc-worker` 0.4.1, `workerHash` `0xd9fa04b080a33062680a27cad828196bfb04615a0ebc76bcbffedb6dcbe838d4` | Ethereum Sepolia (11155111) | [`0x0597fA1f70eD00799f41e0C9BC9dEFE92C92850F`](https://sepolia.etherscan.io/address/0x0597fA1f70eD00799f41e0C9BC9dEFE92C92850F) | `ImmutableWorkerSpecifier`, source verified on Sourcify (exact match) | tx [`0xd0b91eb7…c55b73a`](https://sepolia.etherscan.io/tx/0xd0b91eb7e890541939709ffd46c9f3207d5b32097b329ae502a0f5acfc55b73a), block 11,997,509, 5,188,850 gas |
 | `@hisoka-io/anon-rpc-worker` 0.4.0, `workerHash` `0xd8bef626ec8511d7a468bca5137880680ca2da20d2ea4d9c981a2a3d0c86ba1e` | Ethereum Sepolia (11155111) | [`0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d`](https://sepolia.etherscan.io/address/0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d) | `ImmutableWorkerSpecifier`, source verified on Sourcify (exact match) | tx [`0xb645b0b8…a7e707`](https://sepolia.etherscan.io/tx/0xb645b0b8b1af1d99212f9345eaeac6c3f791c0afae55c2330433e2caa4a7e707), block 11,883,337, 5,188,850 gas |
 | `@hisoka-io/anon-rpc-worker` 0.3.0, `workerHash` `0x24604525d220bcc7e39f2dbc22966a814600a63ada51baafad5dd0bcc1d28549` | Ethereum Sepolia (11155111) | [`0x29B51ca9Ad80E9c0B0D111C8748E6a7908b82eDB`](https://sepolia.etherscan.io/address/0x29B51ca9Ad80E9c0B0D111C8748E6a7908b82eDB) | `ImmutableWorkerSpecifier`, source verified on Sourcify (exact match) | tx [`0x48b8cced…24a97d`](https://sepolia.etherscan.io/tx/0x48b8cced35edfcfc7d69769d3aed130412d27525029bd48aa4e37dcd7e24a97d), block 11,855,976, 1,032,240 gas |
 | `@hisoka-io/anon-rpc-worker` 0.2.0, `workerHash` `0x0a58f9915f686950072a4786249d396ecbf2194a39ac835effe8ea1a7c76f324` | Ethereum Sepolia (11155111) | [`0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6`](https://sepolia.etherscan.io/address/0x29b4a6A8Cc11769531854d87f9F33EC63Efe8fe6) | `ImmutableWorkerSpecifier`, source verified on Sourcify (exact match) | tx [`0x5e5c7cb6…aa30e`](https://sepolia.etherscan.io/tx/0x5e5c7cb6ef38efc6ad5a0683f31036558ca7c8893f80bb1b0e0e985fd17aa30e), block 11,852,795, 1,032,240 gas |
 
 Each of these is immutable: it publishes one worker version for good, and each new version gets its own immutable
-specifier next to the update of the stable address. The 0.4.0 resolvers, in order (https first, then `kps:`), which
+specifier next to the update of the stable address. The 0.4.1 resolvers, in order (https first, then `kps:`), which
 the stable address publishes too:
 
-1. `https://raw.githubusercontent.com/hisoka-io/anon-rpc/keccak/d8/bef6…ba1e` (orphan `keccak` branch)
-2. `https://cdn.jsdelivr.net/npm/@hisoka-io/anon-rpc-worker@0.4.0/dist/anon-rpc-worker.js`
-3. `https://unpkg.com/@hisoka-io/anon-rpc-worker@0.4.0/dist/anon-rpc-worker.js`
-4. `kps:100.56.0.72:15005:uEiBVDwIs40bsslDkM-BYb2AOHw3PHe70_bj5U_09r7vdIQ/keccak/d8/bef6…ba1e` (nox-1)
-5. `kps:3.232.137.146:15005:uEiDGVPDwsQ96ri9T5WLR6jZov_9LW-gRAgs-DN9FyKuHuw/keccak/d8/bef6…ba1e` (nox-2)
-6. `kps:18.215.18.61:15005:uEiCStd3rfGTo0ts0lSUw5f22u93O3PLCZVWWQIv_MXHm7w/keccak/d8/bef6…ba1e` (nox-8)
+1. `https://raw.githubusercontent.com/hisoka-io/anon-rpc/keccak/d9/fa04…38d4` (orphan `keccak` branch)
+2. `https://cdn.jsdelivr.net/npm/@hisoka-io/anon-rpc-worker@0.4.1/dist/anon-rpc-worker.js`
+3. `https://unpkg.com/@hisoka-io/anon-rpc-worker@0.4.1/dist/anon-rpc-worker.js`
+4. `kps:100.56.0.72:15005:uEiBVDwIs40bsslDkM-BYb2AOHw3PHe70_bj5U_09r7vdIQ/keccak/d9/fa04…38d4` (nox-1)
+5. `kps:3.232.137.146:15005:uEiDGVPDwsQ96ri9T5WLR6jZov_9LW-gRAgs-DN9FyKuHuw/keccak/d9/fa04…38d4` (nox-2)
+6. `kps:18.215.18.61:15005:uEiCStd3rfGTo0ts0lSUw5f22u93O3PLCZVWWQIv_MXHm7w/keccak/d9/fa04…38d4` (nox-8)
 
 The three `https:` entries served the exact bytes (keccak256 = `workerHash`) through the harness's
 `fetchAndVerifyBundle` right after the deployment
-(`pnpm inspect -- --rpc-url <sepolia rpc> 0xDf5Db854BA75B52a4bF1a250a93D8d25cB982b2d --fetch`), and the three `kps:`
-entries served the same 1,820,668 bytes to a KPS QUIC client. The 0.3.0 specifier lists the same six kinds of entry
-for 0.3.0; the 0.2.0 specifier lists `kps:` first, then the three kinds of `https:` entry for 0.2.0.
+(`pnpm inspect -- --rpc-url <sepolia rpc> 0x0597fA1f70eD00799f41e0C9BC9dEFE92C92850F --fetch`), and the three `kps:`
+entries served the same 1,831,246 bytes to a KPS client over QUIC and over WebRTC. The ABI-encoded
+`workerResolvers()` of the stable address and of the 0.4.1 pin are byte-identical. The 0.4.0 and 0.3.0 specifiers
+list the same six kinds of entry for their release; the 0.2.0 specifier lists `kps:` first, then the three kinds of
+`https:` entry for 0.2.0.
 
-Gas on Ethereum Sepolia: the 0.4.0 deployment used 5,188,850 gas (live `eth_estimateGas` 5,231,199), where the
+Gas on Ethereum Sepolia: the 0.4.0 and 0.4.1 deployments each used 5,188,850 gas (live `eth_estimateGas` 5,231,199), where the
 0.3.0 deployment of the same contract used 1,032,240 on 2026-10-06. Sepolia's current gas schedule prices contract
 creation higher than the planner's anvil fork (Foundry 1.3.2) models, so take the gas limit for a deployment from
 `eth_estimateGas` on the target chain itself, plus 20%. The stable `WorkerSpecifier` used 9,678,303 gas on
 2026-10-13 (live `eth_estimateGas` 9,756,282; the planner's fork measured 1,671,783). The `setWorker` tool below
-reads its estimate from the target chain.
+reads its estimate from the target chain; the 0.4.1 `setWorker` used 280,430 gas (live estimate 283,823, limit 340,587).
 
 ## Requirements
 

@@ -19,7 +19,7 @@ Built on `@hisoka-io/nox-client` 0.9.0 and `@hisoka-io/nox-wasm` 0.3.0. Every 0.
 - A call that finds no spare while a spare's handshake for its host has run for half the handshake median waits for
   that handshake instead of opening another session; if that handshake fails, the call opens its own.
 
-- Embedded nox-wasm 0.3.0: nox-crypto at nox `dff8ebe`, which refuses a reply body shorter than 33 bytes with an
+- Embedded nox-wasm 0.3.0: nox-crypto at nox `676bb80` (v0.4.0-rc.11), which refuses a reply body shorter than 33 bytes with an
   error instead of trapping the module.
 
 ### Added
