@@ -218,7 +218,7 @@ const body = await client.httpRequest(
 ### TLS tunnels
 
 Exits on nox 0.4.0-rc.9 and later that advertise `tunnel_v1` relay TLS records over one TCP connection per tunnel
-(the testnet fleet runs 0.4.0-rc.10 with `[tunnel]` enabled on its three exits), so a
+(the testnet fleet runs 0.4.0-rc.11 with `[tunnel]` enabled on its three exits), so a
 client that runs TLS itself keeps requests and responses end-to-end encrypted (the anon-rpc worker does this; see
 its README). `tunnelExits()` lists those exits; `tunnelSend` sends one copy of an exchange and hands each reply part
 (an encoded `TunnelReplyV1`) to `onReply`:
