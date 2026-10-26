@@ -357,8 +357,8 @@ dependencies = [
 
 [[package]]
 name = "nox-crypto"
-version = "0.4.0-rc.10"
-source = "git+https://github.com/hisoka-io/nox.git?rev=dff8ebebfc45d5efe6cf97b56d2a44e1abed3053#dff8ebebfc45d5efe6cf97b56d2a44e1abed3053"
+version = "0.4.0-rc.11"
+source = "git+https://github.com/hisoka-io/nox.git?rev=676bb8000e709acedd21fa357a5724ed798d5292#676bb8000e709acedd21fa357a5724ed798d5292"
 dependencies = [
  "blake3",
  "chacha20",

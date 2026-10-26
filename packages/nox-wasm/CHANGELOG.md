@@ -15,7 +15,7 @@ All notable changes to `@hisoka-io/nox-wasm`.
 
 ### Changed
 
-- nox-crypto pinned to nox `dff8ebe` (v0.4.0-rc.10 plus documentation), up from `c8aef77`. Sphinx packets, reply
+- nox-crypto pinned to nox `676bb80` (the v0.4.0-rc.11 tag), up from `c8aef77`. Sphinx packets, reply
   blocks and the wire format are unchanged.
 
 ## 0.2.0
