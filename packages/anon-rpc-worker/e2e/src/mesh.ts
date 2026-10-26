@@ -124,7 +124,7 @@ function assertBinary(path: string, what: string, repo: string): void {
     throw new TestbedError(
       "prerequisite",
       `${what} not found at ${path}. Build it in the nox checkout (${repo}):\n` +
-        "  cargo build --release --bin nox\n" +
+        "  cargo build --release --features dev-node --bin nox\n" +
         "  cargo build --release -p nox-sim --bin nox_mesh_server --features dev-node\n" +
         "or point NOX_REPO / NOX_BIN / NOX_MESH_BIN at existing binaries.",
     );
