@@ -1599,8 +1599,8 @@ export class NoxClient {
    * - "v1": the pinned entry and v1, as in 0.3.0.
    * - "auto": the pinned entry; v2 only when every hop advertises `surb_v2`
    *   and the WASM module can build v2 reply blocks.
-   * - "v2": only hops that advertise `surb_v2`; the pinned entry when it
-   *   does, any such entry otherwise.
+   * - "v2": only hops that advertise `surb_v2`; `entryOverride` or else the
+   *   pinned entry when it does, any such entry otherwise.
    */
   private _planRoute(
     selectedExit: TopologyNode | undefined,
@@ -1608,7 +1608,7 @@ export class NoxClient {
     entryOverride?: TopologyNode,
   ): PlannedRoute {
     const mode = this._config.surbFormat;
-    if (mode === "v2") return this._planStrictV2(selectedExit, avoid, undefined);
+    if (mode === "v2") return this._planStrictV2(selectedExit, avoid, undefined, entryOverride);
     const route = selectRoute(
       this._nodes,
       entryOverride ?? this._leastBusyWarmEntry(avoid),
@@ -1622,11 +1622,16 @@ export class NoxClient {
     return { route, version };
   }
 
-  /** A v2 route over hops that advertise `surb_v2`, optionally excluding one entry. */
+  /**
+   * A v2 route over hops that advertise `surb_v2`, optionally excluding one
+   * entry. `preferredEntry` (a caller's entry override) is used in place of
+   * the pinned entry when it advertises `surb_v2`.
+   */
   private _planStrictV2(
     selectedExit: TopologyNode | undefined,
     avoid: ReadonlySet<string>,
     excludeEntryId: string | undefined,
+    preferredEntry?: TopologyNode,
   ): PlannedRoute {
     if (!wasmSupportsSurbV2(this._wasm)) {
       throw new NoxClientError(
@@ -1648,9 +1653,9 @@ export class NoxClient {
         NoxClientErrorCode.SurbV2Unavailable,
       );
     }
-    const pinned = this._pinnedEntry();
-    const entry = pinned !== undefined && capable.some((node) => node.id === pinned.id)
-      ? pinned
+    const wanted = preferredEntry ?? this._pinnedEntry();
+    const entry = wanted !== undefined && capable.some((node) => node.id === wanted.id)
+      ? wanted
       : undefined;
     let route: Route;
     try {
