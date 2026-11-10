@@ -15,6 +15,7 @@
 #                   next to this nox-sdk checkout, then ../nox, then ../nox-clean)
 #   E2E_SKIP_BUILD  1 = do not build anything, fail on missing prerequisites
 #   E2E_ONLY        a Playwright file filter, e.g. "classic-sdk" or "kps-webrtc"
+#   E2E_WEBKIT      1 = also run the KPS dial and worker boot in WebKit
 #   NOX_KPS_REPO    checkout holding nox-kps (default: NOX_REPO when it has
 #                   crates/nox-kps): builds it (scripts/build-nox-kps-testbed.sh;
 #                   the loopback-filter variant when `lo` carries more than one
@@ -83,6 +84,9 @@ if [ "${E2E_SKIP_BUILD:-0}" != "1" ]; then
         (cd "$HERE" && pnpm install --frozen-lockfile --ignore-workspace)
     fi
     (cd "$HERE" && npx playwright install --only-shell chromium >"$LOG_DIR/playwright-install.log" 2>&1)
+    if [ "${E2E_WEBKIT:-}" = "1" ]; then
+        (cd "$HERE" && npx playwright install webkit >>"$LOG_DIR/playwright-install.log" 2>&1)
+    fi
 fi
 
 if [ -n "${NOX_KPS_REPO:-}" ] && [ -z "${NOX_KPS_CMD:-}" ]; then

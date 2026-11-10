@@ -9,6 +9,21 @@ const UPSTREAM_WEBRTC_FLAGS = [
   "--force-webrtc-ip-handling-policy=default",
 ];
 
+/**
+ * E2E_WEBKIT=1 adds WebKit (Safari's engine) for the KPS dial and the worker
+ * boot. Off by default: WebKit needs `npx playwright install --with-deps webkit`.
+ */
+const WEBKIT_PROJECTS = process.env["E2E_WEBKIT"] === "1"
+  ? [
+      {
+        name: "webkit",
+        testMatch: /(?:kps-webrtc|nox-worker)\.spec\.ts$/u,
+        grep: /server \(|boots by specifier|latency: boot time/u,
+        use: { browserName: "webkit" as const },
+      },
+    ]
+  : [];
+
 export default defineConfig({
   testDir: "tests/e2e",
   testMatch: /.*\.spec\.ts$/u,
@@ -36,5 +51,6 @@ export default defineConfig({
       testMatch: /kps-webrtc\.spec\.ts$/u,
       use: { launchOptions: { args: [] } },
     },
+    ...WEBKIT_PROJECTS,
   ],
 });
