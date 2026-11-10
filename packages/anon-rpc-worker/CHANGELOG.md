@@ -2,6 +2,16 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
+## 0.4.2 (2026-11-10)
+
+Same code and config as 0.4.1; only the embedded TLS library changes.
+
+### Security
+
+- nox-tls now builds on rustls 0.23.46, rustls-webpki 0.103.16 and webpki-roots 1.0.11. Certificates chaining
+  through the emSign intermediates distrusted in RUSTSEC-2026-0381 and RUSTSEC-2026-0382 are rejected, and the
+  rustls fixes for RUSTSEC-2026-0346 to 0349 are included.
+
 ## 0.4.1 (2026-10-25)
 
 Built on `@hisoka-io/nox-client` 0.9.0 and `@hisoka-io/nox-wasm` 0.3.0. Every 0.4.0 config stays valid.
