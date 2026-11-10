@@ -21,7 +21,7 @@ import {
   MAX_SURB_V2_ADDRESS_BYTES,
 } from "../src/topology.js";
 import type { RelayerNode, TopologySnapshot, TopologyNode } from "../src/types.js";
-import { NoxClientError } from "../src/types.js";
+import { NoxClientError, NoxClientErrorCode } from "../src/types.js";
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -40,12 +40,22 @@ function makeNode(overrides: Partial<RelayerNode> = {}): RelayerNode {
   };
 }
 
+/** A distinct Sphinx key per node ID (0xab fill when no ID is given). */
+function keyFor(id: string | undefined): Uint8Array {
+  const key = new Uint8Array(32).fill(0xab);
+  if (id === undefined) return key;
+  new TextEncoder().encode(id).forEach((byte, i) => {
+    key[i % 32] = (key[i % 32] ?? 0) ^ byte;
+  });
+  return key;
+}
+
 function makeTopologyNode(overrides: Partial<TopologyNode> = {}): TopologyNode {
   return {
     id: overrides.id ?? "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     address: overrides.address ?? "http://127.0.0.1:8080",
     routingAddress: overrides.routingAddress ?? "/ip4/127.0.0.1/tcp/9000",
-    publicKey: overrides.publicKey ?? new Uint8Array(32).fill(0xab),
+    publicKey: overrides.publicKey ?? keyFor(overrides.id),
     layer: overrides.layer ?? 0,
     role: overrides.role ?? 1,
   };
@@ -924,6 +934,92 @@ describe("parseNodes", () => {
   it("returns empty array for empty snapshot", () => {
     const snapshot = makeSnapshot([]);
     expect(parseNodes(snapshot)).toHaveLength(0);
+  });
+});
+
+// ── selectRoute: fail closed ───────────────────────────────────────────────
+
+describe("selectRoute fails closed", () => {
+  function expectNoRoute(run: () => unknown): void {
+    try {
+      run();
+    } catch (error) {
+      expect(error).toBeInstanceOf(NoxClientError);
+      expect((error as NoxClientError).code).toBe(NoxClientErrorCode.NoNodesAvailable);
+      return;
+    }
+    throw new Error("expected selectRoute to throw");
+  }
+
+  it("refuses a two-hop path when no distinct mix exists", () => {
+    const nodes = [
+      makeTopologyNode({ id: "0x01", layer: 0, role: 1 }),
+      makeTopologyNode({ id: "0x02", layer: 2, role: 2 }),
+    ];
+    for (let i = 0; i < 10; i++) expectNoRoute(() => selectRoute(nodes));
+  });
+
+  it("refuses an entry-only topology", () => {
+    expectNoRoute(() => selectRoute([makeTopologyNode({ id: "0x01", layer: 0, role: 1 })]));
+  });
+
+  it("refuses a route whose hops share one Sphinx key", () => {
+    const shared = new Uint8Array(32).fill(0x11);
+    const nodes = [
+      makeTopologyNode({ id: "0x01", layer: 0, role: 1, publicKey: shared }),
+      makeTopologyNode({ id: "0x02", layer: 1, role: 1, publicKey: shared }),
+      makeTopologyNode({ id: "0x03", layer: 2, role: 2, publicKey: shared }),
+    ];
+    expectNoRoute(() => selectRoute(nodes));
+  });
+
+  it("skips a duplicate-key candidate when a distinct one exists", () => {
+    const shared = new Uint8Array(32).fill(0x22);
+    const nodes = [
+      makeTopologyNode({ id: "0x01", layer: 0, role: 1, publicKey: shared }),
+      makeTopologyNode({ id: "0x02", layer: 1, role: 1, publicKey: shared }),
+      makeTopologyNode({ id: "0x03", layer: 1, role: 1 }),
+      makeTopologyNode({ id: "0x04", layer: 2, role: 2 }),
+    ];
+    for (let i = 0; i < 20; i++) {
+      const route = selectRoute(nodes, nodes[0]);
+      expect(route.mix.id).toBe("0x03");
+    }
+  });
+
+  it("refuses a pinned entry and selected exit that share a key", () => {
+    const shared = new Uint8Array(32).fill(0x33);
+    const nodes = [
+      makeTopologyNode({ id: "0x01", layer: 0, role: 1, publicKey: shared }),
+      makeTopologyNode({ id: "0x02", layer: 1, role: 1 }),
+      makeTopologyNode({ id: "0x03", layer: 2, role: 2, publicKey: shared }),
+    ];
+    expectNoRoute(() => selectRoute(nodes, nodes[0], nodes[2]));
+  });
+
+  it("never puts an exit in the entry or mix slot while relays can serve", () => {
+    const nodes = [
+      makeTopologyNode({ id: "0x01", layer: 0, role: 1 }),
+      makeTopologyNode({ id: "0x02", layer: 1, role: 1 }),
+      makeTopologyNode({ id: "0x03", layer: 2, role: 2 }),
+      makeTopologyNode({ id: "0x04", layer: 2, role: 3 }),
+      makeTopologyNode({ id: "0x05", layer: 2, role: 2 }),
+    ];
+    for (let i = 0; i < 50; i++) {
+      const route = selectRoute(nodes);
+      expect(route.entry.role).toBe(1);
+      expect(route.mix.role).toBe(1);
+    }
+  });
+
+  it("uses exit-capable nodes in relay slots only when no relay remains", () => {
+    const nodes = [
+      makeTopologyNode({ id: "0x01", layer: 0, role: 3 }),
+      makeTopologyNode({ id: "0x02", layer: 1, role: 3 }),
+      makeTopologyNode({ id: "0x03", layer: 2, role: 3 }),
+    ];
+    const route = selectRoute(nodes);
+    expect(new Set([route.entry.id, route.mix.id, route.exit.id]).size).toBe(3);
   });
 });
 
