@@ -2,6 +2,14 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
+## Unreleased
+
+### Changed
+
+- Default `surbFormat` is `"v2"` (was `"auto"`): the worker builds format v2 reply blocks only and never falls back
+  to v1. Nodes that do not advertise `surb_v2` are left out of routes; a call with no such route fails with
+  `network-error`. `{ surbFormat: "auto" }` restores the 0.4 behaviour.
+
 ## 0.4.1 (2026-10-25)
 
 Built on `@hisoka-io/nox-client` 0.9.0 and `@hisoka-io/nox-wasm` 0.3.0. Every 0.4.0 config stays valid.

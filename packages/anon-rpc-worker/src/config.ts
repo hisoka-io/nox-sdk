@@ -103,7 +103,9 @@ export const CONFIG_DEFAULTS: NoxWorkerConfig = Object.freeze({
   maxConcurrentCalls: 16,
   maxRequestBytes: 1_048_576,
   maxResponseBytes: 8_388_608,
-  surbFormat: "auto",
+  // Replies only as format v2 reply blocks: a route without `surb_v2` on every
+  // hop fails the call (SURB_V2_UNAVAILABLE) instead of falling back to v1.
+  surbFormat: "v2",
   claimIntervalMs: 200,
   bootRetryMaxMs: 60_000,
   topologySources: 2,

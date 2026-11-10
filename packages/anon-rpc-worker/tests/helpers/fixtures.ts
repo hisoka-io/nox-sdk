@@ -255,6 +255,17 @@ export function fakeTlsBindings(): NoxTlsBindings {
 }
 
 /** `config` with `tls: "off"` unless it sets `tls`: tests of the exit `HttpRequest` path. */
+/**
+ * `tlsOff`, plus `surbFormat: "auto"` unless the test sets one: the in-memory
+ * network (fake-nox-network.ts) models format 1 reply blocks only and
+ * advertises no `surb_v2`, so the worker's v2-only default finds no route there.
+ */
+export function onFakeNetwork(config: unknown): unknown {
+  const base = tlsOff(config);
+  if (typeof base !== "object" || base === null || Array.isArray(base)) return base;
+  return "surbFormat" in base ? base : { surbFormat: "auto", ...base };
+}
+
 export function tlsOff(config: unknown): unknown {
   if (config === undefined) return { tls: "off" };
   if (typeof config !== "object" || config === null || Array.isArray(config)) return config;
