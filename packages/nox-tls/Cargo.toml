@@ -13,10 +13,10 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "ring", "tls12"] }
 rustls-pki-types = { version = "1.15", features = ["std"] }
 ring = "=0.17.14"
-webpki-roots = "=1.0.9"
+webpki-roots = "=1.0.11"
 httparse = { version = "1.10", default-features = false, features = ["std"] }
 thiserror = "2"
 
@@ -32,8 +32,8 @@ getrandom = { version = "0.2", features = ["js"] }
 # The Mozilla root store compiled in. The worker provenance records this version and
 # release date (checked against Cargo.lock); refresh it at every worker release.
 [package.metadata.webpki-roots]
-version = "1.0.9"
-released = "2026-07-18"
+version = "1.0.11"
+released = "2026-10-23"
 
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ["-Oz", "--enable-mutable-globals"]
