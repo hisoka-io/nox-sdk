@@ -14,6 +14,9 @@ importers:
       '@anon-rpc/browser-harness-0.3.0':
         specifier: npm:@anon-rpc/browser-harness@0.3.0
         version: '@anon-rpc/browser-harness@0.3.0'
+      '@anon-rpc/browser-harness-0.4.0':
+        specifier: npm:@anon-rpc/browser-harness@0.4.0
+        version: '@anon-rpc/browser-harness@0.4.0'
       '@kpstreams/webrtc-client':
         specifier: 0.2.1
         version: 0.2.1
@@ -46,6 +49,12 @@ packages:
 
   '@anon-rpc/browser-harness@0.3.2':
     resolution: {integrity: sha512-W7Z4bRoHvEFVmSmdpyJM3Z+tV0VdS74bc/lMgTYAcikkI2mt74PAo/PR49xIHRfZA8HqNbW3l6O2O40wQhSV/Q==}
+
+  '@anon-rpc/browser-harness@0.4.0':
+    resolution: {integrity: sha512-9h+ks9lGmGTXE3fuFopowag+pLVJxhgmYG3SEBI1qk8ik7RGkxPT7Ub7RmbkDJ92/4VCa8gjT45BWoEnGynJYQ==}
+
+  '@anon-rpc/harness-core@0.4.0':
+    resolution: {integrity: sha512-ZFVeE0tkUgXPw1qu99s8JPKD4jFatHZ+nELisZ4WF+YMpCrBFIvpJe0qdCoLcmbhH1brbsC35qe8F1G3HxIbgA==}
 
   '@esbuild/aix-ppc64@0.21.5':
     resolution: {integrity: sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==}
@@ -1010,6 +1019,16 @@ snapshots:
   '@anon-rpc/browser-harness@0.3.2':
     dependencies:
       '@kpstreams/webrtc-client': 0.2.1
+      '@noble/hashes': 1.8.0
+
+  '@anon-rpc/browser-harness@0.4.0':
+    dependencies:
+      '@anon-rpc/harness-core': 0.4.0
+      '@kpstreams/webrtc-client': 0.2.1
+      '@noble/hashes': 1.8.0
+
+  '@anon-rpc/harness-core@0.4.0':
+    dependencies:
       '@noble/hashes': 1.8.0
 
   '@esbuild/aix-ppc64@0.21.5':

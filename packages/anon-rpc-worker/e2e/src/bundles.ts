@@ -12,6 +12,7 @@ import { TestbedError } from "./errors.js";
 export const HARNESS_PACKAGES = {
   "0.3.2": "@anon-rpc/browser-harness",
   "0.3.0": "@anon-rpc/browser-harness-0.3.0",
+  "0.4.0": "@anon-rpc/browser-harness-0.4.0",
 } as const;
 
 export type HarnessVersion = keyof typeof HARNESS_PACKAGES;

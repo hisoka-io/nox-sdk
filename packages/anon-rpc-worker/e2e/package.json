@@ -17,6 +17,7 @@
   "devDependencies": {
     "@anon-rpc/browser-harness": "0.3.2",
     "@anon-rpc/browser-harness-0.3.0": "npm:@anon-rpc/browser-harness@0.3.0",
+    "@anon-rpc/browser-harness-0.4.0": "npm:@anon-rpc/browser-harness@0.4.0",
     "@kpstreams/webrtc-client": "0.2.1",
     "@noble/hashes": "1.8.0",
     "@playwright/test": "1.63.0",
