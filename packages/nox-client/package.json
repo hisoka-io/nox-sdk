@@ -1,7 +1,7 @@
 {
   "name": "@hisoka-io/nox-client",
   "version": "0.9.0",
-  "description": "TypeScript client SDK for the NOX mixnet - anonymous DeFi transactions and HTTP proxying",
+  "description": "TypeScript client SDK for the Nox mixnet: route HTTPS, JSON-RPC and Ethereum transactions through Sphinx packets",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
