@@ -2,7 +2,17 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
-## Unreleased
+## 0.10.0 (2026-11-11)
+
+Depends on `@hisoka-io/nox-wasm` 0.3.0.
+
+### Changed
+
+- `selectRoute` fails closed: a candidate that shares a Sphinx key with an earlier hop is skipped, and the route
+  throws `NO_NODES_AVAILABLE` unless entry, mix and exit have distinct node IDs and distinct keys. A pinned entry
+  and an exit with the same key are refused. A topology where two registry entries share a key can now yield fewer
+  routes; a call that used to return a route on such a topology now throws.
+- Package description names the Nox mixnet use cases.
 
 ### Fixed
 

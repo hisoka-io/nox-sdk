@@ -2,7 +2,11 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
-## Unreleased
+## 0.5.0 (2026-11-11)
+
+Built on `@hisoka-io/nox-client` 0.10.0 and `@hisoka-io/nox-wasm` 0.3.0; nox-tls on rustls 0.23.46, rustls-webpki
+0.103.16 and webpki-roots 1.0.11 (same as 0.4.2). Every 0.4 config stays valid; `{ surbFormat: "auto" }` keeps the
+0.4 reply format behaviour.
 
 ### Added
 
@@ -17,6 +21,8 @@ All notable changes to `@hisoka-io/anon-rpc-worker`.
 - Default `surbFormat` is `"v2"` (was `"auto"`): the worker builds format v2 reply blocks only and never falls back
   to v1. Nodes that do not advertise `surb_v2` are left out of routes; a call with no such route fails with
   `network-error`. `{ surbFormat: "auto" }` restores the 0.4 behaviour.
+- Routes need three distinct node keys (nox-client 0.10.0 `selectRoute`); a route that cannot meet this fails
+  with `network-error` before anything is sent.
 
 ## 0.4.2 (2026-11-10)
 
