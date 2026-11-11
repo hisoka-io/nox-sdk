@@ -32,6 +32,9 @@
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild"
-    ]
+    ],
+    "overrides": {
+      "vite": "8.3.5"
+    }
   }
 }
