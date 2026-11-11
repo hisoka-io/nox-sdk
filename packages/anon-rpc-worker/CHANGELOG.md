@@ -2,6 +2,16 @@
 
 All notable changes to `@hisoka-io/anon-rpc-worker`.
 
+## Unreleased
+
+### Added
+
+- anon-rpc SPEC 0.4.0 (`spec-types.ts` from ethereum/anon-rpc `c8980fb`). `anonOptions.isolationKey` is honoured:
+  each key gets its own Nox client (KPS connections, entries, SURB pool, exit choice) and its own TLS sessions, so
+  nothing is shared across keys. Config `maxIsolationKeys` (8) and `isolationIdleMs` (300,000). A malformed
+  `anonOptions` or key fails the call with `unsupported`. Forwarded fetch init entries are ignored.
+- Log events `isolation.open`, `isolation.ready`, `isolation.close`, `isolation.connect.failed` (no key in them).
+
 ## 0.4.2 (2026-11-10)
 
 Same code and config as 0.4.1; only the embedded TLS library changes.

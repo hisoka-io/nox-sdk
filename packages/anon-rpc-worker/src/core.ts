@@ -14,7 +14,9 @@
  * mixnet in the background (S1); each verified check refreshes the
  * learned-anchor cache. With `tls` other than `"off"` the embedded TLS module
  * is compiled at boot too, off the first call's path, and https calls go
- * through TLS tunnels (src/tls/).
+ * through TLS tunnels (src/tls/). Calls with an `anonOptions.isolationKey`
+ * (SPEC 9.3) run on a client and TLS pool of their own per key
+ * (src/isolation.ts); calls without one use the boot client.
  */
 import {
   DISCOVERY_FIRST_CHECK_MAX_DEFER_MS,
@@ -53,6 +55,7 @@ import {
   type PreparedRequest,
 } from "./fetch-map.js";
 import { LocalAnswers } from "./local-answers.js";
+import { isolationKeyOf } from "./isolation.js";
 import type { NoxTlsBindings } from "./tls/module.js";
 import { TlsPool } from "./tls/pool.js";
 import { TlsTransport } from "./tls/transport.js";
@@ -102,6 +105,24 @@ export const WASM_TRAP_LIMIT = 3;
 export const WASM_TRAP_WINDOW_MS = 60_000;
 /** Bytes of the optional warm-up echo. */
 export const WARMUP_ECHO_BYTES = 16;
+/** Longest gap between sweeps that close idle isolation lanes. */
+export const ISOLATION_SWEEP_MAX_MS = 60_000;
+
+/**
+ * One isolation key's own client and TLS sessions (src/isolation.ts). Nothing
+ * here is shared with another key or with calls that carry no key.
+ */
+interface IsolationLane {
+  readonly answers: LocalAnswers;
+  client: NoxClientPort | undefined;
+  tlsPool: TlsPool | undefined;
+  tunnels: TlsTransport | undefined;
+  connecting: Promise<NoxClientPort> | undefined;
+  /** Calls holding the lane; only a lane with none may be closed. */
+  active: number;
+  lastUsed: number;
+  closed: boolean;
+}
 
 /** Stable identity of a pinned snapshot, for the storage cache binding. */
 export function snapshotIdentity(pinned: PinnedSnapshot): string {
@@ -169,6 +190,10 @@ class NoxWorker {
   private tlsPool: TlsPool | undefined;
   private tunnels: TlsTransport | undefined;
   private readonly answers = new LocalAnswers();
+  private readonly lanes = new Map<string, IsolationLane>();
+  private laneTimer: ReturnType<typeof setInterval> | undefined;
+  private clientConfig: NoxClientConfig | undefined;
+  private tlsBindings: NoxTlsBindings | undefined;
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
@@ -275,13 +300,9 @@ class NoxWorker {
       return;
     }
     this.client = client;
+    this.tlsBindings = tls;
     if (tls !== undefined) {
-      this.tlsPool = new TlsPool(client, tls, cfg, {
-        now: this.now,
-        random: this.random,
-        randomBytes: (length) => crypto.getRandomValues(new Uint8Array(length)),
-        log: this.log,
-      });
+      this.tlsPool = this.newTlsPool(client, tls, cfg);
       this.tunnels = new TlsTransport(this.tlsPool, tls, cfg, this.log, this.now);
     }
     this.startRemovalCache(pinned, snapshotId, stored);
@@ -307,6 +328,8 @@ class NoxWorker {
   private shutdown(reason: NoxWorkerError): void {
     if (this.cacheTimer !== undefined) clearInterval(this.cacheTimer);
     this.cacheTimer = undefined;
+    for (const [key, lane] of [...this.lanes]) this.closeLane(key, lane);
+    this.stopLaneSweep();
     this.tlsPool?.close();
     this.tlsPool = undefined;
     this.tunnels = undefined;
@@ -357,6 +380,9 @@ class NoxWorker {
         ...(deprioritize.length === 0 ? {} : { deprioritize }),
       },
     };
+    // Isolation lanes connect with the same settings: same pinned snapshot,
+    // bootstrap and policy, with connections, entries and SURBs of their own.
+    this.clientConfig = config;
     for (let attempt = 1; ; attempt++) {
       if (this.failed || this.stopped) return undefined;
       try {
@@ -504,9 +530,13 @@ class NoxWorker {
     const seq = ++this.callSeq;
     const started = this.now();
     const budget = new CallControl(call.requestInit?.signal, cfg.callDeadlineMs, this.now);
+    let lane: IsolationLane | undefined;
     try {
+      const key = isolationKeyOf(call.requestInit);
       const prepared = await prepareRequest(call.url, call.requestInit, cfg, budget.signal);
-      const local = this.answers.lookup(prepared);
+      if (key !== undefined) lane = this.reserveLane(key, cfg);
+      const answers = lane?.answers ?? this.answers;
+      const local = answers.lookup(prepared);
       if (local !== undefined) {
         this.log.debug("call.done", {
           seq,
@@ -514,12 +544,15 @@ class NoxWorker {
           ms: this.now() - started,
           outcome: "ok",
           local: local.kind,
+          isolated: lane !== undefined,
         });
         return local.response;
       }
-      const client = await this.waitReady(budget.signal);
-      const response = await sendPrepared(prepared, client, cfg, budget, this.tunnels);
-      if (this.answers.observe(prepared, response) === "verify") this.verifyAnswer(prepared, client, cfg);
+      const primary = await this.waitReady(budget.signal);
+      const client = lane === undefined ? primary : await this.openLane(lane, cfg, budget.signal);
+      const tunnels = lane === undefined ? this.tunnels : lane.tunnels;
+      const response = await sendPrepared(prepared, client, cfg, budget, tunnels);
+      if (answers.observe(prepared, response) === "verify") this.verifyAnswer(prepared, client, tunnels, answers, cfg);
       if (this.log.enabled("debug")) {
         this.log.debug("call.done", {
           seq,
@@ -528,6 +561,7 @@ class NoxWorker {
           bytesIn: response.body instanceof Uint8Array ? response.body.length : null,
           ms: this.now() - started,
           outcome: "ok",
+          isolated: lane !== undefined,
         });
       }
       return response;
@@ -539,27 +573,165 @@ class NoxWorker {
     } finally {
       budget.dispose();
       // Spares open only once a wallet call settled (background work never delays the first call).
-      this.tlsPool?.enableBackground();
+      if (lane === undefined) {
+        this.tlsPool?.enableBackground();
+      } else {
+        lane.active -= 1;
+        lane.lastUsed = this.now();
+        lane.tlsPool?.enableBackground();
+      }
     }
   }
 
   /**
    * Send a memo call (`eth_chainId`, `net_version`) once more through the
    * mixnet on a fresh route, in the background; the answer is kept only when
-   * both agree (see `LocalAnswers`).
+   * both agree (see `LocalAnswers`). It goes out on the client of the call
+   * that produced the answer, so a keyed call's check stays in its lane.
    */
-  private verifyAnswer(prepared: PreparedRequest, client: NoxClientPort, cfg: NoxWorkerConfig): void {
+  private verifyAnswer(
+    prepared: PreparedRequest,
+    client: NoxClientPort,
+    tunnels: TlsTransport | undefined,
+    answers: LocalAnswers,
+    cfg: NoxWorkerConfig,
+  ): void {
     const budget = new CallControl(undefined, cfg.callDeadlineMs, this.now);
-    sendPrepared(prepared, client, cfg, budget, this.tunnels)
+    sendPrepared(prepared, client, cfg, budget, tunnels)
       .then(
         (response) => {
-          this.answers.observe(prepared, response);
+          answers.observe(prepared, response);
         },
         (error: unknown) => {
           this.log.debug("local.verify.failed", { code: errorCode(mapClientError(error)) ?? "error" });
         },
       )
       .finally(() => budget.dispose());
+  }
+
+  /**
+   * The lane for `key`, held by one more call. A new key takes a free slot,
+   * closing the least recently used idle lane when all `maxIsolationKeys`
+   * slots are taken; with every slot busy the call is refused rather than
+   * served on another key's lane. The key itself is never logged.
+   */
+  private reserveLane(key: string, cfg: NoxWorkerConfig): IsolationLane {
+    let lane = this.lanes.get(key);
+    if (lane === undefined) {
+      if (this.lanes.size >= cfg.maxIsolationKeys) this.closeLeastRecentIdleLane();
+      if (this.lanes.size >= cfg.maxIsolationKeys) {
+        throw callError(
+          CALL_CODES.networkError,
+          `All ${cfg.maxIsolationKeys} isolation key slots have calls in flight (config.maxIsolationKeys); ` +
+            "retry once one finishes",
+        );
+      }
+      lane = {
+        answers: new LocalAnswers(),
+        client: undefined,
+        tlsPool: undefined,
+        tunnels: undefined,
+        connecting: undefined,
+        active: 0,
+        lastUsed: this.now(),
+        closed: false,
+      };
+      this.lanes.set(key, lane);
+      this.log.debug("isolation.open", { lanes: this.lanes.size });
+      this.startLaneSweep(cfg);
+    }
+    lane.active += 1;
+    lane.lastUsed = this.now();
+    return lane;
+  }
+
+  /** The lane's client, connecting it on first use (one attempt, bounded by the call's budget). */
+  private async openLane(lane: IsolationLane, cfg: NoxWorkerConfig, signal: AbortSignal): Promise<NoxClientPort> {
+    if (lane.client !== undefined) return lane.client;
+    lane.connecting ??= this.connectLane(lane, cfg);
+    return raceAbort(lane.connecting, signal);
+  }
+
+  private async connectLane(lane: IsolationLane, cfg: NoxWorkerConfig): Promise<NoxClientPort> {
+    const config = this.clientConfig;
+    if (config === undefined || this.failed || this.stopped) {
+      lane.connecting = undefined;
+      throw callError(CALL_CODES.networkError, "The worker is not running");
+    }
+    const started = this.now();
+    let client: NoxClientPort;
+    try {
+      client = await this.deps.connect(config);
+    } catch (error) {
+      lane.connecting = undefined;
+      this.log.warn("isolation.connect.failed", { code: errorCode(error) ?? "error", ms: this.now() - started });
+      throw error;
+    }
+    if (lane.closed || this.failed || this.stopped) {
+      client.disconnect();
+      throw callError(CALL_CODES.networkError, "The isolation lane closed while it connected");
+    }
+    lane.client = client;
+    const tls = this.tlsBindings;
+    if (tls !== undefined) {
+      lane.tlsPool = this.newTlsPool(client, tls, cfg);
+      lane.tunnels = new TlsTransport(lane.tlsPool, tls, cfg, this.log, this.now);
+    }
+    this.log.info("isolation.ready", { lanes: this.lanes.size, ms: this.now() - started });
+    return client;
+  }
+
+  private newTlsPool(client: NoxClientPort, tls: NoxTlsBindings, cfg: NoxWorkerConfig): TlsPool {
+    return new TlsPool(client, tls, cfg, {
+      now: this.now,
+      random: this.random,
+      randomBytes: (length) => crypto.getRandomValues(new Uint8Array(length)),
+      log: this.log,
+    });
+  }
+
+  private closeLane(key: string, lane: IsolationLane): void {
+    lane.closed = true;
+    lane.tlsPool?.close();
+    lane.tlsPool = undefined;
+    lane.tunnels = undefined;
+    lane.client?.disconnect();
+    lane.client = undefined;
+    if (this.lanes.get(key) === lane) this.lanes.delete(key);
+    if (this.lanes.size === 0) this.stopLaneSweep();
+  }
+
+  private closeLeastRecentIdleLane(): void {
+    let oldest: [string, IsolationLane] | undefined;
+    for (const entry of this.lanes) {
+      if (entry[1].active > 0) continue;
+      if (oldest === undefined || entry[1].lastUsed < oldest[1].lastUsed) oldest = entry;
+    }
+    if (oldest === undefined) return;
+    this.closeLane(oldest[0], oldest[1]);
+    this.log.debug("isolation.close", { reason: "capacity", lanes: this.lanes.size });
+  }
+
+  /** Close lanes idle for `isolationIdleMs`. */
+  private sweepLanes(cfg: NoxWorkerConfig): void {
+    const now = this.now();
+    for (const [key, lane] of [...this.lanes]) {
+      if (lane.active === 0 && now - lane.lastUsed >= cfg.isolationIdleMs) {
+        this.closeLane(key, lane);
+        this.log.debug("isolation.close", { reason: "idle", lanes: this.lanes.size });
+      }
+    }
+  }
+
+  private startLaneSweep(cfg: NoxWorkerConfig): void {
+    if (this.laneTimer !== undefined) return;
+    const every = Math.min(Math.ceil(cfg.isolationIdleMs / 2), ISOLATION_SWEEP_MAX_MS);
+    this.laneTimer = setInterval(() => this.sweepLanes(cfg), every);
+  }
+
+  private stopLaneSweep(): void {
+    if (this.laneTimer !== undefined) clearInterval(this.laneTimer);
+    this.laneTimer = undefined;
   }
 
   private waitReady(signal: AbortSignal): Promise<NoxClientPort> {
@@ -639,6 +811,25 @@ class CallControl implements CallBudget {
   private abort(reason: NoxWorkerError): void {
     if (!this.controller.signal.aborted) this.controller.abort(reason);
   }
+}
+
+/** `promise`, or the signal's reason once it aborts (the promise itself runs on). */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /** FIFO counting semaphore for the accept loop's back-pressure. */
