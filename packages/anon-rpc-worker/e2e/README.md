@@ -4,7 +4,7 @@ This package runs the Nox anon-rpc worker the way a wallet runs it, entirely on 
 
 ```
 headless Chromium (Playwright)
-  host page: published @anon-rpc/browser-harness 0.3.2 and 0.3.0
+  host page: published @anon-rpc/browser-harness 0.4.0, 0.3.2 and 0.3.0
     reads a WorkerSpecifier on a local anvil chain, fetches the bundle from a local keccak resolver
     (or over KPS from a nox-kps sidecar, `kps:` resolver), verifies keccak256, boots the worker in
     the harness sandbox

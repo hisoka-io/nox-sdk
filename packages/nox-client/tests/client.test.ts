@@ -20,6 +20,7 @@ import { computeTopologyFingerprint } from "../src/topology.js";
 import { parseNodes } from "../src/topology.js";
 import { Interface } from "ethers";
 import type { Route, TopologyNode } from "../src/types.js";
+import { nodeKey } from "./helpers/node_key.js";
 
 // ── Mock infrastructure ────────────────────────────────────────────────────
 
@@ -769,11 +770,11 @@ describe("retry on a different route", () => {
 
   function retryClient(): { client: NoxClient; routes: Route[]; outcomes: (Uint8Array | Error)[] } {
     const nodes: TopologyNode[] = [
-      { id: "0x01", address: "https://entry.test", routingAddress: "/e", publicKey: new Uint8Array(32), layer: 0, role: 1 },
-      { id: "0x02", address: "", routingAddress: "/m1", publicKey: new Uint8Array(32), layer: 1, role: 1 },
-      { id: "0x03", address: "", routingAddress: "/m2", publicKey: new Uint8Array(32), layer: 1, role: 1 },
-      { id: "0x04", address: "", routingAddress: "/x1", publicKey: new Uint8Array(32), layer: 2, role: 2 },
-      { id: "0x05", address: "", routingAddress: "/x2", publicKey: new Uint8Array(32), layer: 2, role: 2 },
+      { id: "0x01", address: "https://entry.test", routingAddress: "/e", publicKey: nodeKey("0x01"), layer: 0, role: 1 },
+      { id: "0x02", address: "", routingAddress: "/m1", publicKey: nodeKey("0x02"), layer: 1, role: 1 },
+      { id: "0x03", address: "", routingAddress: "/m2", publicKey: nodeKey("0x03"), layer: 1, role: 1 },
+      { id: "0x04", address: "", routingAddress: "/x1", publicKey: nodeKey("0x04"), layer: 2, role: 2 },
+      { id: "0x05", address: "", routingAddress: "/x2", publicKey: nodeKey("0x05"), layer: 2, role: 2 },
     ];
     const client = Object.create(NoxClient.prototype) as NoxClient;
     Reflect.set(client, "_nodes", nodes);
@@ -900,12 +901,12 @@ describe("reply block format selection", () => {
     wasmV2?: boolean;
   }): { client: NoxClient; sent: { route: Route; version: number }[]; outcomes: (Uint8Array | Error)[] } {
     const base: TopologyNode[] = [
-      { id: "0x01", address: "https://entry-a.test", routingAddress: "/ea", publicKey: new Uint8Array(32), layer: 0, role: 1 },
-      { id: "0x06", address: "https://entry-b.test", routingAddress: "/eb", publicKey: new Uint8Array(32), layer: 0, role: 1 },
-      { id: "0x02", address: "", routingAddress: "/m1", publicKey: new Uint8Array(32), layer: 1, role: 1 },
-      { id: "0x03", address: "", routingAddress: "/m2", publicKey: new Uint8Array(32), layer: 1, role: 1 },
-      { id: "0x04", address: "", routingAddress: "/x1", publicKey: new Uint8Array(32), layer: 2, role: 2 },
-      { id: "0x05", address: "", routingAddress: "/x2", publicKey: new Uint8Array(32), layer: 2, role: 2 },
+      { id: "0x01", address: "https://entry-a.test", routingAddress: "/ea", publicKey: nodeKey("0x01"), layer: 0, role: 1 },
+      { id: "0x06", address: "https://entry-b.test", routingAddress: "/eb", publicKey: nodeKey("0x06"), layer: 0, role: 1 },
+      { id: "0x02", address: "", routingAddress: "/m1", publicKey: nodeKey("0x02"), layer: 1, role: 1 },
+      { id: "0x03", address: "", routingAddress: "/m2", publicKey: nodeKey("0x03"), layer: 1, role: 1 },
+      { id: "0x04", address: "", routingAddress: "/x1", publicKey: nodeKey("0x04"), layer: 2, role: 2 },
+      { id: "0x05", address: "", routingAddress: "/x2", publicKey: nodeKey("0x05"), layer: 2, role: 2 },
     ];
     const nodes = base.map((node) =>
       opts.capable.includes(node.id) ? { ...node, capabilities: V2 } : node,
@@ -1108,10 +1109,10 @@ describe("replies through a non-pinned entry", () => {
 describe("paid exit capability", () => {
   function capabilityClient(capabilities: (readonly string[] | undefined)[]): NoxClient {
     const base: TopologyNode[] = [
-      { id: "0x0000000000000000000000000000000000000001", address: "https://entry.test", routingAddress: "/e", publicKey: new Uint8Array(32), layer: 0, role: 1 },
-      { id: "0x0000000000000000000000000000000000000002", address: "", routingAddress: "/m", publicKey: new Uint8Array(32), layer: 1, role: 1 },
-      { id: "0x0000000000000000000000000000000000000004", address: "", routingAddress: "/x1", publicKey: new Uint8Array(32), layer: 2, role: 2 },
-      { id: "0x0000000000000000000000000000000000000005", address: "", routingAddress: "/x2", publicKey: new Uint8Array(32), layer: 2, role: 2 },
+      { id: "0x0000000000000000000000000000000000000001", address: "https://entry.test", routingAddress: "/e", publicKey: nodeKey("0x0000000000000000000000000000000000000001"), layer: 0, role: 1 },
+      { id: "0x0000000000000000000000000000000000000002", address: "", routingAddress: "/m", publicKey: nodeKey("0x0000000000000000000000000000000000000002"), layer: 1, role: 1 },
+      { id: "0x0000000000000000000000000000000000000004", address: "", routingAddress: "/x1", publicKey: nodeKey("0x0000000000000000000000000000000000000004"), layer: 2, role: 2 },
+      { id: "0x0000000000000000000000000000000000000005", address: "", routingAddress: "/x2", publicKey: nodeKey("0x0000000000000000000000000000000000000005"), layer: 2, role: 2 },
     ];
     const nodes = base.map((node, index) => {
       const nodeCapabilities = capabilities[index];

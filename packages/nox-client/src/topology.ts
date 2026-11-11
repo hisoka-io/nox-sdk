@@ -678,6 +678,11 @@ export function hasHttpEntry(node: TopologyNode): boolean {
  * the route holds that many, the remaining hops come from members that are
  * not on probation whenever such a candidate exists. A layer with only
  * probation members still serves (availability over the cap).
+ *
+ * The route always has three hops with three distinct node IDs and three
+ * distinct Sphinx keys; there is no shorter path. Exit-capable nodes fill the
+ * entry or mix slot only when no relay can. When no such route exists the
+ * call throws `NoNodesAvailable` instead of degrading.
  */
 export function selectRoute(
   nodes: TopologyNode[],
@@ -754,7 +759,20 @@ export function selectRoute(
     );
   }
 
-  const selectableEntries = entries.filter((node) => node.id !== pinnedExit?.id);
+  if (
+    pinnedExit !== undefined &&
+    canonicalPinnedEntry !== undefined &&
+    sameKey(pinnedExit, canonicalPinnedEntry)
+  ) {
+    throw new NoxClientError(
+      "Selected exit and pinned entry share a Sphinx key",
+      NoxClientErrorCode.NoNodesAvailable,
+    );
+  }
+
+  const selectableEntries = entries.filter(
+    (node) => node.id !== pinnedExit?.id && (pinnedExit === undefined || !sameKey(node, pinnedExit)),
+  );
   const entryOnly = selectableEntries.filter(
     (node) => !exits.some((exit) => exit.id === node.id),
   );
@@ -771,7 +789,11 @@ export function selectRoute(
   }
 
   const eligibleMixes = mixes.filter(
-    (n) => n.id !== entry.id && n.id !== pinnedExit?.id,
+    (n) =>
+      n.id !== entry.id &&
+      n.id !== pinnedExit?.id &&
+      !sameKey(n, entry) &&
+      (pinnedExit === undefined || !sameKey(n, pinnedExit)),
   );
   const mixOnly = eligibleMixes.filter((n) => !exits.some((e) => e.id === n.id));
   const used = (entry.probation === true ? 1 : 0) + (pinnedExit?.probation === true ? 1 : 0);
@@ -785,7 +807,9 @@ export function selectRoute(
     );
   }
 
-  const eligibleExits = exits.filter((n) => n.id !== entry.id && n.id !== mix.id);
+  const eligibleExits = exits.filter(
+    (n) => n.id !== entry.id && n.id !== mix.id && !sameKey(n, entry) && !sameKey(n, mix),
+  );
   const exitBudget = maxProbation - (entry.probation === true ? 1 : 0) - (mix.probation === true ? 1 : 0);
   const exit = pinnedExit ?? pickRandom(preferNotAvoided(withinProbation(eligibleExits, exitBudget), avoid));
   if (exit === undefined) {
@@ -795,7 +819,29 @@ export function selectRoute(
     );
   }
 
+  assertDistinctHops(entry, mix, exit);
   return { entry, mix, exit };
+}
+
+/** Constant-time equality of two nodes' Sphinx public keys. */
+function sameKey(a: TopologyNode, b: TopologyNode): boolean {
+  if (a.publicKey.length !== b.publicKey.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.publicKey.length; i++) {
+    diff |= (a.publicKey[i] ?? 0) ^ (b.publicKey[i] ?? 0);
+  }
+  return diff === 0;
+}
+
+/** Fail closed unless the three hops are distinct by node ID and by Sphinx key. */
+function assertDistinctHops(entry: TopologyNode, mix: TopologyNode, exit: TopologyNode): void {
+  const ids = new Set([entry.id, mix.id, exit.id]);
+  if (ids.size !== 3 || sameKey(entry, mix) || sameKey(entry, exit) || sameKey(mix, exit)) {
+    throw new NoxClientError(
+      `Route needs three distinct hops (entry ${entry.id}, mix ${mix.id}, exit ${exit.id})`,
+      NoxClientErrorCode.NoNodesAvailable,
+    );
+  }
 }
 
 /** True when the seed reports that this node handles format v2 reply blocks. */

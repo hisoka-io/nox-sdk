@@ -300,6 +300,39 @@ test.describe("Nox anon-rpc worker over KPS through the local mesh", () => {
     });
   }
 
+  test("harness 0.4.0: each anonOptions.isolationKey gets its own client; calls without one keep the boot client", async ({
+    cfg,
+    chains,
+    guardedHost,
+  }) => {
+    const page = await guardedHost.open("0.4.0");
+    const result = await boot(page, chains.specifier.url, cfg.worker.readyTimeoutMs, { ...(pin().config as object), logLevel: "debug" });
+    expect(result.ok, JSON.stringify(result.error)).toBe(true);
+    const keyed = async (isolationKey: string | undefined) => {
+      const fetched = await page.evaluate((request) => window.e2e.fetch(request), {
+        id: WORKER_ID,
+        url: chains.upstream.url,
+        method: "POST",
+        headers: [["content-type", "application/json"]] as [string, string][],
+        body: JSON.stringify(rpcCall("eth_blockNumber")),
+        timeoutMs: cfg.worker.callTimeoutMs,
+        ...(isolationKey === undefined ? {} : { anonOptions: { isolationKey } }),
+      });
+      expect(fetched.ok, JSON.stringify(fetched.error)).toBe(true);
+      expect(fetched.status).toBe(200);
+      expectHex(rpcResult(JSON.parse(fetched.bodyText ?? "null") as unknown), "eth_blockNumber via an isolation lane");
+    };
+    await keyed(undefined);
+    await keyed("origin-a");
+    await keyed("origin-b");
+    await keyed("origin-a");
+    const lines = await drainLogs(page);
+    expect(lines.filter((line) => line.text.includes("isolation.ready"))).toHaveLength(2);
+    expect(lines.some((line) => line.text.includes("origin-a") || line.text.includes("origin-b"))).toBe(false);
+    expectKpsOnlyEgress(guardedHost);
+    await page.evaluate((id) => window.e2e.close(id), WORKER_ID);
+  });
+
   test("kps: resolver only: the bundle loads from a nox-kps sidecar and the worker serves", async ({
     cfg,
     runPaths,

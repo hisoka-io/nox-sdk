@@ -4,11 +4,29 @@ All notable changes to `@hisoka-io/anon-rpc-worker`.
 
 ## Unreleased
 
+### Added
+
+- anon-rpc SPEC 0.4.0 (`spec-types.ts` from ethereum/anon-rpc `c8980fb`). `anonOptions.isolationKey` is honoured:
+  each key gets its own Nox client (KPS connections, entries, SURB pool, exit choice) and its own TLS sessions, so
+  nothing is shared across keys. Config `maxIsolationKeys` (8) and `isolationIdleMs` (300,000). A malformed
+  `anonOptions` or key fails the call with `unsupported`. Forwarded fetch init entries are ignored.
+- Log events `isolation.open`, `isolation.ready`, `isolation.close`, `isolation.connect.failed` (no key in them).
+
 ### Changed
 
 - Default `surbFormat` is `"v2"` (was `"auto"`): the worker builds format v2 reply blocks only and never falls back
   to v1. Nodes that do not advertise `surb_v2` are left out of routes; a call with no such route fails with
   `network-error`. `{ surbFormat: "auto" }` restores the 0.4 behaviour.
+
+## 0.4.2 (2026-11-10)
+
+Same code and config as 0.4.1; only the embedded TLS library changes.
+
+### Security
+
+- nox-tls now builds on rustls 0.23.46, rustls-webpki 0.103.16 and webpki-roots 1.0.11. Certificates chaining
+  through the emSign intermediates distrusted in RUSTSEC-2026-0381 and RUSTSEC-2026-0382 are rejected, and the
+  rustls fixes for RUSTSEC-2026-0346 to 0349 are included.
 
 ## 0.4.1 (2026-10-25)
 

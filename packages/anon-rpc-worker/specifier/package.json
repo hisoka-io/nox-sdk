@@ -21,8 +21,8 @@
     "@types/node": "^20.0.0",
     "ethers": "6.16.0",
     "typescript": "^5.4.0",
-    "vite-node": "^1.6.0",
-    "vitest": "^1.6.0"
+    "vite-node": "^6.0.0",
+    "vitest": "^4.1.12"
   },
   "engines": {
     "node": ">=20"

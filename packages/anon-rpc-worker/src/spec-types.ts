@@ -1,7 +1,7 @@
 // Copied verbatim from ethereum/anon-rpc, impl/passthrough-worker/src/spec-types.ts
-// at commit f2c8a758caaa555974a3c79769e8cb4a40ac1ae1 (anon-rpc SPEC 0.3.2).
+// at commit c8980fb1f89d712c91595863e6f53bd63f64c56d (anon-rpc SPEC 0.4.0).
 // Copyright (c) 2026 Ethereum Foundation. MIT License:
-// https://github.com/ethereum/anon-rpc/blob/f2c8a758caaa555974a3c79769e8cb4a40ac1ae1/LICENSE
+// https://github.com/ethereum/anon-rpc/blob/c8980fb1f89d712c91595863e6f53bd63f64c56d/LICENSE
 // Keep in sync with the SPEC version the worker declares.
 
 // Worker-facing type surface from SPEC.md (§7–§13): the `anonRpcWorker`
@@ -22,9 +22,9 @@ export type AnonRpcWorkerApi = {
   // code/message on the error. Failure is final.
   signalFailed(reason?: { code?: string; message?: string }): void;
   acceptCall(opts?: { signal?: AbortSignal }): Promise<IncomingCall>;
-  // The host's WorkerInit.config (§7.1): a structured clone, fixed for the
-  // worker's lifetime; undefined when the host supplied none.
-  config: unknown;
+  // The host's WorkerInit.config (§7.1): a §9.4 copy, fixed for the worker's
+  // lifetime; undefined when the host supplied none.
+  config: PlainValue;
   kps: KpsApi;
   storage: StorageApi;
   log: LogApi;
@@ -53,7 +53,29 @@ export type AnonRequestInit = {
   body?: ByteBody;
   redirect?: "follow" | "manual" | "error";
   signal?: AbortSignal;
+  anonOptions?: AnonOptions;
+  // Forwarded entries (§9.1): every other key of the host's fetch init.
+  [key: string]: unknown;
 };
+
+/** §9.3: per-call options addressed to the worker, not the destination. */
+export type AnonOptions = {
+  // Calls under different keys should not be linkable to one another.
+  isolationKey?: string;
+  [key: string]: PlainValue;
+};
+
+/** §9.4: the value domain every harness boundary carries identically. */
+export type PlainValue =
+  | undefined
+  | null
+  | boolean
+  | number
+  | string
+  | Uint8Array
+  | ArrayBuffer
+  | PlainValue[]
+  | { [key: string]: PlainValue };
 
 export type AnonFetchResponse = {
   status: number;

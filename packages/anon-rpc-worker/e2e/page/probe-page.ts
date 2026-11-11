@@ -142,6 +142,9 @@ const api: E2EPageApi = {
       const init: RequestInit = { method: request.method ?? "GET", signal: controller.signal };
       if (request.headers !== undefined) init.headers = request.headers.map(([k, v]) => [k, v]);
       if (request.body !== undefined) init.body = request.body;
+      if (request.anonOptions !== undefined) {
+        (init as RequestInit & { anonOptions?: unknown }).anonOptions = { ...request.anonOptions };
+      }
       const response = await worker.fetch(request.url, init);
       const bodyText = await response.text();
       const headers: [string, string][] = [];

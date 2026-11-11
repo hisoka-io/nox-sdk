@@ -86,6 +86,14 @@ export interface NoxWorkerConfig {
   readonly tlsGapMs: number;
   /** Copies per exchange sent for silence or a gap. */
   readonly tlsMaxCopies: number;
+  /**
+   * Isolation keys (SPEC 9.3 `anonOptions.isolationKey`) served at once. Each
+   * key has its own client (KPS connections, entries, SURBs, exits) and its
+   * own TLS sessions; calls without a key use the boot client.
+   */
+  readonly maxIsolationKeys: number;
+  /** A key's client and sessions close after this long without a call. */
+  readonly isolationIdleMs: number;
 }
 
 export const CONFIG_DEFAULTS: NoxWorkerConfig = Object.freeze({
@@ -125,6 +133,8 @@ export const CONFIG_DEFAULTS: NoxWorkerConfig = Object.freeze({
   tlsCopyAfterMs: 2_500,
   tlsGapMs: 800,
   tlsMaxCopies: 3,
+  maxIsolationKeys: 8,
+  isolationIdleMs: 300_000,
 });
 
 /** Inclusive integer ranges of the numeric fields. */
@@ -146,6 +156,8 @@ export const CONFIG_RANGES = Object.freeze({
   tlsCopyAfterMs: [500, 30_000],
   tlsGapMs: [100, 10_000],
   tlsMaxCopies: [1, 5],
+  maxIsolationKeys: [1, 32],
+  isolationIdleMs: [10_000, 3_600_000],
 } as const satisfies Record<string, readonly [number, number]>);
 
 /** `gateways` and `bridges` list length bounds. */

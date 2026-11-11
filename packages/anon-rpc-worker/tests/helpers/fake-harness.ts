@@ -10,6 +10,7 @@ import type {
   IncomingCall,
   KpsApi,
   LogArg,
+  PlainValue,
   StorageApi,
 } from "../../src/spec-types.js";
 
@@ -82,7 +83,7 @@ export class FakeHarness {
         this.failedResolve();
       },
       acceptCall: () => this.acceptCall(),
-      config: structuredClone(config),
+      config: structuredClone(config) as PlainValue,
       kps: kps as KpsApi,
       storage,
       log: { debug: log("debug"), info: log("info"), warn: log("warn"), error: log("error") },

@@ -20,7 +20,7 @@ over one TCP connection, seeing the provider's host name, timing and sizes (see 
 
 | Path | Contents |
 |---|---|
-| `src/` | The worker: `worker.ts` (bundle entry), `core.ts` (boot, readiness, accept loop, deadlines), `config.ts`, `fetch-map.ts` (`fetch` to Nox `HttpRequest`, redirects, gzip), `tls/` (end-to-end TLS: `tunnel.ts` one exit tunnel, `channel.ts` TLS and HTTP/1.1 over it, `pool.ts` sessions, spares and exit choice, `transport.ts` the per-hop transport and error mapping, `module.ts` the TLS module bindings), `jsonrpc.ts`, `errors.ts`, `log.ts`, `storage.ts`, `spec-types.ts` (anon-rpc SPEC 0.3.2 worker types) |
+| `src/` | The worker: `worker.ts` (bundle entry), `core.ts` (boot, readiness, accept loop, deadlines), `config.ts`, `fetch-map.ts` (`fetch` to Nox `HttpRequest`, redirects, gzip), `tls/` (end-to-end TLS: `tunnel.ts` one exit tunnel, `channel.ts` TLS and HTTP/1.1 over it, `pool.ts` sessions, spares and exit choice, `transport.ts` the per-hop transport and error mapping, `module.ts` the TLS module bindings), `jsonrpc.ts`, `errors.ts`, `log.ts`, `storage.ts`, `isolation.ts` (`anonOptions.isolationKey`), `spec-types.ts` (anon-rpc SPEC 0.4.0 worker types) |
 | `snapshot/` | The pinned registry snapshot, its keccak-256, JSON Schema and reviewed capability hints, and the discovery bootstrap (`nox-bootstrap.json`) |
 | `scripts/` | Snapshot generator and verifier, reproducible WASM and bundle build, hashing, provenance |
 | `specifier/` | Worker specifier contracts (Foundry), a read-only deploy planner and inspector, and the `setWorker` update tool for the stable address |
@@ -63,6 +63,8 @@ optional, and every config valid for 0.1.0 stays valid:
 | `tlsCopyAfterMs` | integer | 2,500 | 500-30,000; another copy of the current tunnel exchange when nothing arrived for this long (raised to the observed p95) |
 | `tlsGapMs` | integer | 800 | 100-10,000; another copy when a gap in the reply stream stays open this long |
 | `tlsMaxCopies` | integer | 3 | 1-5 copies per exchange for silence or a gap |
+| `maxIsolationKeys` | integer | 8 | 1-32 isolation keys served at once, see [Isolation keys](#isolation-keys) |
+| `isolationIdleMs` | integer | 300,000 | 10,000-3,600,000; a key's client and TLS sessions close after this long without a call |
 
 An unknown key, a wrong type or an out-of-range value fails the boot with `bad-config`, naming the field.
 
@@ -75,6 +77,18 @@ Examples:
 ```json5
 { gateways: ["100.56.0.72:15005:uEiBVDwIs40bsslDkM-BYb2AOHw3PHe70_bj5U_09r7vdIQ"] }
 ```
+
+## Isolation keys
+
+anon-rpc SPEC 0.4.0 lets a host pass `anonOptions: { isolationKey }` in a fetch init: calls under different keys
+should look like calls from unrelated clients. The worker gives each key its own Nox client, with its own KPS
+connections, entry and standby entry, SURB pool and exit choice, and its own TLS sessions and spares. Nothing of
+one key is used for another, and calls without a key keep the boot client. A new key connects on its first call,
+so that call also pays one client boot. With `maxIsolationKeys` keys open, a new key closes the least recently
+used idle one; when every key has a call in flight, the call fails with `network-error` instead of sharing a lane.
+The key is never logged. All lanes run in one worker on one device, so they share the host's network address and
+the worker's timing; the separation is at the Nox layer. Other `anonOptions` entries and forwarded fetch init
+entries are ignored.
 
 ## End-to-end TLS
 

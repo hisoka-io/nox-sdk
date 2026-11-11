@@ -46,6 +46,8 @@ export interface FetchRequest {
   readonly timeoutMs: number;
   /** Abort this call after N ms (abort tests); absent means only the timeout applies. */
   readonly abortAfterMs?: number;
+  /** SPEC 9.3 per-call options; harnesses before 0.4.0 drop them. */
+  readonly anonOptions?: { readonly isolationKey?: string };
 }
 
 export interface FetchResult {
