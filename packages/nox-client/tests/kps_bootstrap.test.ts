@@ -8,6 +8,7 @@ import { selectRoute } from "../src/topology.js";
 import { NoxClientErrorCode, type TopologyNode } from "../src/types.js";
 import { kpsAddressFor } from "./helpers/fake_kps.js";
 import { makeBootstrap, makePinned } from "./helpers/pinned_fixture.js";
+import { nodeKey } from "./helpers/node_key.js";
 
 const pinned = makePinned();
 
@@ -110,7 +111,7 @@ describe("probation cap in route selection", () => {
       id,
       address: `kps:${kpsAddressFor(Number.parseInt(id.slice(-2), 16))}`,
       routingAddress: `/ip4/10.0.0.1/tcp/1/p2p/${id}`,
-      publicKey: new Uint8Array(32),
+      publicKey: nodeKey(id),
       layer: 0,
       role,
       ...(probation ? { probation: true } : {}),
