@@ -48,7 +48,7 @@ optional, and every config valid for 0.1.0 stays valid:
 | `maxConcurrentCalls` | integer | 16 | 1-64 |
 | `maxRequestBytes` | integer | 1,048,576 | 1,024-4,194,304 |
 | `maxResponseBytes` | integer | 8,388,608 | 65,536-67,108,864 |
-| `surbFormat` | `"auto"`, `"v1"`, `"v2"` | `"auto"` | |
+| `surbFormat` | `"auto"`, `"v1"`, `"v2"` | `"v2"` | `"v2"`: replies use format v2 reply blocks only; nodes without `surb_v2` are left out of routes, and a call fails with `network-error` when no route of `surb_v2` nodes exists. `"auto"` (the 0.4 default) builds v1 whenever a hop of the chosen route lacks `surb_v2` |
 | `claimIntervalMs` | integer | 200 | 50-2,000 |
 | `bootRetryMaxMs` | integer | 60,000 | 5,000-300,000 |
 | `topologySources` | integer | 2 | 1-4 |

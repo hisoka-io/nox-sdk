@@ -58,7 +58,11 @@ describe.skipIf(!built)("worker bundle smoke", () => {
       }
     });
     const network = new FakeNoxNetwork(pinned, () => exitReply(200, [], "{}"));
-    const harness = new FakeHarness({ topologySources: 1, callDeadlineMs: 3_000, attemptTimeoutMs: 3_000, tls: "preferred" }, network.kps);
+    const harness = new FakeHarness(
+      // The in-memory network models format 1 reply blocks only.
+      { topologySources: 1, callDeadlineMs: 3_000, attemptTimeoutMs: 3_000, tls: "preferred", surbFormat: "auto" },
+      network.kps,
+    );
     (globalThis as { anonRpcWorker?: unknown }).anonRpcWorker = harness.api;
     new Function(code)();
     try {

@@ -8,7 +8,7 @@ import { NoxClient, type ServiceRequest } from "@hisoka-io/nox-client";
 import { runNoxWorker } from "../src/core.js";
 import { FakeHarness } from "./helpers/fake-harness.js";
 import { FakeNoxNetwork, fakeWasm } from "./helpers/fake-nox-network.js";
-import { exitReply, fakeTlsBindings, kpsAddressFor, makeBootstrap, makePinned, tlsOff } from "./helpers/fixtures.js";
+import { exitReply, fakeTlsBindings, kpsAddressFor, makeBootstrap, makePinned, onFakeNetwork } from "./helpers/fixtures.js";
 
 const ambientFetch = vi.fn(() => {
   throw new Error("the worker must never call the global fetch");
@@ -36,7 +36,7 @@ afterEach(() => {
 function boot(config: unknown, exit: (request: ServiceRequest) => Uint8Array) {
   const pinned = makePinned();
   const network = new FakeNoxNetwork(pinned, exit);
-  const harness = new FakeHarness(tlsOff(config), network.kps);
+  const harness = new FakeHarness(onFakeNetwork(config), network.kps);
   void runNoxWorker(harness.api, {
     snapshot: pinned,
     bootstrap: makeBootstrap(pinned),
@@ -52,6 +52,21 @@ function boot(config: unknown, exit: (request: ServiceRequest) => Uint8Array) {
 }
 
 describe("worker on the real SDK in KPS mode", () => {
+  it("v2-only default: with no hop advertising surb_v2, a call fails with network-error and nothing reaches an exit", async () => {
+    const { network, harness } = boot({ topologySources: 1, surbFormat: "v2", callDeadlineMs: 3_000, attemptTimeoutMs: 3_000 }, () => {
+      throw new Error("no request may reach an exit");
+    });
+    await harness.ready;
+    await expect(
+      harness.fetch("https://rpc.example.test/v1", {
+        method: "POST",
+        headers: [["content-type", "application/json"]],
+        body: new TextEncoder().encode('{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'),
+      }),
+    ).rejects.toMatchObject({ code: "network-error" });
+    expect(network.served).toHaveLength(0);
+  });
+
   it("boots over KPS and answers JSON-RPC calls through an exit", async () => {
     const { network, harness } = boot({ topologySources: 1 }, (request) => {
       if (request.tag !== "HttpRequest") throw new Error("unexpected request");
@@ -119,7 +134,7 @@ describe("worker on the real SDK in KPS mode", () => {
     const pinned = makePinned();
     const network = new FakeNoxNetwork(pinned, () => exitReply(200, [], "{}"));
     for (let index = 1; index <= pinned.members.length; index++) network.refused.add(kpsAddressFor(index));
-    const harness = new FakeHarness(tlsOff({ topologySources: 1 }), network.kps);
+    const harness = new FakeHarness(onFakeNetwork({ topologySources: 1 }), network.kps);
     void runNoxWorker(harness.api, {
       snapshot: pinned,
       bootstrap: makeBootstrap(pinned),
@@ -154,7 +169,7 @@ describe("worker liveness versus registry evidence (real SDK, two anchors)", () 
     const pinned = makePinned();
     const network = new FakeNoxNetwork(pinned, ok);
     prepare(network, pinned);
-    const harness = new FakeHarness(tlsOff(anchors), network.kps);
+    const harness = new FakeHarness(onFakeNetwork(anchors), network.kps);
     void runNoxWorker(harness.api, {
       snapshot: pinned,
       bootstrap: makeBootstrap(pinned),

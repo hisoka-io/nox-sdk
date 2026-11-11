@@ -996,6 +996,20 @@ describe("reply block format selection", () => {
     expect(sent[0]!.route.exit.id).toBe("0x04");
   });
 
+  it("v2 mode honours an entry override instead of the pinned entry", () => {
+    const { client } = formatClient({ surbFormat: "v2", capable: ALL });
+    const nodes = Reflect.get(client, "_nodes") as TopologyNode[];
+    const other = nodes.find((node) => node.id === "0x06")!;
+    const plan = Reflect.get(client, "_planRoute") as (
+      exit: TopologyNode | undefined,
+      avoid: ReadonlySet<string>,
+      entry?: TopologyNode,
+    ) => { route: Route; version: number };
+    const planned = plan.call(client, undefined, new Set(), other);
+    expect(planned.version).toBe(2);
+    expect(planned.route.entry.id).toBe("0x06");
+  });
+
   it("resends a timed-out v2 request with v2 through a different entry", async () => {
     const { client, sent, outcomes } = formatClient({ capable: ALL });
     outcomes.push(timeout(), new Uint8Array([7]));

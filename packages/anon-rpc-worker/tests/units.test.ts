@@ -26,6 +26,7 @@ describe("config", () => {
     expect(parseConfig(undefined)).toBe(CONFIG_DEFAULTS);
     expect(parseConfig(null)).toBe(CONFIG_DEFAULTS);
     expect(parseConfig({})).toEqual(CONFIG_DEFAULTS);
+    expect(CONFIG_DEFAULTS.surbFormat).toBe("v2");
   });
 
   it("accepts a full valid config, including a JSON5-parsed object, without mutating it", () => {

@@ -12,6 +12,12 @@ All notable changes to `@hisoka-io/anon-rpc-worker`.
   `anonOptions` or key fails the call with `unsupported`. Forwarded fetch init entries are ignored.
 - Log events `isolation.open`, `isolation.ready`, `isolation.close`, `isolation.connect.failed` (no key in them).
 
+### Changed
+
+- Default `surbFormat` is `"v2"` (was `"auto"`): the worker builds format v2 reply blocks only and never falls back
+  to v1. Nodes that do not advertise `surb_v2` are left out of routes; a call with no such route fails with
+  `network-error`. `{ surbFormat: "auto" }` restores the 0.4 behaviour.
+
 ## 0.4.2 (2026-11-10)
 
 Same code and config as 0.4.1; only the embedded TLS library changes.

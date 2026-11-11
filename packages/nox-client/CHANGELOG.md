@@ -2,6 +2,13 @@
 
 All notable changes to `@hisoka-io/nox-client`.
 
+## Unreleased
+
+### Fixed
+
+- `surbFormat: "v2"` honours an entry override (a chain-check read whose exit is the pinned entry, a tunnel route
+  that avoids the pinned entry) instead of always taking the pinned entry.
+
 ## 0.9.0 (2026-10-25)
 
 Additive; every 0.8.0 call behaves as before. Depends on `@hisoka-io/nox-wasm` 0.3.0.
