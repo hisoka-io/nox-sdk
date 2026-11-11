@@ -47,6 +47,7 @@ import type {
 } from "../src/paid_execute.js";
 import { NoxClientError, NoxClientErrorCode } from "../src/types.js";
 import type { TopologyNode } from "../src/types.js";
+import { nodeKey } from "./helpers/node_key.js";
 
 const CHAIN_ID = 421_614n;
 const ENTRY_POINT = `0x${"11".repeat(20)}`;
@@ -266,7 +267,7 @@ class FakeClient implements PaidExecutionClient {
       id: this.wallets[index]!.address.toLowerCase(),
       address: "",
       routingAddress: `/exit/${index}`,
-      publicKey: new Uint8Array(32),
+      publicKey: nodeKey(`/exit/${index}`),
       layer: 2,
       role: 2,
     };
@@ -1202,7 +1203,7 @@ describe("selectPaidExit exclusion", () => {
       id: `0x${id.toString(16).padStart(40, "0")}`,
       address: layer === 0 ? "https://entry.test" : "",
       routingAddress: `/n${id}`,
-      publicKey: new Uint8Array(32),
+      publicKey: nodeKey(`/n${id}`),
       layer,
       role,
     });
@@ -1243,7 +1244,7 @@ describe("executePaid through NoxClient with two paid exits", () => {
       id,
       address: layer === 0 ? "https://entry.test" : "",
       routingAddress: `/n/${id}`,
-      publicKey: new Uint8Array(32),
+      publicKey: nodeKey(id),
       layer,
       role,
       capabilities,
