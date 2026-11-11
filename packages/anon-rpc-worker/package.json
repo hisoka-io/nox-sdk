@@ -1,6 +1,6 @@
 {
   "name": "@hisoka-io/anon-rpc-worker",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Nox mixnet worker for the anon-rpc standard, built as one reproducible classic-script bundle with a pinned NoxRegistry snapshot",
   "license": "Apache-2.0",
   "repository": {
@@ -38,7 +38,7 @@
     "esbuild": "0.27.3",
     "ethers": "6.16.0",
     "typescript": "5.9.3",
-    "vitest": "1.6.1"
+    "vitest": "4.1.12"
   },
   "publishConfig": {
     "access": "public"
