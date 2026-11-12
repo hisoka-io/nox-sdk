@@ -216,7 +216,8 @@ src/           test-bed library: config, processes, anvil, mesh, KPS servers, sp
 page/          host page script (window.e2e), bundled per harness version
 workers/       hash-pinned test workers: KPS probe, leaky worker (egress negative control)
 shared/        echo, bulk and KPS-HTTP/1 helpers used by the page and the probe worker
-tools/         kps-bulk-server (Go, built against ethereum/kps libs/go)
+tools/         kps-bulk-server (Go, built against ethereum/kps libs/go); kps-repro (KPS-only dial page); live-boot
+               (worker boot from a live specifier in Chromium or WebKit, run by scripts/live-webkit.sh in CI)
 contracts/     vendored reference WorkerSpecifier (MIT) and its compiled artifact; NoxRegistry, ERC1967Proxy and
                E2eLogEmitter artifacts (scripts/compile-local-contracts.sh)
 fixtures/      upstream passthrough worker bundle, nox-kps config template

@@ -1,0 +1,102 @@
+name: WebKit
+
+# The anon-rpc worker in WebKit (Safari's engine) against the live network:
+# the KPS-only dial repro on each bootstrap anchor, then a full worker boot
+# from the stable specifier and two JSON-RPC calls. Chromium runs the same
+# steps as a control. Reports and Playwright traces are uploaded.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/webkit.yml
+      - packages/anon-rpc-worker/e2e/**
+
+permissions:
+  contents: read
+
+jobs:
+  webkit:
+    name: WebKit boot (live)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: nox-sdk/packages/anon-rpc-worker/e2e
+
+    steps:
+      - name: Checkout nox-sdk
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: nox-sdk
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+        with:
+          version: "10"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: "pnpm"
+          cache-dependency-path: nox-sdk/packages/anon-rpc-worker/e2e/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile --ignore-workspace
+
+      - name: Install WebKit and Chromium with their system dependencies
+        run: npx playwright install --with-deps webkit chromium
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: KPS dial repro (WebKit)
+        id: kps_webkit
+        continue-on-error: true
+        run: bash scripts/live-webkit.sh kps webkit
+
+      - name: KPS dial repro (Chromium control)
+        id: kps_chromium
+        continue-on-error: true
+        run: bash scripts/live-webkit.sh kps chromium
+
+      - name: Worker boot from the stable specifier (WebKit)
+        id: boot_webkit
+        continue-on-error: true
+        run: bash scripts/live-webkit.sh boot webkit
+
+      - name: Worker boot from the stable specifier (Chromium control)
+        id: boot_chromium
+        continue-on-error: true
+        run: bash scripts/live-webkit.sh boot chromium
+
+      - name: Upload reports and traces
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: webkit-live-reports
+          path: |
+            nox-sdk/packages/anon-rpc-worker/e2e/.run/live-boot/
+            nox-sdk/packages/anon-rpc-worker/e2e/.run/kps-repro/*.json
+            nox-sdk/packages/anon-rpc-worker/e2e/.run/kps-repro/*.log
+          if-no-files-found: warn
+
+      - name: Outcome
+        env:
+          KPS_WEBKIT: ${{ steps.kps_webkit.outcome }}
+          KPS_CHROMIUM: ${{ steps.kps_chromium.outcome }}
+          BOOT_WEBKIT: ${{ steps.boot_webkit.outcome }}
+          BOOT_CHROMIUM: ${{ steps.boot_chromium.outcome }}
+        run: |
+          {
+            echo "### Outcome"
+            echo ""
+            echo "| Step | WebKit | Chromium |"
+            echo "|---|---|---|"
+            echo "| KPS dial repro | $KPS_WEBKIT | $KPS_CHROMIUM |"
+            echo "| Worker boot and RPC calls | $BOOT_WEBKIT | $BOOT_CHROMIUM |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "KPS repro: webkit=$KPS_WEBKIT chromium=$KPS_CHROMIUM; boot: webkit=$BOOT_WEBKIT chromium=$BOOT_CHROMIUM"
+          test "$KPS_WEBKIT" = success -a "$BOOT_WEBKIT" = success
