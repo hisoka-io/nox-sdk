@@ -40,3 +40,7 @@ coverage/
 no-commit/
 CLAUDE.md
 MEMORY.md
+
+# Docusaurus build output
+docs/.docusaurus/
+docs/build/
