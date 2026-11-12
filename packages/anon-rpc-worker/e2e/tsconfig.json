@@ -17,5 +17,5 @@
     "skipLibCheck": true,
     "noEmit": true
   },
-  "include": ["src", "tests", "playwright.config.ts", "vitest.config.ts", "page/globals.d.ts"]
+  "include": ["src", "tests", "tools/live-boot", "playwright.config.ts", "vitest.config.ts", "page/globals.d.ts"]
 }
