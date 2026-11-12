@@ -2,6 +2,15 @@
 
 All notable changes to `@hisoka-io/nox-wasm`.
 
+## Unreleased
+
+### Changed
+
+- nox-crypto pinned to nox `b687ecf` (main, after v0.4.0-rc.13), up from `676bb80`. Sphinx packets and reply
+  blocks built by `build_sphinx_packet`, `create_surb` and `create_surb_v2` fill the final hop's unused routing
+  bytes with random bytes, so the final hop cannot read the path length. Nodes read the same bytes as before; the
+  wire format is unchanged.
+
 ## 0.3.0 (2026-10-25)
 
 ### Fixed
