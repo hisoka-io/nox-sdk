@@ -52,8 +52,17 @@ let result;
 try {
   const page = await browser.newPage();
   await page.goto(`http://127.0.0.1:${port}/repro.html?addr=${encodeURIComponent(address)}`);
-  await page.waitForFunction(() => window.kpsRepro?.done === true, undefined, { timeout: RUN_TIMEOUT_MS });
-  result = await page.evaluate(() => window.kpsRepro);
+  page.on("console", (message) => console.error(`page ${message.type()}: ${message.text()}`));
+  page.on("pageerror", (error) => console.error(`page error: ${error.message}`));
+  let timedOut = false;
+  await page
+    .waitForFunction(() => window.kpsRepro?.done === true, undefined, { timeout: RUN_TIMEOUT_MS })
+    .catch(() => {
+      timedOut = true;
+    });
+  // On a timeout the steps and ICE states reached so far still say where it stopped.
+  result = { ...((await page.evaluate(() => window.kpsRepro)) ?? { ok: false, steps: [], pcStates: [] }), timedOut };
+  if (timedOut) result.ok = false;
 } finally {
   await browser.close();
   server.close();
